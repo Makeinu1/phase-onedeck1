@@ -379,12 +379,26 @@ export async function saveAuthoritativeGameStrict(
   await saveResumableGameStrict(gameId, await authoritativePersistenceState(adapter, fallbackState));
 }
 
+/**
+ * Capture the engine-authored trusted envelope for a persistence boundary
+ * (saves, undo checkpoints). Rendered screen states are viewer projections
+ * (`wire_projection`) that the restore ingress fails closed on, so anything
+ * that may later be restored must come from this boundary. Returns null when
+ * the adapter holds no local engine — callers push/save nothing restorable
+ * rather than an unrestorable projection.
+ */
+export async function captureTrustedCheckpoint(
+  adapter: EngineAdapter,
+): Promise<PersistedGameState | null> {
+  const trustedJson = await adapter.exportPersistenceState?.();
+  return trustedJson ? JSON.parse(trustedJson) as PersistedGameState : null;
+}
+
 async function authoritativePersistenceState(
   adapter: EngineAdapter,
   fallbackState: GameState,
 ): Promise<PersistedGameState> {
-  const trustedJson = await adapter.exportPersistenceState?.();
-  return trustedJson ? JSON.parse(trustedJson) as PersistedGameState : fallbackState;
+  return (await captureTrustedCheckpoint(adapter)) ?? fallbackState;
 }
 
 export async function loadGame(gameId: string): Promise<PersistedGameState | null> {
@@ -528,7 +542,7 @@ export async function clearP2PHostSession(gameId: string): Promise<void> {
 
 // ── Checkpoints (IndexedDB) ─────────────────────────────────────────────
 
-export async function saveCheckpoints(gameId: string, checkpoints: GameState[]): Promise<void> {
+export async function saveCheckpoints(gameId: string, checkpoints: PersistedGameState[]): Promise<void> {
   try {
     await withGameWriteLock(gameId, async () => {
       if (await hasTerminalCleanup(gameId)) return;
@@ -537,9 +551,9 @@ export async function saveCheckpoints(gameId: string, checkpoints: GameState[]):
   } catch { /* best effort */ }
 }
 
-export async function loadCheckpoints(gameId: string): Promise<GameState[]> {
+export async function loadCheckpoints(gameId: string): Promise<PersistedGameState[]> {
   try {
-    const checkpoints = await get<GameState[]>(GAME_CHECKPOINTS_PREFIX + gameId, getGameStore());
+    const checkpoints = await get<PersistedGameState[]>(GAME_CHECKPOINTS_PREFIX + gameId, getGameStore());
     return checkpoints?.map((checkpoint) => migratePersistedGameState(checkpoint)) ?? [];
   } catch {
     return [];

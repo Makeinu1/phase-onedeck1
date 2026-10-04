@@ -35,9 +35,14 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // option's `authority`, the slot prompt's `permission`, the latched terms).
 // v91 retypes PendingManaAbility's required chosen-counter count (#9207).
 // v93 adds the SacrificedForCost reduction provenance.
-// v94 adds phase-delayed departure look-back state and mana-cost provenance.
-// v95 reshapes FilterProp::Unblocked to FilterProp::BlockStatus.
-// v96 adds Full-only terminal final-view cleanup/recovery authority.
+// v97 adds TargetReadOrigin instruction provenance.
+// v99 adds the GraveyardCastPermission pool.
+// v100 replaces `AdditionalPhase.phase` with a `TurnSegment` `segment`,
+// retypes `followed_by` to `TurnSegment`, and replaces
+// `AdditionalPhase.target` with an `ExtraPhaseRecipient` `recipient`.
+// v101 adds `ActivatedAbilityKind::Mana` (mana-ability activations now emit
+// `GameEvent::AbilityActivated`), the event's `departed_source_lki`, and
+// `AbilityActivationRecord.source_zone`.
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
 const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
@@ -62,12 +67,25 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +23: the v94 phase-delayed departure look-back carrier
 // (SpellContext.creation_lookback_event) and TriggerSourceContext.mana_cost.
 // +24: the v95 FilterProp::BlockStatus reshape (Unblocked → BlockStatus { status }).
-// +25: Full-only recipient terminal final-view cleanup and recovery authority.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 25;
+// +25: the v96 QuantityRef::NameStickerLetterCount tagged quantity.
+// +26: the v97 serialized TargetReadOrigin (`target_reads`) instruction
+// provenance.
+// +27: the v98 PerPlayerScope::Opponents value, the PerPlayerChoiceOrder and
+// SubstituteChooser chooser purposes, and the per-player frame's current and
+// nominee fields.
+// +28: the v99 GraveyardCastPermission pool (from any graveyard).
+// +29: the v100 additional-phase segment and recipient parse bump.
+// +30: the v101 mana-ability activation kind and departed-source LKI.
+// +31: v102 adds the tagged SharedCardTypes quantity.
+// +32: v103 removes FormatConfig.allow_experimental_dungeons for the format-derived dungeon pool.
+// +33: v104 moves delve fuel to total-cost payment (PendingCast.delved_cards,
+// the FinalizeDelvedCast completion; DelveManaPayment removed).
+// +34: v105 adds Full-only recipient terminal final-view cleanup and recovery.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 34;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
-const EXPECTED_LOBBY_PROTOCOL_VERSION = 14;
+const EXPECTED_LOBBY_PROTOCOL_VERSION = 15;
 // The capability FLOOR for correlated tournament settlement — a different kind
 // of number from the other version constants here, and the reason it is pinned
 // separately. Those track a surface's current version; this one is frozen at the
@@ -110,7 +128,18 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +21: wire 75 moves with full-game v93 for the SacrificedForCost provenance.
 // +22: wire 76 moves with full-game v94 for the departure look-back carrier.
 // +23: wire 77 moves with full-game v95 for the FilterProp::BlockStatus reshape.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 23;
+// +24: wire 78 moves with full-game v96 for name-sticker quantities.
+// +25: wire 79 moves with full-game v97 for the serialized TargetReadOrigin.
+// +26: wire 80 moves with full-game v98 for per-player choice order and
+// PerPlayerScope::Opponents.
+// +27: wire 81 moves with full-game v99 for the graveyard permission pool.
+// +28: wire 82 moves with full-game v100 for the additional-phase segment and
+// recipient.
+// +29: wire 83 moves with full-game v101 for the mana-ability activation kind.
+// +30: wire 84 moves with full-game v102 for SharedCardTypes.
+// +31: wire 85 moves with full-game v103 for the format-derived dungeon pool.
+// +32: wire 86 moves with full-game v104 for the delve payment state shape.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 32;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse

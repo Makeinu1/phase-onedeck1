@@ -3,8 +3,8 @@
 Consolidated from 50 per-batch clustering passes over the whole card database. Synonymous per-batch clusters were merged into canonical root causes, their card lists unioned and deduped, and ranked by total card appearances (largest first).
 
 - **Canonical root causes:** 29
-- **Distinct cards implicated:** 4568
-- **Total card appearances across root causes:** 4601 (a card may appear under more than one root cause when it exhibits multiple distinct misparses)
+- **Distinct cards implicated:** 4557
+- **Total card appearances across root causes:** 4590 (a card may appear under more than one root cause when it exhibits multiple distinct misparses)
 
 > Counting method: both figures count the per-root-cause card bullets only — the
 > three metadata bullets above are excluded — and are the source of truth.
@@ -15,8 +15,8 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 
 | # | Root cause | # cards | Fix hint (where it likely lives) |
 |---|------------|--------:|----------------------------------|
-| 1 | Relative-clause / filter restriction on target dropped | 736 | oracle_target.rs / game/filter.rs — extend TargetFilter property extraction for trailing relative clauses |
-| 2 | Dropped intervening-if / gating condition (condition: null) | 577 | oracle_nom/condition.rs parse_inner_condition — trigger/static parsers must delegate condition extraction here |
+| 1 | Relative-clause / filter restriction on target dropped | 735 | oracle_target.rs / game/filter.rs — extend TargetFilter property extraction for trailing relative clauses |
+| 2 | Dropped intervening-if / gating condition (condition: null) | 575 | oracle_nom/condition.rs parse_inner_condition — trigger/static parsers must delegate condition extraction here |
 | 3 | Anaphor bound to wrong referent | 402 | oracle_quantity.rs context-ref resolution + game/ability_utils.rs forward_result wiring |
 | 4 | Conjoined / chained second effect clause dropped | 383 | oracle.rs effect-chain composition — split on 'and'/'then'/sentence boundaries and build sub_ability chain |
 | 5 | Dropped 'for each' / dynamic count collapsed to Fixed | 332 | oracle_quantity.rs parse_for_each_clause / parse_quantity_ref — thread ForEach/ObjectCount into the effect count field |
@@ -38,18 +38,18 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 | 21 | Token entry flags / keyword / attachment clause dropped | 52 | oracle parser token-description handling — preserve attacking/tapped flags, keyword grants, attach target |
 | 23 | Effect modeled with structurally wrong variant / ability class | 50 | add-engine-effect: select the correct Effect/ability variant for the clause class |
 | 24 | Variable X / where-X count unbound (sentinel or unresolved Variable) | 37 | oracle_cost.rs / oracle_quantity.rs — allow QuantityExpr in count fields and bind trailing 'where X is' clauses |
-| 25 | Wrong / dropped effect duration | 28 | oracle_nom/duration.rs — add until-event / two-turn / permanent duration variants |
+| 25 | Wrong / dropped effect duration | 20 | oracle_nom/duration.rs — add until-event / two-turn / permanent duration variants |
 | 26 | Delayed / future-phase trigger flattened to immediate effect | 20 | add-trigger: wrap future-phase effects in CreateDelayedTrigger |
 | 27 | Cross-target group / shared-quality constraint dropped | 12 | oracle_target.rs multi_target — add SameController/SameZone/DistinctNames/Parity constraints |
 | 28 | Trigger/activation timing or ordinal restriction dropped | 12 | oracle_casting.rs scan_timing_restrictions + trigger constraint parsing |
 | 30 | Token/named-card name corrupted by normalization or overrun | 7 | oracle_util.rs SELF_REF normalization + Named-filter parsing — guard literal 'named X' spans |
 | 31 | Other / uncategorized misparse | 4 | manual triage |
 
-> The top **5** root causes cover 2430/4601 ≈ 53% of all misparse appearances; the top 10 cover 3421/4601 ≈ 74%. Fix these first.
+> The top **5** root causes cover 2427/4590 ≈ 53% of all misparse appearances; the top 10 cover 3418/4590 ≈ 74%. Fix these first.
 
 ## Full card lists per root cause
 
-### 1. Relative-clause / filter restriction on target dropped  (736 cards)
+### 1. Relative-clause / filter restriction on target dropped  (735 cards)
 
 **Signature.** TargetFilter/affected emitted with empty or missing properties; a trailing restrictive clause (type, subtype, color, mana value, zone, combat/temporal/control predicate, exclusion) is silently dropped, over-broadening the filter.
 
@@ -151,7 +151,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Captain America's Shield
 - Captain N'ghathrod
 - Cathedral Membrane
-- Cemetery Prowler
 - Cephalid Shrine
 - Challenger Troll
 - Champion's Victory
@@ -796,7 +795,7 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 
 </details>
 
-### 2. Dropped intervening-if / gating condition (condition: null)  (577 cards)
+### 2. Dropped intervening-if / gating condition (condition: null)  (575 cards)
 
 **Signature.** Trigger/static/replacement/spell condition left null though Oracle has an 'if/while/as long as/unless' game-state gate; the effect resolves unconditionally (CR 603.4 / 608.2c).
 
@@ -1088,7 +1087,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Kyren Legate
 - Kytheon, Hero of Akros
 - Laboratory Drudge
-- Lairwatch Giant
 - Lashwhip Predator
 - Latchkey Faerie
 - Lava Burst
@@ -1203,7 +1201,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Ran and Shaw
 - Raphael, the Muscle
 - Rapid Fire
-- Rashka the Slayer
 - Raven Clan War-Axe
 - Rayne, Academy Chancellor
 - Reaper of Night
@@ -4843,7 +4840,7 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 
 </details>
 
-### 25. Wrong / dropped effect duration  (28 cards)
+### 25. Wrong / dropped effect duration  (20 cards)
 
 **Signature.** Effect duration is wrong (UntilEndOfTurn where permanent/until-event/two-turn needed, or a spurious expiry added), or a 'until <state change>' delayed-return is dropped.
 
@@ -4863,13 +4860,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Fraying Sanity
 - Glorious End
 - Golden Guardian
-- Jinx
-- Mistform Shrieker
-- Mistform Skyreaver
-- Mistform Stalker
-- Mistform Wakecaster
-- Mistform Wall
-- Mistform Warchief
 - Monoist Gravliner
 - Mythos of Vadrok
 - Nezumi Ronin
@@ -4877,7 +4867,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Palace Jailer
 - Peace Talks
 - Plant a Sapling
-- Trickery Charm
 - War of the Last Alliance
 
 </details>
@@ -5050,6 +5039,8 @@ CR 607.2d linkage seam (`parser/oracle_nom/filter.rs::classify_chosen_color_gran
 `None => modification.clone()` fallback gains its first discriminating test at
 the same moment, and **Chromatic Armor** becomes the first pool permanent able
 to hold two persisting colour answers.
+
+**F1-subtype — `persist: false` creature-type / basic-land-type choosers write nothing.** The "becomes the creature type / basic land type of your choice" class built by `crates/engine/src/parser/oracle_effect/subject.rs::try_parse_become_choice` (Mistform Shrieker, Skyreaver, Stalker, Wakecaster, Wall, Warchief; Jinx; Trickery Charm; and the rest of the class) emits `Effect::Choose { persist: false }`. `crates/engine/src/game/effects/choose.rs::named_choice_authority` returns no source for those choice types, so the answer lands only in `state.last_named_choice`, while the `AddChosenSubtype` arm in `crates/engine/src/game/layers.rs` reads the source object's `chosen_attributes`. The continuous effect installs with its printed window (CR 611.2a) but adds no subtype. These cards left §25 when the duration defect was fixed; the subtype defect is tracked here. Same repair shape as F1.
 
 **F6 — wrap the printed colour choice at the CARRYING clause's own node.**
 `inject_printed_color_choice_filter`

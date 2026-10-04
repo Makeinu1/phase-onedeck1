@@ -466,6 +466,41 @@ pub fn activatable_mana_actions_for_player(state: &GameState, player: PlayerId) 
     actions
 }
 
+/// The `TapLandForMana` rows [`activatable_mana_actions_for_player`] emits for
+/// one land, without sweeping the rest of the battlefield.
+///
+/// A land-tap action names its source, so validating one only needs that
+/// source's rows. Re-running the board-wide sweep made every simulated land tap
+/// pay the readiness simulation of every other costed mana source the player
+/// controls (filter lands, Vivid lands), which dominated legality probing on
+/// boards with several of them.
+fn activatable_land_mana_actions_for_object(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    aura_sources: &[ObjectId],
+    mana_activation_gates: &mana_abilities::ManaActivationGates,
+) -> Vec<GameAction> {
+    let is_controlled_land = state.battlefield.contains(&object_id)
+        && state.objects.get(&object_id).is_some_and(|object| {
+            object.controller == player && object.card_types.core_types.contains(&CoreType::Land)
+        });
+    if !is_controlled_land {
+        return Vec::new();
+    }
+    activatable_land_mana_options_indexed_gated(
+        state,
+        object_id,
+        player,
+        aura_sources,
+        mana_activation_gates,
+    )
+    .into_iter()
+    .filter_map(|option| option.semantic_selection(state))
+    .map(|selection| GameAction::TapLandForMana { selection })
+    .collect()
+}
+
 /// CR 605.3a: Complete semantic capabilities for mana activation, across lands
 /// and nonlands. This is intentionally separate from `GameAction` generation:
 /// callers can freeze these engine-authored candidates in an interaction and
@@ -865,10 +900,19 @@ pub(crate) fn preflight_tap_land_action(
     if turn_control::authorized_submitter_for_player(state, waiting_player) != authenticated_actor {
         return Err(EngineError::WrongPlayer);
     }
-    let matches = activatable_mana_actions_for_player(state, waiting_player)
-        .into_iter()
-        .filter(|candidate| candidate == action)
-        .count();
+    let GameAction::TapLandForMana { selection } = action else {
+        unreachable!("guarded by the TapLandForMana match above");
+    };
+    let matches = activatable_land_mana_actions_for_object(
+        state,
+        waiting_player,
+        selection.source.object_id,
+        &taps_for_mana_trigger_sources(state),
+        &mana_abilities::ManaActivationGates::compute(state),
+    )
+    .into_iter()
+    .filter(|candidate| candidate == action)
+    .count();
     match matches {
         1 => Ok(()),
         0 => Err(EngineError::ActionNotAllowed(
@@ -960,6 +1004,18 @@ pub(crate) fn activate_mana_source_option_with_output(
             object_id: option.object_id,
             caused_by: None,
         });
+        // CR 305.6 + CR 605.3: tapping a basic land for mana activates its
+        // intrinsic mana ability; observe its triggers at that boundary.
+        let activation_event = super::casting_targets::emit_ability_activated(
+            state,
+            player,
+            option.object_id,
+            crate::types::events::ActivatedAbilityKind::Mana,
+            crate::types::zones::Zone::Battlefield,
+            events,
+        );
+        super::triggers::collect_activation_event_at_boundary(state, events, activation_event)
+            .map_err(|error| EngineError::InvalidAction(error.to_string()))?;
         // The atomic combination is planning metadata: Aura-trigger bonuses are
         // produced by their own TapsForMana abilities after this single source
         // event. Producing the combination here would add those bonuses twice.
@@ -993,13 +1049,61 @@ pub(crate) fn activate_mana_source_option_with_output(
     };
 
     if option.penalty.is_undoable() {
-        state
-            .lands_tapped_for_mana
-            .entry(player)
-            .or_default()
-            .push(option.object_id);
+        record_undoable_mana_tap(state, player, option.object_id, events);
     }
     Ok(waiting_for)
+}
+
+/// CR 605.3b: the single authority for offering an undo of a mana tap
+/// (`UntapLandForMana`). Undo is an engine convenience, not a rules action, so
+/// it is offered only when it can reverse everything the tap did: the mana and
+/// the tap itself. It is recorded only for an activation that completed in
+/// `events` and whose boundary observation bound nothing
+/// (`ActivationObservers::Unbound`). An activation still paused mid-cost (a
+/// replacement choice) has not been observed yet, so it is never recorded;
+/// one an activation trigger observed (CR 603.10) queued an ability or spent
+/// a "triggers only once each turn" limit, which undo cannot reverse. Callers
+/// decide the penalty axis (`ManaSourcePenalty::is_undoable`) first.
+pub(crate) fn record_undoable_mana_tap(
+    state: &mut GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    events: &[GameEvent],
+) {
+    let completed_unobserved = events.iter().any(|event| {
+        matches!(
+            event,
+            GameEvent::AbilityActivated {
+                player_id,
+                source_id: activated,
+                kind: crate::types::events::ActivatedAbilityKind::Mana,
+                trigger_state: crate::types::events::ActivationTriggerState::CollectedAtActivation {
+                    observers: crate::types::events::ActivationObservers::Unbound,
+                },
+                ..
+            } if *player_id == player && *activated == source_id
+        )
+    });
+    if !completed_unobserved {
+        return;
+    }
+    state
+        .lands_tapped_for_mana
+        .entry(player)
+        .or_default()
+        .push(source_id);
+}
+
+/// CR 605.3b: withdraw any undo recorded for `player`'s tap of `source_id` once
+/// observing its activation bound a trigger.
+pub(crate) fn revoke_undoable_mana_tap(
+    state: &mut GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+) {
+    if let Some(tapped) = state.lands_tapped_for_mana.get_mut(&player) {
+        tapped.retain(|tapped_id| *tapped_id != source_id);
+    }
 }
 
 /// CR 605.3a-b: Revalidate and activate a generic mana capability. The caller

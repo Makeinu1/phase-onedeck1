@@ -106,6 +106,47 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  86 — game_setup and state_update carry GameState, whose PendingCast
+ *       gains delved_cards and whose pending cost-move resume swaps
+ *       DelveManaPayment for FinalizeDelvedCast (#9400). Bumped in lockstep
+ *       with full-game protocol 104.
+ *  85 — game_setup and state_update carry GameState, whose FormatConfig
+ *       loses allow_experimental_dungeons: the Wilderness pool is
+ *       format-derived now, so a v84 peer would fail it closed in freeform
+ *       games. First contact rejects the skew instead. Bumped in lockstep
+ *       with full-game protocol 103.
+ *  84 — full-game protocol 102 adds the SharedCardTypes quantity tag in
+ *       serialized ability definitions. Keep the existing P2P handshake in
+ *       lockstep with full-game protocol 102.
+ *  83 — game_setup and state_update carry GameState, whose events now include
+ *       mana-ability activations (AbilityActivated kind "Mana") and a
+ *       departed-source LKI. A v82 peer would not recognize the kind; first
+ *       contact rejects the skew instead. Bumped in lockstep with full-game
+ *       protocol 101.
+ *  82 — game_setup and state_update carry GameState, whose additional-phase
+ *       abilities now name what they add as a TurnSegment (segment, and
+ *       followed_by's elements) in place of a Phase, and who gets it as an
+ *       ExtraPhaseRecipient (recipient) in place of a TargetFilter. Both peers are browsers
+ *       and neither validates the shape, so a v81 peer would take the new
+ *       shape with no decode error; first contact rejects the skew instead.
+ *       Bumped in lockstep with full-game protocol 100.
+ *  81 — game_setup and state_update carry GameState, whose graveyard cast
+ *       permissions now carry a pool (GraveyardPermissionPool: AnyGraveyard is
+ *       "from any graveyard"). A v80 peer would default it to the own graveyard
+ *       and refuse a cast the permission allows, so first contact rejects the
+ *       skew. Bumped in lockstep with full-game protocol 99.
+ *  80 — game_setup and state_update carry GameState, whose abilities can now
+ *       serialize ZoneOwner {"Each":"Opponents"}, the PerPlayerChoiceOrder
+ *       and SubstituteChooser chooser purposes, and per-player frame
+ *       current/nominee fields. A v79 peer cannot deserialize
+ *       them, so first contact rejects the skew. Bumped in lockstep with
+ *       full-game protocol 98.
+ *  79 — game_setup and state_update carry GameState, whose stack abilities now
+ *       serialize ResolvedAbility.target_reads (TargetReadOrigin): a
+ *       ParentAnnouncement instruction reads the object its parent announced
+ *       and announces no target of its own. A v78 peer would default the field
+ *       and rebuild a target slot, so first contact rejects the skew. Bumped in
+ *       lockstep with full-game protocol 97.
  *  77 — game_setup and state_update carry GameState, whose ability definitions
  *       now carry FilterProp.BlockStatus { status } in place of the unit
  *       FilterProp.Unblocked (CR 509.1h). A v76 peer cannot parse the new
@@ -495,7 +536,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 77 as const;
+export const WIRE_PROTOCOL_VERSION = 86 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

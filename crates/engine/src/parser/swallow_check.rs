@@ -30,15 +30,17 @@ use super::oracle_ir::feature::{
     audit_units, scope_to_unit, AuditUnit, ItemIdTracks, OracleSemanticFeature,
 };
 use super::oracle_nom::error::OracleError;
+use super::oracle_nom::primitives::{scan_contains, split_sentence_units};
 use super::swallow_evidence::UnitEvidence;
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, ActivationRestriction, CastingPermission,
     ChooseFromZoneConstraint, Comparator, ContinuousModification, CopyRetargetPermission,
     DamageModification, DelayedTriggerCondition, Duration, Effect, FilterProp, ManaProduction,
-    ModalSelectionConstraint, OpponentMayScope, ParsedCondition, PlayerFilter, QuantityExpr,
-    QuantityRef, ReplacementCondition, ReplacementDefinition, ReplacementMode, RestrictionExpiry,
-    StaticCondition, StaticDefinition, TargetFilter, TriggerCondition, TriggerConstraint,
-    TriggerDefinition, UnlessPayScaling,
+    ModalSelectionConstraint, OpponentMayScope, ParsedCondition, PerPlayerScope, PlayerFilter,
+    QuantityExpr, QuantityRef, ReplacementCondition, ReplacementDefinition, ReplacementMode,
+    RestrictionExpiry, SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition,
+    TargetFilter, TriggerCondition, TriggerConstraint, TriggerDefinition, UnlessPayScaling,
+    ZoneOwner,
 };
 use crate::types::ability_visit::{
     visit_ability_def, visit_replacement, visit_static, visit_trigger,
@@ -54,8 +56,8 @@ use crate::types::zones::Zone;
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_until, take_while1},
-    character::complete::digit1,
-    combinator::{opt, value},
+    character::complete::{digit1, multispace0},
+    combinator::{eof, opt, value},
     Parser,
 };
 use std::ops::ControlFlow;
@@ -512,6 +514,118 @@ fn enters_with_counter_carrier_is_only_enters_with_marker(
     })
 }
 
+/// CR 701.6a + CR 614.1a: true when this def tree carries a typed
+/// `Effect::Counter { countered_spell_zone: Some(Library | Hand) }` — the modeled
+/// "put it <zone> instead of into that player's graveyard" redirect (Memory Lapse,
+/// Lapse of Certainty, Spell Crumple, Remand). `None` (Hinder's "your choice of top or
+/// bottom") is deliberately not a carrier, and `Some(Exile)` is pinned out so a future
+/// parser change to that shape fails loudly instead of being silently accepted.
+///
+/// Declined (the warning stays): Hinder (`Counter { None }` plus a sub-ability
+/// `ChangeZone`, "your choice of top or bottom"); the exile-it-instead ETB counter card
+/// and the artifact-or-creature-onto-the-battlefield-under-your-control counter card are
+/// declined by construction (no Library/Hand slot), not fixture-tested; and
+/// a second " instead" sentence after a populated redirect (e.g. "you gain 2 life
+/// instead", or a different "countered this way ... instead" clause).
+///
+/// Deliberately NOT part of `effect_is_replacement_carrier`: that matcher also feeds
+/// the skip/enters-with/as-enters detector, where a Counter node proves nothing.
+fn def_tree_has_countered_spell_zone_redirect(def: &AbilityDefinition) -> bool {
+    if matches!(
+        &*def.effect,
+        Effect::Counter {
+            countered_spell_zone: Some(
+                SpellStackToGraveyardReplacement::Library { .. }
+                    | SpellStackToGraveyardReplacement::Hand
+            ),
+            ..
+        }
+    ) {
+        return true;
+    }
+    if let Effect::CreateDelayedTrigger { effect, .. } = &*def.effect {
+        if def_tree_has_countered_spell_zone_redirect(effect) {
+            return true;
+        }
+    }
+    def.sub_ability
+        .as_deref()
+        .is_some_and(def_tree_has_countered_spell_zone_redirect)
+        || def
+            .else_ability
+            .as_deref()
+            .is_some_and(def_tree_has_countered_spell_zone_redirect)
+        || def
+            .mode_abilities
+            .iter()
+            .any(def_tree_has_countered_spell_zone_redirect)
+}
+
+fn any_ability_has_countered_spell_zone_redirect(parsed: &ParsedAbilities) -> bool {
+    parsed
+        .abilities
+        .iter()
+        .any(def_tree_has_countered_spell_zone_redirect)
+        || parsed.triggers.iter().any(|t| {
+            t.execute
+                .as_deref()
+                .is_some_and(def_tree_has_countered_spell_zone_redirect)
+        })
+}
+
+/// CR 701.6a + CR 614.1a: the countered-spell redirect sentence
+/// "if that spell is countered this way, put it <destination> instead of into
+/// <that player's|its owner's|their owner's> graveyard", anchored at BOTH ends of the
+/// sentence unit so no unmodelled head or tail can ride along with the typed slot.
+/// The destinations are exactly those modelled by
+/// `SpellStackToGraveyardReplacement::{Library, Hand}` (Memory Lapse / Lapse of Certainty:
+/// top of library; Spell Crumple: bottom of library; Remand: hand).
+fn parse_countered_spell_redirect_shape(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
+    // The redirect must START the sentence: an unmodelled head ("..., you gain 2 life
+    // instead of ... and put it ...") must not be swallowed by the typed slot.
+    let (rest, _) = tag("if that spell is countered this way, put it ").parse(input)?;
+    let (rest, _) = alt((
+        tag("on top of its owner's library"),
+        tag("on the bottom of its owner's library"),
+        tag("into its owner's hand"),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag(" instead of into ").parse(rest)?;
+    let (rest, _) = alt((
+        tag("that player's"),
+        tag("its owner's"),
+        tag("their owner's"),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag(" graveyard").parse(rest)?;
+    // The redirect must be the WHOLE sentence: an unmodelled tail (", and you gain 2 life
+    // instead ...") must not be swallowed by the typed slot.
+    let (rest, _) = opt(tag(".")).parse(rest)?;
+    let (rest, _) = multispace0.parse(rest)?;
+    value((), eof).parse(rest)
+}
+
+/// CR 701.6a + CR 614.1a: true when the typed countered-spell redirect accounts for
+/// EVERY " instead" sentence of the unit. The redirect slot carries no sentence-level
+/// provenance, so even a second matching redirect sentence must keep the warning.
+/// Require exactly one "instead" sentence, and require it to BE the redirect clause
+/// itself (`parse_countered_spell_redirect_shape`, whole-unit match).
+fn countered_spell_zone_redirect_is_only_instead_marker(
+    cleaned: &str,
+    parsed: &ParsedAbilities,
+) -> bool {
+    if !any_ability_has_countered_spell_zone_redirect(parsed) {
+        return false;
+    }
+    let mut instead_sentences = split_sentence_units(cleaned)
+        .into_iter()
+        .filter(|sentence| scan_contains(sentence, "instead"));
+    let Some(sentence) = instead_sentences.next() else {
+        return false;
+    };
+    parse_countered_spell_redirect_shape(sentence).is_ok() && instead_sentences.next().is_none()
+}
+
 // ── Detector A: Replacement_Instead ─────────────────────────────────────
 
 /// CR 614: "if X would Y, [do Z] instead" — every "instead" phrase outside of
@@ -558,6 +672,12 @@ fn detect_replacement_instead(
     // CR 608.2m + CR 614.1a + CR 614.11: the remaining replacement carriers live
     // in an effect or a static rather than in `parsed.replacements`.
     if any_ability_has_replacement_carrier(parsed) {
+        return;
+    }
+    // CR 701.6a + CR 614.1a + CR 608.2c: "If that spell is countered this way, put it
+    // <zone> instead of into that player's graveyard" is the typed
+    // `Counter.countered_spell_zone` redirect, provided it is the ONLY "instead" clause.
+    if countered_spell_zone_redirect_is_only_instead_marker(cleaned, parsed) {
         return;
     }
     diagnostics.push(OracleDiagnostic::swallowed_clause(
@@ -1650,6 +1770,23 @@ fn effect_is_replacement_carrier(effect: &Effect) -> bool {
         // Feather return / Lilah plot parameterization is a second consequence
         // folded into the same carrier, so it stays exempt either way).
         | Effect::ExileResolvingSpellInsteadOfGraveyard { .. } => true,
+        // CR 614.1a: a resolution-created permission whose granted static carries
+        // the replacement ("If a spell cast this way would be put into a
+        // graveyard, exile it instead" folded into a graveyard cast permission —
+        // The Great Work). The granted static answers the same question it does
+        // when printed on a permanent.
+        Effect::GenericEffect {
+            static_abilities, ..
+        } => static_abilities
+            .iter()
+            .flat_map(|grant| grant.modifications.iter())
+            .any(|modification| {
+                matches!(
+                    modification,
+                    ContinuousModification::GrantStaticAbility { definition }
+                        if static_is_replacement_carrier(definition)
+                )
+            }),
         _ => false,
     }
 }
@@ -2626,25 +2763,86 @@ fn def_tree_distinct_card_type_constraint_count(def: &AbilityDefinition) -> usiz
 /// within the one-line granularity `AuditUnit` accepts, when split roots of one
 /// ability diverge and only some of them carry every printed constraint.
 fn distinct_card_type_constraint_count(scoped: &ParsedAbilities) -> usize {
-    scoped
-        .abilities
-        .iter()
-        .map(def_tree_distinct_card_type_constraint_count)
-        .sum::<usize>()
+    root_aware_count(scoped, def_tree_distinct_card_type_constraint_count)
+}
+
+/// CR 113.2c: sum `per_def` over the unit's spell-ability roots, and
+/// take its max over the trigger roots and over the replacement roots — see
+/// [`distinct_card_type_constraint_count`] for why split trigger and replacement
+/// roots of one printed ability count once.
+fn root_aware_count(scoped: &ParsedAbilities, per_def: fn(&AbilityDefinition) -> usize) -> usize {
+    scoped.abilities.iter().map(per_def).sum::<usize>()
         + scoped
             .triggers
             .iter()
             .filter_map(|t| t.execute.as_deref())
-            .map(def_tree_distinct_card_type_constraint_count)
+            .map(per_def)
             .max()
             .unwrap_or(0)
         + scoped
             .replacements
             .iter()
             .filter_map(|r| r.execute.as_deref())
-            .map(def_tree_distinct_card_type_constraint_count)
+            .map(per_def)
             .max()
             .unwrap_or(0)
+}
+
+/// CR 102.2 + CR 608.2c: the number of per-opponent choices `def`'s tree
+/// represents, one per `ChooseFromZone { zone_owner: Each(Opponents) }`.
+///
+/// "For each opponent, choose an artifact or land that player controls"
+/// (Ultimate Magic: Meteor) realizes its per-opponent iteration as the
+/// choice's population, not as a `QuantityExpr`, so the generic quantity probes
+/// cannot see it.
+fn def_tree_per_opponent_choice_count(def: &AbilityDefinition) -> usize {
+    let mut count = 0usize;
+    let _ = visit_ability_def(def, &mut |effect| {
+        if matches!(
+            effect,
+            Effect::ChooseFromZone {
+                zone_owner: ZoneOwner::Each(PerPlayerScope::Opponents),
+                ..
+            }
+        ) {
+            count += 1;
+        }
+        ControlFlow::Continue(())
+    });
+    count
+}
+
+/// CR 102.2 + CR 608.2c: true when every `"for each "` occurrence the line
+/// raises opens a "for each opponent, choose …" clause and each is represented
+/// by its own per-opponent `ChooseFromZone`. Occurrence-counted like
+/// [`for_each_card_type_constraints_cover_all_for_each_markers`]: a second,
+/// unrepresented `"for each "` in the unit still warns, and a raised occurrence
+/// with any other continuation belongs to a clause this carrier does not
+/// represent.
+fn per_opponent_choices_cover_all_for_each_markers(
+    cleaned: &str,
+    markers: &[&'static str],
+    scoped: &ParsedAbilities,
+) -> bool {
+    if markers.len() != 1 || markers[0] != "for each " {
+        return false;
+    }
+    let mut raised = 0usize;
+    // allow-noncombinator: swallow detector marker scan on classified text
+    for (idx, _) in cleaned.match_indices("for each ") {
+        let rest = &cleaned[idx + "for each ".len()..];
+        let opens_choice = alt((
+            tag::<_, _, nom::error::Error<&str>>("opponent, choose "),
+            tag("opponent choose "),
+        ))
+        .parse(rest)
+        .is_ok();
+        if !opens_choice {
+            return false;
+        }
+        raised += 1;
+    }
+    raised > 0 && root_aware_count(scoped, def_tree_per_opponent_choice_count) >= raised
 }
 
 /// CR 205.2 + CR 608.2c/d: true when every `"for each "` occurrence the line
@@ -3018,6 +3216,12 @@ fn detect_dynamic_qty(
     // "for each " occurrence (`for_each_card_type_constraints_cover_all_for_each_markers`),
     // so a sibling unrepresented "for each " in the same unit still warns.
     if for_each_card_type_constraints_cover_all_for_each_markers(cleaned, &markers, scoped) {
+        return;
+    }
+    // CR 102.2 + CR 608.2c: "For each opponent, choose …" (Ultimate Magic:
+    // Meteor) realizes its iteration as a per-opponent `ChooseFromZone`
+    // population; one choice discharges one raised "for each " occurrence.
+    if per_opponent_choices_cover_all_for_each_markers(cleaned, &markers, scoped) {
         return;
     }
     // CR 608.2c: each printed "For each <population>," is represented by its own
@@ -5820,8 +6024,9 @@ mod tests {
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, CardSelectionMode, ChooseFromZoneConstraint, Chooser,
         ContinuousModification, CopyRetargetPermission, DamageModification, Effect, ManaProduction,
-        OutsideGameSourcePool, PlayerFilter, QuantityExpr, StaticCondition, StaticDefinition,
-        TargetFilter, TriggerCondition, ZoneChoiceCandidateSource, ZoneOwner,
+        OutsideGameSourcePool, PlayerFilter, QuantityExpr, SpellStackToGraveyardReplacement,
+        StaticCondition, StaticDefinition, TargetFilter, TriggerCondition,
+        ZoneChoiceCandidateSource, ZoneOwner,
     };
     use crate::types::card_type::CoreType;
     use crate::types::identifiers::TrackedSetId;
@@ -7801,6 +8006,35 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         assert!(!has_swallowed_detector(&parsed, "Replacement_Instead"));
     }
 
+    /// CR 614.1a: The Great Work's chapter III folds "If a spell cast this way would
+    /// be put into a graveyard, exile it instead" into the graveyard cast
+    /// permission it grants, so the clause is represented. The same grant with a
+    /// destination the permission cannot carry (a library) is not folded and must
+    /// keep warning.
+    #[test]
+    fn replacement_instead_accepts_a_granted_graveyard_permission_rider() {
+        let folded = parse_named(
+            "Until end of turn, you may cast instant and sorcery spells from any graveyard. \
+             If a spell cast this way would be put into a graveyard, exile it instead.",
+            "Folded Grant",
+            &["Sorcery"],
+        );
+        assert!(!has_swallowed_detector(&folded, "Replacement_Instead"));
+
+        let unfolded = parse_named(
+            "Until end of turn, you may cast instant and sorcery spells from any graveyard. \
+             If a spell cast this way would be put into a graveyard, put it on the bottom of \
+             its owner's library instead.",
+            "Unfolded Grant",
+            &["Sorcery"],
+        );
+        assert!(
+            has_swallowed_detector(&unfolded, "Replacement_Instead"),
+            "{:?}",
+            unfolded.parse_warnings
+        );
+    }
+
     #[test]
     fn replacement_instead_accepts_power_pack_delayed_payload_rider() {
         let parsed = parse_named(
@@ -8603,6 +8837,179 @@ If you sang a song the whole time you were searching and shuffling, you may unta
             &["Instant"],
         );
         assert!(!has_swallowed_detector(&remand, "Condition_If"));
+    }
+
+    /// CR 701.6a + CR 614.1a + CR 608.2c: the typed countered-spell redirect IS the
+    /// "instead" replacement (Memory Lapse, Spell Crumple, Remand) — but only when it is
+    /// the sole " instead" clause. Declines: Hinder (`Counter{None}`), a second
+    /// unmodelled " instead" sentence, or an unmodelled same-sentence tail. The exile-it-instead
+    /// and onto-battlefield counter cards are declined by construction (no Library/Hand
+    /// slot), not fixture-tested.
+    #[test]
+    fn replacement_instead_accepts_countered_spell_zone_redirect() {
+        fn counter_zone(
+            parsed: &crate::parser::oracle::ParsedAbilities,
+        ) -> Option<&Option<SpellStackToGraveyardReplacement>> {
+            parsed.abilities.first().and_then(|a| match &*a.effect {
+                Effect::Counter {
+                    countered_spell_zone,
+                    ..
+                } => Some(countered_spell_zone),
+                _ => None,
+            })
+        }
+        fn no_unimplemented(parsed: &crate::parser::oracle::ParsedAbilities) -> bool {
+            !any_ability_has_unimplemented(parsed)
+        }
+
+        let memory_lapse_text = "Counter target spell. If that spell is countered this way, \
+             put it on top of its owner's library instead of into that \
+             player's graveyard.";
+        let cases = [
+            ("Memory Lapse", memory_lapse_text.to_string()),
+            (
+                "Spell Crumple",
+                "Counter target spell. If that spell is countered this way, put it on the \
+                 bottom of its owner's library instead of into that player's graveyard. \
+                 Put Spell Crumple on the bottom of its owner's library."
+                    .to_string(),
+            ),
+            (
+                "Remand",
+                "Counter target spell. If that spell is countered this way, \
+                 put it into its owner's hand instead of into that player's \
+                 graveyard.\nDraw a card."
+                    .to_string(),
+            ),
+        ];
+        for (name, text) in &cases {
+            let parsed = parse_named(text, name, &["Instant"]);
+            // Reach guards: the redirect slot is populated and the " instead" marker is
+            // present, so the absence of a warning is not vacuous.
+            assert!(
+                no_unimplemented(&parsed),
+                "{name}: unexpected Unimplemented"
+            );
+            assert!(
+                matches!(counter_zone(&parsed), Some(Some(_))),
+                "{name}: expected Counter with countered_spell_zone"
+            );
+            assert!(crate::parser::oracle_nom::primitives::scan_contains(
+                text, "instead"
+            ));
+            assert!(
+                !has_swallowed_detector(&parsed, "Replacement_Instead"),
+                "{name}: redirect must discharge Replacement_Instead"
+            );
+        }
+
+        // Hostile: Hinder has no modeled destination -> still warns.
+        let hinder = parse_named(
+            "Counter target spell. If that spell is countered this way, put that card on \
+             your choice of the top or bottom of its owner's library instead of into that \
+             player's graveyard.",
+            "Hinder",
+            &["Instant"],
+        );
+        assert!(no_unimplemented(&hinder));
+        assert!(
+            matches!(counter_zone(&hinder), Some(None)),
+            "Hinder: expected Counter with countered_spell_zone == None"
+        );
+        assert!(has_swallowed_detector(&hinder, "Replacement_Instead"));
+
+        // Hostile: a second, unmodelled " instead" sentence must keep the warning even
+        // though the redirect slot is populated.
+        let second_instead = parse_named(
+            &format!("{memory_lapse_text} You gain 2 life instead."),
+            "Memory Lapse",
+            &["Instant"],
+        );
+        assert!(no_unimplemented(&second_instead));
+        assert!(
+            matches!(counter_zone(&second_instead), Some(Some(_))),
+            "second-instead fixture: expected Counter with countered_spell_zone"
+        );
+        assert!(has_swallowed_detector(
+            &second_instead,
+            "Replacement_Instead"
+        ));
+
+        // One redirect slot cannot prove that two matching printed sentences were modeled.
+        let redirect_sentence =
+            crate::parser::oracle_nom::primitives::split_sentence_units(memory_lapse_text)
+                .into_iter()
+                .last()
+                .expect("Memory Lapse carries a redirect sentence");
+        let repeated_redirect = parse_named(
+            &format!("{memory_lapse_text} {redirect_sentence}"),
+            "Memory Lapse",
+            &["Instant"],
+        );
+        assert!(no_unimplemented(&repeated_redirect));
+        assert!(matches!(counter_zone(&repeated_redirect), Some(Some(_))));
+        assert!(has_swallowed_detector(
+            &repeated_redirect,
+            "Replacement_Instead"
+        ));
+
+        // Hostile: the extra sentence mentions "countered this way" but is a different
+        // " instead" clause, not the redirect shape -> must still warn.
+        let second_countered_instead = parse_named(
+            &format!(
+                "{memory_lapse_text} If it was countered this way, you gain 2 life instead of \
+                 drawing a card."
+            ),
+            "Memory Lapse",
+            &["Instant"],
+        );
+        assert!(no_unimplemented(&second_countered_instead));
+        assert!(
+            matches!(counter_zone(&second_countered_instead), Some(Some(_))),
+            "second-countered-instead fixture: expected Counter with countered_spell_zone"
+        );
+        assert!(has_swallowed_detector(
+            &second_countered_instead,
+            "Replacement_Instead"
+        ));
+
+        // Hostile: same sentence — the redirect is followed by an unmodelled tail, so the
+        // shape must be anchored to the end of the sentence and keep the warning.
+        let same_sentence_tail = parse_named(
+            "Counter target spell. If that spell is countered this way, put it on top of its \
+             owner's library instead of into that player's graveyard and you gain 2 life \
+             instead of drawing a card.",
+            "Memory Lapse",
+            &["Instant"],
+        );
+        assert!(no_unimplemented(&same_sentence_tail));
+        assert!(
+            matches!(counter_zone(&same_sentence_tail), Some(Some(_))),
+            "same-sentence-tail fixture: expected Counter with countered_spell_zone"
+        );
+        assert!(has_swallowed_detector(
+            &same_sentence_tail,
+            "Replacement_Instead"
+        ));
+
+        // Hostile: an " instead" sentence that ENDS with the redirect shape but carries an
+        // unmodelled head must not be discharged — the shape is anchored to the start of
+        // the sentence. Probed on the predicate directly: through the full parse, such a
+        // sentence is caught by earlier gates before the redirect discharge is reached.
+        let memory_lapse = parse_named(memory_lapse_text, "Memory Lapse", &["Instant"]);
+        assert!(super::countered_spell_zone_redirect_is_only_instead_marker(
+            &memory_lapse_text.to_ascii_lowercase(),
+            &memory_lapse
+        ));
+        let with_head = format!(
+            "{memory_lapse_text} If a creature spell is countered this way, you gain 2 life \
+             instead and put it on top of its owner's library instead of into that player's \
+             graveyard."
+        )
+        .to_ascii_lowercase();
+        assert!(
+            !super::countered_spell_zone_redirect_is_only_instead_marker(&with_head, &memory_lapse)
+        );
     }
 
     /// CR 702.170c + CR 608.2c: "You may exile a card … If you do, it becomes
@@ -12279,6 +12686,7 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
             extra_cost: None,
             enters_with_counter: Some(CounterType::Finality),
             required_cast_keyword: None,
+            pool: crate::types::statics::GraveyardPermissionPool::OwnGraveyard,
         });
         let parsed = crate::parser::oracle::ParsedAbilities {
             abilities: Vec::new(),
@@ -12365,6 +12773,7 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
             extra_cost: None,
             enters_with_counter: Some(CounterType::Finality),
             required_cast_keyword: None,
+            pool: crate::types::statics::GraveyardPermissionPool::OwnGraveyard,
         });
         let parsed = crate::parser::oracle::ParsedAbilities {
             abilities: Vec::new(),
@@ -13053,7 +13462,77 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
         assert_eq!(swallows_for(&parsed, "DynamicQty").len(), 1);
     }
 
-    /// Typed positive: the co-scoped pair represents the iteration.
+    /// CR 102.2 + CR 608.2c: Ultimate Magic: Meteor's "for each opponent,
+    /// choose …" is represented by its per-opponent `ChooseFromZone`, so it
+    /// raises no `DynamicQty`.
+    #[test]
+    fn per_opponent_choice_represents_its_for_each() {
+        let parsed = parse_named(
+            "Ultimate Magic: Meteor deals 7 damage to each creature. If this spell was cast from exile, for each opponent, choose an artifact or land that player controls. Destroy the chosen permanents.",
+            "Ultimate Magic: Meteor",
+            &["Sorcery"],
+        );
+        let swallows = swallows_for(&parsed, "DynamicQty");
+        assert!(swallows.is_empty(), "{swallows:?}");
+        // Reach: the parse the detector saw is the full per-opponent chain, not
+        // a gap the card-wide `Unimplemented` guard would have excused.
+        assert_eq!(
+            crate::parser::swallow_check::root_aware_count(
+                &parsed,
+                crate::parser::swallow_check::def_tree_per_opponent_choice_count,
+            ),
+            1,
+            "exactly one ChooseFromZone {{ Each(Opponents) }}: {:#?}",
+            parsed.abilities
+        );
+        let mut unimplemented = false;
+        for def in &parsed.abilities {
+            let _ = crate::types::ability_visit::visit_ability_def(def, &mut |effect| {
+                if matches!(effect, Effect::Unimplemented { .. }) {
+                    unimplemented = true;
+                }
+                std::ops::ControlFlow::<()>::Continue(())
+            });
+        }
+        assert!(!unimplemented, "{:#?}", parsed.abilities);
+    }
+
+    /// Occurrence-counted: one per-opponent choice discharges one raised
+    /// "for each opponent, choose", and a "for each " that opens anything else
+    /// is not discharged at all.
+    #[test]
+    fn per_opponent_choice_does_not_discharge_a_second_for_each() {
+        let one_choice = parse_named(
+            "For each opponent, choose a creature that player controls. Destroy the chosen permanents.",
+            "Probe",
+            &["Sorcery"],
+        );
+        let markers = ["for each "];
+        assert!(
+            crate::parser::swallow_check::per_opponent_choices_cover_all_for_each_markers(
+                "for each opponent, choose a creature that player controls.",
+                &markers,
+                &one_choice,
+            ),
+            "reach: one raised occurrence, one represented choice"
+        );
+        assert!(
+            !crate::parser::swallow_check::per_opponent_choices_cover_all_for_each_markers(
+                "for each opponent, choose a creature that player controls. for each opponent, choose a land that player controls.",
+                &markers,
+                &one_choice,
+            ),
+            "two raised occurrences, one represented choice"
+        );
+        assert!(
+            !crate::parser::swallow_check::per_opponent_choices_cover_all_for_each_markers(
+                "for each opponent, choose a creature that player controls. you gain 1 life for each creature you control.",
+                &markers,
+                &one_choice,
+            ),
+            "a for each that opens something else is not this carrier's"
+        );
+    }
     #[test]
     fn co_scoped_parent_target_iteration_is_represented() {
         assert!(
@@ -13622,6 +14101,7 @@ mod detect_condition_if_replacement_exemption_tests {
             extra_cost: None,
             enters_with_counter: Some(CounterType::Finality),
             required_cast_keyword: None,
+            pool: crate::types::statics::GraveyardPermissionPool::OwnGraveyard,
         });
         let parsed = crate::parser::oracle::ParsedAbilities {
             abilities: Vec::new(),
