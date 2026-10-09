@@ -772,22 +772,19 @@ pub fn resolve_event_context_target(
             .first()
             .copied()
             .map(TargetRef::Object),
+        // CR 115.10a: a bound object id is affected, never a declared target; it
+        // names its object directly, independent of any trigger event.
+        TargetFilter::SpecificObject { id } => Some(TargetRef::Object(*id)),
         TargetFilter::AttachedTo
         | TargetFilter::PostReplacementSourceController
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner => {
             resolve_event_context_target_for_event_or_state(state, filter, source_id, None)
         }
-        TargetFilter::DefendingPlayer => {
-            let event = state.current_trigger_event.as_ref();
-            resolve_event_context_target_for_event_or_state(state, filter, source_id, event)
-        }
-        // CR 108.3 + CR 608.2c: `ParentTargetOwner` may fall back to the source's
-        // AttachedTo host (Enslave's "enchanted creature deals 1 damage to its
-        // owner" — phase trigger has no event source). Allow the no-event path so
-        // the AttachedTo branch in the inner resolver runs even when no trigger
-        // event is active.
-        TargetFilter::ParentTargetOwner => {
+        TargetFilter::DefendingPlayer
+        | TargetFilter::ParentTarget
+        | TargetFilter::ParentTargetController
+        | TargetFilter::ParentTargetOwner => {
             let event = state.current_trigger_event.as_ref();
             resolve_event_context_target_for_event_or_state(state, filter, source_id, event)
         }
@@ -830,6 +827,9 @@ pub fn resolve_event_context_targets(
                 .map(|id| TargetRef::Object(*id))
                 .collect();
         }
+        // CR 115.10a: a bound object id is affected, never a declared target; it
+        // is one object, not one per batched event.
+        TargetFilter::SpecificObject { id } => return vec![TargetRef::Object(*id)],
         _ => {}
     }
 
@@ -884,18 +884,26 @@ pub fn resolved_targets(
     target_filter: &TargetFilter,
     state: &GameState,
 ) -> Vec<TargetRef> {
+    // CR 201.5a + CR 400.7: the stamped granter incarnation, and nothing once it has left.
+    if let TargetFilter::GrantingObject { bound } = target_filter {
+        if let Some(granter) = bound.or(ability.context.granting_object) {
+            return granter
+                .is_current(state)
+                .then_some(TargetRef::Object(granter.object_id))
+                .into_iter()
+                .collect();
+        }
+    }
     // CR 608.2c: SelfRef is the printed-name anaphor (`~`) — its referent is
     // the source object itself, never a chosen target. Must short-circuit
     // before the `ability.targets` fallback so chained "Exile ~" sub-abilities
     // don't accidentally inherit the parent's targets via the chain target
     // propagation in `effects::mod.rs::resolve_chain`.
-    // CR 201.5a: `GrantingObject` is always concretized to `SpecificObject` at
-    // grant-clone time and should never reach here; the arm is a fail-safe that
-    // degrades an un-concretized granter ref to the ability source (host) — the
-    // pre-fix binding, never worse.
+    // CR 201.5: an unstamped `GrantingObject` resolves to the exact current
+    // ability source.
     if matches!(
         target_filter,
-        TargetFilter::SelfRef | TargetFilter::GrantingObject
+        TargetFilter::SelfRef | TargetFilter::GrantingObject { .. }
     ) {
         // CR 400.7: A self-reference resolves to the exact source, except that
         // a departure trigger may follow its own immediate recorded event
@@ -903,7 +911,7 @@ pub fn resolved_targets(
         // new object and finds nothing.
         let source_is_current = match target_filter {
             TargetFilter::SelfRef => ability.self_ref_is_current(state),
-            TargetFilter::GrantingObject => ability.source_is_current(state),
+            TargetFilter::GrantingObject { .. } => ability.source_is_current(state),
             _ => unreachable!("self-reference branch only handles SelfRef or GrantingObject"),
         };
         return if source_is_current {
@@ -1302,6 +1310,10 @@ pub(crate) fn is_pure_event_context_filter(target_filter: &TargetFilter) -> bool
             | TargetFilter::PostReplacementSourceController
             | TargetFilter::PostReplacementDamageTarget
             | TargetFilter::PostReplacementDamageTargetOwner
+            // CR 201.5a + CR 115.10a: resolved from its bound id, never chosen.
+            | TargetFilter::SpecificObject { .. }
+            // CR 201.5a + CR 115.10a: resolved from the granter stamp, never chosen.
+            | TargetFilter::GrantingObject { .. }
     )
 }
 
@@ -1424,19 +1436,21 @@ pub(crate) fn resolved_object_ids_for_filter_with_context(
         // CR 400.7: self-reference resolves only to the exact source or its own
         // immediate recorded event successor; a blinked-and-returned source
         // (higher incarnation) finds nothing.
-        // CR 201.5a: an un-concretized `GrantingObject` degrades to the source
-        // (host) — fail-safe; it is normally rewritten to `SpecificObject` at
-        // grant-clone time.
+        // CR 201.5: an unstamped `GrantingObject` resolves to the exact current
+        // ability source.
         TargetFilter::SelfRef => ability
             .self_ref_is_current(state)
             .then_some(ability.source_id)
             .into_iter()
             .collect(),
-        TargetFilter::GrantingObject => ability
-            .source_is_current(state)
-            .then_some(ability.source_id)
-            .into_iter()
-            .collect(),
+        TargetFilter::GrantingObject { bound } => match bound.or(ability.context.granting_object) {
+            Some(granter) => granter.is_current(state).then_some(granter.object_id),
+            None => ability
+                .source_is_current(state)
+                .then_some(ability.source_id),
+        }
+        .into_iter()
+        .collect(),
         // CR 400.7 + CR 603.7c: mirror the `resolved_targets` pin check on the
         // untargeted-pool path (the second SelfRef chokepoint).
         TargetFilter::ParentTarget => object_targets(&ability.live_object_targets(state)).collect(),
@@ -1519,15 +1533,31 @@ pub(crate) fn resolved_object_ids_for_filter_with_context(
     }
 }
 
-fn object_targets(targets: &[TargetRef]) -> impl Iterator<Item = ObjectId> + '_ {
-    targets.iter().filter_map(target_ref_object)
-}
-
 fn target_ref_object(target: &TargetRef) -> Option<ObjectId> {
     match target {
         TargetRef::Object(id) => Some(*id),
         TargetRef::Player(_) => None,
     }
+}
+
+fn object_targets(targets: &[TargetRef]) -> impl Iterator<Item = ObjectId> + '_ {
+    targets.iter().filter_map(target_ref_object)
+}
+
+fn resolve_source_attached_to(
+    state: &GameState,
+    source_id: ObjectId,
+) -> Option<crate::game::game_object::AttachTarget> {
+    if let Some(host) = state.objects.get(&source_id).and_then(|o| o.attached_to) {
+        return Some(host);
+    }
+    // CR 113.7a + CR 608.2k: Last-known information when the source permanent has left the battlefield.
+    state
+        .zone_changes_this_turn
+        .iter()
+        .rev()
+        .find(|r| r.object_id == source_id && r.from_zone == Some(Zone::Battlefield))
+        .and_then(|r| r.attached_to)
 }
 
 pub(crate) fn resolve_event_context_target_for_event_or_state(
@@ -1555,9 +1585,21 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
             Some(TargetRef::Player(player))
         }
         TargetFilter::TriggeringSource => {
-            let event = event?;
-            let obj_id = extract_source_from_event(event)?;
-            Some(TargetRef::Object(obj_id))
+            if let Some(event) = event {
+                if let Some(obj_id) = extract_source_from_event(event) {
+                    return Some(TargetRef::Object(obj_id));
+                }
+            }
+            // CR 301.5a + CR 303.4b + CR 608.2k: Aura/Equipment fallback — when no
+            // trigger event supplies a source object (e.g. an Aura/Equipment phase
+            // trigger or static ability), fall back to the source's attached host.
+            let host = state.objects.get(&source_id)?.attached_to?;
+            match host {
+                crate::game::game_object::AttachTarget::Object(id) => Some(TargetRef::Object(id)),
+                crate::game::game_object::AttachTarget::Player(player) => {
+                    Some(TargetRef::Player(player))
+                }
+            }
         }
         // Engine contract: "that creature" / "that permanent" resolves to the
         // object carried in the triggering event's target slot (the target
@@ -1630,48 +1672,59 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
             Some(TargetRef::Player(controller))
         }
         TargetFilter::ParentTarget => {
-            let event = event?;
-            if let Some(id) = blocked_attacker_from_event(event, source_id) {
-                return Some(TargetRef::Object(id));
+            if let Some(event) = event {
+                if let Some(id) = blocked_attacker_from_event(event, source_id) {
+                    return Some(TargetRef::Object(id));
+                }
+                match event {
+                    // CR 702.184a: "that creature" on a Stationed trigger is the
+                    // creature that stationed the Spacecraft (Monoist Gravliner).
+                    crate::types::events::GameEvent::Stationed { creature_id, .. } => {
+                        return Some(TargetRef::Object(*creature_id));
+                    }
+                    // CR 702.122: "that Vehicle" on a crews trigger is the crewed
+                    // Vehicle (Tiana, Angelic Mechanic).
+                    crate::types::events::GameEvent::VehicleCrewed { vehicle_id, .. } => {
+                        return Some(TargetRef::Object(*vehicle_id));
+                    }
+                    // CR 702.171: "that Mount" on a saddles trigger is the saddled Mount.
+                    crate::types::events::GameEvent::Saddled { mount_id, .. } => {
+                        return Some(TargetRef::Object(*mount_id));
+                    }
+                    // CR 603.2 + CR 608.2c: "that [creature/permanent]" on a zone-change
+                    // trigger (Captain America, Team Leader's "that Hero") is the entering
+                    // object when it is not the trigger source itself (Abigale's "that
+                    // creature" anaphor must still inherit the chosen target).
+                    crate::types::events::GameEvent::ZoneChanged { object_id, .. }
+                        if *object_id != source_id =>
+                    {
+                        return Some(TargetRef::Object(*object_id));
+                    }
+                    // CR 701.17c + CR 603.2: "that card" on a mill trigger is the
+                    // milled card, when it is not the trigger source itself (the
+                    // source keeps its chosen target). CR 701.17c admits the reference
+                    // only while the card's destination is a PUBLIC zone — "can find
+                    // that card in the zone it moved to from the library, as long as
+                    // that zone is a public zone". A replacement that diverts the card
+                    // to hand or library leaves nothing this effect may find, so the
+                    // reference resolves to no object rather than to a hidden one.
+                    crate::types::events::GameEvent::Milled { object_id, to, .. }
+                        if *object_id != source_id && to.is_public() =>
+                    {
+                        return Some(TargetRef::Object(*object_id));
+                    }
+                    _ => {}
+                }
             }
-            match event {
-                // CR 702.184a: "that creature" on a Stationed trigger is the
-                // creature that stationed the Spacecraft (Monoist Gravliner).
-                crate::types::events::GameEvent::Stationed { creature_id, .. } => {
-                    Some(TargetRef::Object(*creature_id))
+            // CR 301.5a + CR 303.4b + CR 608.2k: Aura/Equipment fallback — when no
+            // trigger event supplies an antecedent object (e.g. an Aura/Equipment phase
+            // trigger or static ability), fall back to the source's attached host.
+            let host = resolve_source_attached_to(state, source_id)?;
+            match host {
+                crate::game::game_object::AttachTarget::Object(id) => Some(TargetRef::Object(id)),
+                crate::game::game_object::AttachTarget::Player(player) => {
+                    Some(TargetRef::Player(player))
                 }
-                // CR 702.122: "that Vehicle" on a crews trigger is the crewed
-                // Vehicle (Tiana, Angelic Mechanic).
-                crate::types::events::GameEvent::VehicleCrewed { vehicle_id, .. } => {
-                    Some(TargetRef::Object(*vehicle_id))
-                }
-                // CR 702.171: "that Mount" on a saddles trigger is the saddled Mount.
-                crate::types::events::GameEvent::Saddled { mount_id, .. } => {
-                    Some(TargetRef::Object(*mount_id))
-                }
-                // CR 603.2 + CR 608.2c: "that [creature/permanent]" on a zone-change
-                // trigger (Captain America, Team Leader's "that Hero") is the entering
-                // object when it is not the trigger source itself (Abigale's "that
-                // creature" anaphor must still inherit the chosen target).
-                crate::types::events::GameEvent::ZoneChanged { object_id, .. }
-                    if *object_id != source_id =>
-                {
-                    Some(TargetRef::Object(*object_id))
-                }
-                // CR 701.17c + CR 603.2: "that card" on a mill trigger is the
-                // milled card, when it is not the trigger source itself (the
-                // source keeps its chosen target). CR 701.17c admits the reference
-                // only while the card's destination is a PUBLIC zone — "can find
-                // that card in the zone it moved to from the library, as long as
-                // that zone is a public zone". A replacement that diverts the card
-                // to hand or library leaves nothing this effect may find, so the
-                // reference resolves to no object rather than to a hidden one.
-                crate::types::events::GameEvent::Milled { object_id, to, .. }
-                    if *object_id != source_id && to.is_public() =>
-                {
-                    Some(TargetRef::Object(*object_id))
-                }
-                _ => None,
             }
         }
         TargetFilter::StackSpell => {
@@ -1699,7 +1752,7 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
                 .map(TargetRef::Player)
         }
         TargetFilter::AttachedTo => {
-            let host = state.objects.get(&source_id)?.attached_to?;
+            let host = resolve_source_attached_to(state, source_id)?;
             match host {
                 crate::game::game_object::AttachTarget::Object(id) => Some(TargetRef::Object(id)),
                 crate::game::game_object::AttachTarget::Player(player) => {
@@ -1708,10 +1761,35 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
             }
         }
         TargetFilter::ParentTargetController => {
-            let event = event?;
-            let source_obj_id = extract_source_from_event(event)?;
-            let controller = state.objects.get(&source_obj_id)?.controller;
-            Some(TargetRef::Player(controller))
+            if let Some(event) = event {
+                if let Some(source_obj_id) = extract_source_from_event(event) {
+                    if let Some(controller) =
+                        state.objects.get(&source_obj_id).map(|o| o.controller)
+                    {
+                        return Some(TargetRef::Player(controller));
+                    }
+                }
+            }
+            // CR 301.5 + CR 303.4 + CR 113.7a: Aura/Equipment fallback — the controller of the
+            // source's attached host is the controller of "that creature/permanent".
+            let host = resolve_source_attached_to(state, source_id)?;
+            match host {
+                crate::game::game_object::AttachTarget::Object(id) => state
+                    .objects
+                    .get(&id)
+                    .map(|obj| TargetRef::Player(obj.controller))
+                    .or_else(|| {
+                        state
+                            .zone_changes_this_turn
+                            .iter()
+                            .rev()
+                            .find(|r| r.object_id == id && r.from_zone == Some(Zone::Battlefield))
+                            .map(|r| TargetRef::Player(r.controller))
+                    }),
+                crate::game::game_object::AttachTarget::Player(player) => {
+                    Some(TargetRef::Player(player))
+                }
+            }
         }
         // CR 108.3 + CR 603.10a + CR 608.2c + CR 608.2h: `ParentTargetOwner`
         // mirrors `ParentTargetController` but returns the *owner* of the
@@ -1737,14 +1815,22 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
                     }
                 }
             }
-            // CR 301.5 + CR 303.4: Aura/Equipment fallback — the source's
+            // CR 301.5 + CR 303.4 + CR 113.7a: Aura/Equipment fallback — the source's
             // attached host is the implicit "it" subject of the sentence.
-            let host = state.objects.get(&source_id)?.attached_to?;
+            let host = resolve_source_attached_to(state, source_id)?;
             match host {
                 crate::game::game_object::AttachTarget::Object(id) => state
                     .objects
                     .get(&id)
-                    .map(|obj| TargetRef::Player(obj.owner)),
+                    .map(|obj| TargetRef::Player(obj.owner))
+                    .or_else(|| {
+                        state
+                            .zone_changes_this_turn
+                            .iter()
+                            .rev()
+                            .find(|r| r.object_id == id && r.from_zone == Some(Zone::Battlefield))
+                            .map(|r| TargetRef::Player(r.owner))
+                    }),
                 crate::game::game_object::AttachTarget::Player(player) => {
                     Some(TargetRef::Player(player))
                 }
@@ -6468,6 +6554,40 @@ mod tests {
             Some(PlayerId(1)),
             "\"that player\" must still resolve to the scoped chooser"
         );
+    }
+
+    /// CR 201.5a + CR 400.7: the untargeted-pool reader names the stamped granter
+    /// incarnation, nothing once it left, and the source when unstamped.
+    #[test]
+    fn granting_object_pool_reads_the_stamped_incarnation() {
+        let mut state = GameState::new_two_player(42);
+        let mk = |state: &mut GameState, n: u64, name: &str| {
+            create_object(
+                state,
+                CardId(n),
+                PlayerId(0),
+                name.to_string(),
+                Zone::Battlefield,
+            )
+        };
+        let host = mk(&mut state, 1, "Host");
+        let granter = mk(&mut state, 2, "Granter");
+        let mut ability = make_resolved_with_targets(vec![], host);
+        let pool = |state: &GameState, ability: &crate::types::ability::ResolvedAbility| {
+            resolved_object_ids_for_filter(
+                state,
+                ability,
+                &TargetFilter::GrantingObject { bound: None },
+            )
+        };
+        assert_eq!(pool(&state, &ability), vec![host]);
+        ability.context.granting_object = Some(
+            crate::types::identifiers::ObjectIncarnationRef::from_object(&state.objects[&granter]),
+        );
+        assert_eq!(pool(&state, &ability), vec![granter]);
+        crate::game::zones::move_to_zone(&mut state, granter, Zone::Exile, &mut Vec::new());
+        crate::game::zones::move_to_zone(&mut state, granter, Zone::Battlefield, &mut Vec::new());
+        assert!(pool(&state, &ability).is_empty());
     }
 
     /// CR 608.2c + 603.10a: Tier 1 — `SelfRef` with empty `ability.targets`

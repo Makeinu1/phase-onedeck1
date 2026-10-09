@@ -126,7 +126,7 @@ fn resolve_reveal(
         .ok_or(EffectError::PlayerNotFound)?;
 
     // Snapshot library (top = index 0) to iterate without borrow conflicts.
-    let library: Vec<ObjectId> = player.library.iter().copied().collect();
+    let library: Vec<ObjectId> = state.library_of(player.id).iter().copied().collect();
     let mut revealed_misses: Vec<ObjectId> = Vec::new();
     let mut hit_cards: Vec<ObjectId> = Vec::new();
 
@@ -226,6 +226,12 @@ fn resolve_reveal(
 
     // Store revealed IDs for downstream reference.
     state.last_revealed_ids = all_revealed.clone();
+    // CR 608.2c + CR 701.20a: "[quantity] revealed this way" names the cards this
+    // reveal revealed — every card looked at until the until-condition was met,
+    // matching or not. Publish them as the chain's tracked set so a downstream
+    // "the number of nonland cards revealed this way" reads the revealed
+    // population (Goblin Charbelcher) even after the cards have been moved.
+    super::publish_tracked_set(state, all_revealed.clone());
 
     // CR 701.20b: reveal-only until-loop — cards stay in their zones (Sanar's
     // Vivid draws nothing to hand before per-color exile from the library).

@@ -129,6 +129,7 @@ fn redact_paid_cast_cleanup_authority(waiting_for: &mut WaitingFor) {
         | WaitingFor::ChooseFromZoneChoice { .. }
         | WaitingFor::BeholdChoice { .. }
         | WaitingFor::EmpowerJaceChoice { .. }
+        | WaitingFor::SpellCopyOrderChoice { .. }
         | WaitingFor::ChooseOneOfBranch { .. }
         | WaitingFor::ConniveDiscard { .. }
         | WaitingFor::DiscardChoice { .. }
@@ -860,7 +861,7 @@ pub(crate) fn identity_projection_for_viewer(
         .players
         .iter()
         .filter(|p| p.can_look_at_top_of_library && can_view_private_for_player(p.id))
-        .filter_map(|p| p.library.front().copied())
+        .filter_map(|p| state.library_of(p.id).front().copied())
         .collect();
     let all_library_ids: Vec<ObjectId> = state
         .players
@@ -1795,8 +1796,15 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
     // redacts the underlying object. Keep that display payload consistent with
     // the filtered object view, while the player making the choice retains the
     // real source identity needed by the action round-trip.
-    if let WaitingFor::ReplacementChoice { candidates, .. } = &mut filtered.waiting_for {
+    if let WaitingFor::ReplacementChoice {
+        candidates,
+        remember_identity,
+        ..
+    } = &mut filtered.waiting_for
+    {
         if !replacement_choice_authorized {
+            // CR 400.2: definition snapshots can disclose hidden-origin source identities.
+            *remember_identity = None;
             for candidate in candidates {
                 let source_is_hidden = candidate.source_id != ObjectId(0)
                     && (hidden_replacement_candidate_source_ids.contains(&candidate.source_id)
@@ -2715,6 +2723,11 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
     filtered
         .priority_passing_modes
         .retain(|pid, _| viewer.is_some_and(|viewer| *pid == viewer));
+    filtered
+        .replacement_auto_choices
+        .retain(|record| viewer == Some(record.key.player));
+    // A replay cursor is internal to the event, not a viewer preference.
+    filtered.replacement_auto_choice_tail = None;
     filtered
         .may_trigger_auto_choices
         .retain(|record| viewer.is_some_and(|viewer| record.selector.player() == viewer));
@@ -3722,6 +3735,34 @@ fn redact_hidden_library_identity_carriers(
     // `CardsRevealed.card_names`), so its ids join to the names. No client
     // reads it.
     filtered.last_revealed_ids.clear();
+    // A tracked set is the engine's "revealed this way" population, kept in
+    // reveal order. Its members that sit in a library are position handles that
+    // join to the public ordered names (CR 401.2), so the viewer copy drops them;
+    // the engine's own copy keeps the full population for its quantity readers.
+    {
+        let in_library = |id: &ObjectId| {
+            hidden_library.contains(id)
+                || filtered
+                    .objects
+                    .get(id)
+                    .is_some_and(|object| object.zone == Zone::Library)
+        };
+        let hidden: HashSet<ObjectId> = filtered
+            .tracked_object_sets
+            .values()
+            .flatten()
+            .filter(|id| in_library(id))
+            .copied()
+            .collect();
+        if !hidden.is_empty() {
+            for members in filtered.tracked_object_sets.values_mut() {
+                members.retain(|id| !hidden.contains(id));
+            }
+            for causes in filtered.tracked_set_member_causes.values_mut() {
+                causes.retain(|id, _| !hidden.contains(id));
+            }
+        }
+    }
     for entry in filtered
         .stack
         .iter_mut()
@@ -8437,6 +8478,7 @@ mod tests {
                 remaining: vec![remaining],
                 linked_batch: Vec::new(),
                 cumulative: 0,
+                hits: Vec::new(),
             },
         ));
         let authoritative = serde_json::to_string(&state.pending_exile_from_top_until)

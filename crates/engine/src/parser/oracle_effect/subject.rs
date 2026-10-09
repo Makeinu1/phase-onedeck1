@@ -1448,15 +1448,15 @@ fn try_parse_subject_base_pt_set_clause_ast(
             .map(|keyword| ContinuousModification::AddKeyword { keyword }),
     );
 
+    // CR 611.2a: no stated duration means this base-P/T set lasts indefinitely.
+    // Permanent remains the unset sentinel for an enclosing clause duration.
+    let duration = leading_duration.or(Some(Duration::Permanent));
     let effect = Effect::GenericEffect {
         static_abilities: vec![StaticDefinition::continuous()
             .affected(affected)
             .modifications(modifications)
             .description(body.trim_end_matches('.').to_string())],
-        // CR 611.2a: a leading duration stripped above is threaded onto the
-        // GenericEffect; otherwise the sequence layer's wrapping duration (for
-        // the trigger-body path, where it is already stripped upstream) applies.
-        duration: leading_duration.clone(),
+        duration: duration.clone(),
         target: application.target.clone(),
         end_cost: None,
     };
@@ -1471,7 +1471,7 @@ fn try_parse_subject_base_pt_set_clause_ast(
         }),
         predicate: Box::new(PredicateAst::Continuous {
             effect,
-            duration: leading_duration,
+            duration,
             sub_ability: None,
         }),
     })
@@ -5513,21 +5513,44 @@ fn build_become_clause(
         });
     }
 
-    // CR 205.3e + CR 607.2d: "becomes that type" applies the creature type chosen
-    // by the preceding "Choose a creature type" instruction in the same ability
-    // (Imagecrafter, Unnatural Selection, Mistform Mutant, Standardize). Unlike
-    // the "of your choice" arm above, the choice is already made upstream, so this
-    // emits only the apply half — a continuous `AddChosenSubtype` that reads the
-    // source's chosen creature type at resolution. Must intercept before
-    // parse_animation_spec, which would mis-tokenize "that"/"type" as subtypes.
-    if become_text.eq_ignore_ascii_case("that type") {
+    // CR 608.2c + CR 608.2d: "becomes that type" consumes a choice made by an
+    // earlier instruction in this effect chain. CR 205.3e: the producer's
+    // domain, not the recipient's card type, determines which subtype is chosen.
+    // Emit only the application; the existing transient-effect snapshot binds
+    // this resolution's choice even when the source was sacrificed as a cost.
+    // Intercept before animation parsing can mistake "that type" for subtypes.
+    let become_lower = become_text.trim().to_lowercase();
+    if all_consuming(tag::<_, _, OracleError<'_>>("that type"))
+        .parse(become_lower.as_str())
+        .is_ok()
+    {
+        let modifications = match ctx.pending_choice_type.as_ref() {
+            // CR 305.7 + CR 305.6: setting a basic land type replaces land
+            // subtypes and rules-text abilities, then supplies intrinsic mana.
+            Some(crate::types::ability::ChoiceType::BasicLandType) => {
+                vec![ContinuousModification::SetChosenBasicLandType]
+            }
+            // CR 205.1a: a bare subtype change replaces its own subtype set.
+            Some(crate::types::ability::ChoiceType::CreatureType { .. }) => vec![
+                ContinuousModification::RemoveAllSubtypes {
+                    set: crate::types::card_type::SubtypeSet::Creature,
+                },
+                ContinuousModification::AddChosenSubtype {
+                    kind: ChosenSubtypeKind::CreatureType,
+                },
+            ],
+            _ => {
+                return Some(super::parsed_clause(Effect::unimplemented(
+                    "chosen_subtype_context",
+                    predicate.trim(),
+                )));
+            }
+        };
         let affected = static_affected_for_application(&application);
         let effect = Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::continuous()
                 .affected(affected)
-                .modifications(vec![ContinuousModification::AddChosenSubtype {
-                    kind: ChosenSubtypeKind::CreatureType,
-                }])
+                .modifications(modifications)
                 .description(become_text.to_string())],
             duration: duration.clone(),
             target: application.target.clone(),
@@ -5558,7 +5581,6 @@ fn build_become_clause(
         Prepared,
         Unprepared,
     }
-    let become_lower = become_text.trim().to_lowercase();
     if let Ok((_, kind)) = all_consuming(alt((
         value(
             PreparedKind::Unprepared,
@@ -6166,9 +6188,10 @@ fn ends_with_of_your_choice(lower: &str) -> bool {
 /// the non-choice "becomes a `<type>`" form (Possessed Goat). Previously this
 /// function anchored on the choice phrase literally ending in "of your choice",
 /// so any trailing marker text made the whole predicate fall through unparsed.
-/// The land/creature choice modification (`AddChosenSubtype`) is additive by
-/// construction (CR 205.1b) regardless of the marker, so accepting it changes
-/// nothing about the emitted modification — only whether the line parses at all.
+/// The marker selects the modification: without it the chosen creature type
+/// replaces the object's creature types (CR 205.1a) and the chosen basic land
+/// type sets the land's type (CR 305.7); with it the chosen subtype is added
+/// (CR 205.1b, CR 305.7).
 ///
 /// CR 611.2a + CR 608.2c — WHERE THE DURATION GOES. "A continuous effect
 /// generated by the resolution of a spell or ability lasts as long as stated by
@@ -6226,40 +6249,54 @@ fn try_parse_become_choice(
     // `parse_animation_spec` fallback). Peel it off with the shared
     // `split_in_addition_tail` splitter before the "of your choice" anchor
     // check below, so the choice phrase underneath is still recognized instead
-    // of the whole predicate falling through unparsed. `AddChosenSubtype` (the
-    // land/creature-type modification below) is additive by construction
-    // regardless of the marker, so no branching on the match is needed — it
-    // only needs to be accepted, not interpreted.
-    let choice_text = match split_in_addition_tail(choice_text) {
-        Some((prefix, _matched)) => prefix.trim(),
-        None => choice_text,
-    };
+    // of the whole predicate falling through unparsed. The marker selects
+    // retain semantics (CR 205.1b); its absence selects set semantics
+    // (CR 205.1a for a creature type, CR 305.7 for a basic land type).
+    let retained = split_in_addition_tail(choice_text);
+    let choice_text = retained.map_or(choice_text, |(prefix, _matched)| prefix.trim());
 
     let lower = choice_text.to_lowercase();
     if !ends_with_of_your_choice(lower.as_str()) {
         return None;
     }
 
-    let (choice_type, modification) = if lower.contains("creature type") {
-        (
-            ChoiceType::creature_type(),
-            // CR 205.1b: additive by construction regardless of the marker —
-            // `AddChosenSubtype` never clears existing creature subtypes (unlike
-            // the bare "are the chosen type" static form, which pairs it with
-            // `RemoveAllSubtypes` for CR 205.1a replacement semantics). The
-            // marker (if present) is accepted, not required.
-            ContinuousModification::AddChosenSubtype {
+    let (choice_type, mut modifications) = if nom_primitives::scan_contains(&lower, "creature type")
+    {
+        // CR 205.1b: with the marker the chosen creature type is added and the
+        // object keeps its other creature types. CR 205.1a + CR 613.1d: without
+        // it the chosen type replaces them — `RemoveAllSubtypes` then
+        // `AddChosenSubtype`, applied in the order written (the same pairing the
+        // bare "are the chosen type" static form emits).
+        let modifications = if retained.is_some() {
+            vec![ContinuousModification::AddChosenSubtype {
                 kind: ChosenSubtypeKind::CreatureType,
-            },
-        )
-    } else if lower.contains("basic land type") {
-        (
-            ChoiceType::BasicLandType,
+            }]
+        } else {
+            vec![
+                ContinuousModification::RemoveAllSubtypes {
+                    set: crate::types::card_type::SubtypeSet::Creature,
+                },
+                ContinuousModification::AddChosenSubtype {
+                    kind: ChosenSubtypeKind::CreatureType,
+                },
+            ]
+        };
+        (ChoiceType::creature_type(), modifications)
+    } else if nom_primitives::scan_contains(&lower, "basic land type") {
+        // CR 305.7: a land that becomes a basic land type without the marker
+        // loses its old land types (and the mana abilities they grant) —
+        // `SetChosenBasicLandType`, as the "enchanted land is the chosen type"
+        // static form emits. CR 305.7 (last sentence): with the marker it keeps
+        // its other types and gains the chosen one — `AddChosenSubtype`.
+        let modification = if retained.is_some() {
             ContinuousModification::AddChosenSubtype {
                 kind: ChosenSubtypeKind::BasicLandType,
-            },
-        )
-    } else if lower.contains("color") {
+            }
+        } else {
+            ContinuousModification::SetChosenBasicLandType
+        };
+        (ChoiceType::BasicLandType, vec![modification])
+    } else if nom_primitives::scan_contains(&lower, "color") {
         // CR 105.3: "become the color of your choice" — player chooses a color.
         // No printed card pairs this with the "in addition to its other colors"
         // marker (unlike the land/creature-type axes), so this stays the
@@ -6267,9 +6304,9 @@ fn try_parse_become_choice(
         // line parse instead of falling through, should one ever be printed.
         (
             ChoiceType::color(),
-            ContinuousModification::AddChosenColor {
+            vec![ContinuousModification::AddChosenColor {
                 mode: ColorChangeMode::Set,
-            },
+            }],
         )
     } else {
         return None;
@@ -6279,7 +6316,6 @@ fn try_parse_become_choice(
     // hexproof from that color") onto the apply-half. `parse_continuous_modifications`
     // is the shared keyword-grant building block; it maps "gains hexproof from
     // that color" → `AddKeyword(HexproofFrom(ChosenColor))`.
-    let mut modifications = vec![modification];
     if let Some(grant) = grant_text {
         modifications.extend(parse_continuous_modifications(grant));
     }
@@ -6569,7 +6605,7 @@ fn build_restriction_clause(
             | TargetFilter::SourceController
             | TargetFilter::ControllerAndControlledPermanents { .. }
             | TargetFilter::Opponent
-            | TargetFilter::GrantingObject
+            | TargetFilter::GrantingObject { .. }
             | TargetFilter::SourceOrPaired
             | TargetFilter::Not { .. }
             | TargetFilter::Or { .. }
@@ -11269,8 +11305,8 @@ mod tests {
         assert!(mods.contains(&ContinuousModification::AddKeyword {
             keyword: Keyword::Trample
         }));
-        // No leading duration in the trigger-body form.
-        assert_eq!(duration, None);
+        // CR 611.2a: an enclosing duration may still override this unset sentinel.
+        assert_eq!(duration, Some(Duration::Permanent));
     }
 
     #[test]

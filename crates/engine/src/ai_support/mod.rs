@@ -27,7 +27,7 @@ use crate::types::ability::{
     AbilityBlockEntry, AbilityKind, CounterCostSelection, TapCreaturesSelectionMode, TargetRef,
     TriggerDefinition,
 };
-use crate::types::actions::GameAction;
+use crate::types::actions::{GameAction, MulliganChoice};
 use crate::types::card_type::CoreType;
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{
@@ -367,6 +367,9 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
             },
             GameAction::ChooseReplacement { index },
         ) => *index >= *candidate_count,
+        (WaitingFor::ReplacementChoice { .. }, GameAction::ChooseReplacementAndRemember { choice }) => {
+            !crate::game::replacement::validate_remembered_replacement(state, choice)
+        }
         // CR 603.3b: Order must be a permutation of 0..triggers.len() — same
         // validity check the engine handler enforces. Reject early so the
         // simulation filter never fires a known-rejected action.
@@ -1322,6 +1325,7 @@ fn classify_flat_priority_action(action: &GameAction) -> FlatPriorityActionClass
         | GameAction::SelectTargets { .. }
         | GameAction::ChooseTarget { .. }
         | GameAction::ChooseReplacement { .. }
+        | GameAction::ChooseReplacementAndRemember { .. }
         | GameAction::ChooseEntryController { .. }
         | GameAction::OrderTriggers { .. }
         | GameAction::OrderCostReductions { .. }
@@ -1392,6 +1396,7 @@ fn classify_flat_priority_action(action: &GameAction) -> FlatPriorityActionClass
         | GameAction::SetPriorityPassingMode { .. }
         | GameAction::SetPriorityYield { .. }
         | GameAction::SetMayTriggerAutoChoice { .. }
+        | GameAction::SetReplacementAutoChoice { .. }
         | GameAction::SetTriggerOrderTemplate { .. }
         | GameAction::AssignCombatDamage { .. }
         | GameAction::AssignBlockerDamage { .. }
@@ -2572,10 +2577,38 @@ pub fn legal_actions_for_viewer(state: &GameState, viewer: PlayerId) -> LegalAct
     // controlled turn for them). Coincides with `acting_players().contains`
     // whenever no turn-control effect is active.
     if crate::game::turn_control::is_authorized_submitter(state, viewer) {
-        legal_actions_full(state)
+        let (actions, spell_costs, grouped) = legal_actions_full(state);
+        (
+            with_viewer_actions(state, viewer, actions),
+            spell_costs,
+            grouped,
+        )
     } else {
         (Vec::new(), HashMap::new(), HashMap::new())
     }
+}
+
+/// Adds to a seat-agnostic enumeration the actions only `viewer`'s own seat is
+/// offered. `UseSerumPowder` (CR 103.5b) and `FreeReveal` (CR 103.5, Dandan free
+/// reveal) depend on one seat's hand, so no unscoped enumerator carries them:
+/// they are emitted here, from the viewer's own pending entry, and a surface that
+/// skips this call simply lacks them.
+pub fn with_viewer_actions(
+    state: &GameState,
+    viewer: PlayerId,
+    mut actions: Vec<GameAction>,
+) -> Vec<GameAction> {
+    for object_id in crate::game::mulligan::serum_powders_offered_to(state, viewer) {
+        actions.push(GameAction::MulliganDecision {
+            choice: MulliganChoice::UseSerumPowder { object_id },
+        });
+    }
+    if crate::game::mulligan::free_reveal_offered_to(state, viewer) {
+        actions.push(GameAction::MulliganDecision {
+            choice: MulliganChoice::FreeReveal,
+        });
+    }
+    actions
 }
 
 /// CR 118.3: maximum TOTAL read-out entries summed across every object bucket
@@ -2660,8 +2693,8 @@ fn collect_activation_block_reasons_for_object(
 ///
 /// CR 117.1: this function is UNSCOPED. It returns the acting player's read-out
 /// regardless of who is asking. It is `pub` only for the viewer-less
-/// `engine-wasm` entry point (`get_legal_actions_js`), a single-player local
-/// surface with exactly one recipient. Publishing this map from a
+/// `engine-wasm` entry point (`get_legal_actions_js`), which no client surface
+/// reads. Publishing this map from a
 /// multi-recipient transport leaks a controller-relative payability read-out to
 /// opponents — the disclosure defect this design exists to avoid.
 ///
@@ -2793,7 +2826,7 @@ pub fn activation_block_reasons(state: &GameState) -> HashMap<ObjectId, Vec<Abil
     // CR 108.4 + CR 108.4a: same owner fallback as the hand loop above, and
     // CR 404.1 puts a card into its OWNER's graveyard. Mirrors the graveyard
     // loop in `candidates.rs`.
-    for &obj_id in &state.players[player.0 as usize].graveyard {
+    for &obj_id in state.graveyard_of(player) {
         if let Some(obj) = state.objects.get(&obj_id) {
             if obj.owner == player {
                 collect_activation_block_reasons_for_object(
@@ -4204,6 +4237,7 @@ mod tests {
             candidates: Vec::new(),
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
 
         assert!(cheap_reject_candidate(
@@ -6367,6 +6401,7 @@ mod tests {
                 bypass_beneficiary: None,
                 protection_does_not_remove: None,
                 room_door: None,
+                granting_object: None,
             };
             obj.static_definitions = vec![def].into();
         }
@@ -6491,6 +6526,7 @@ mod tests {
                 bypass_beneficiary: None,
                 protection_does_not_remove: None,
                 room_door: None,
+                granting_object: None,
             };
             obj.static_definitions = vec![def].into();
         }
@@ -6769,6 +6805,7 @@ mod tests {
                 phase: MulliganDecisionPhase::Declare,
             }],
             free_first_mulligan: false,
+            declared: Vec::new(),
         };
 
         assert!(
@@ -7328,6 +7365,7 @@ mod tests {
                     },
                 }],
                 free_first_mulligan: false,
+                declared: Vec::new(),
             },
             WaitingFor::OpeningHandBottomCards {
                 pending: vec![MulliganBottomEntry {

@@ -1,6 +1,7 @@
 import type { BracketDeckRequest, BracketEstimate } from "../types/bracketEstimate";
 import type {
   InteractionActionId,
+  InteractionId,
   InteractionPreview,
   InteractionPreviewRequest,
   InteractionSubmission,
@@ -168,7 +169,8 @@ export type BuiltInGameFormat =
   | "Momir"
   | "CommanderDraft"
   | "Freeform"
-  | "FreeformCommander";
+  | "FreeformCommander"
+  | "Dandan";
 
 /**
  * Wire form of `GameFormat::Custom(CustomFormatId)`.
@@ -1795,7 +1797,10 @@ export type ManaSourcePenalty =
 
 export type ManaSourceOutput =
   | { type: "Concrete"; data: ManaType }
-  | { type: "DeferredColorChoice" };
+  | {
+      type: "DeferredColorChoice";
+      data: { quantity: { type: "Fixed"; data: number } | { type: "Variable" } };
+    };
 
 export type ProductionOverride =
   | { type: "SingleColor"; data: ManaType }
@@ -2378,6 +2383,24 @@ export type ReplacementChoiceKind =
   | { type: "OptionalBranch" }
   | { type: "SearchFoundDestination" };
 
+export type ReplacementAutoChoice =
+  | { type: "Order"; data: { order: number[] } }
+  | { type: "Optional"; data: { index: number } };
+
+export interface ReplacementAutoChoiceKey {
+  player: PlayerId;
+  event: string;
+  kind: ReplacementChoiceKind;
+  candidates: unknown[];
+}
+
+export interface ReplacementAutoChoiceRecord {
+  id: string;
+  key: ReplacementAutoChoiceKey;
+  choice: ReplacementAutoChoice;
+  descriptions: string[];
+}
+
 export type EmergeSacrificeQuality =
   | { type: "Artifact" }
   | { type: "Battle" }
@@ -2477,6 +2500,7 @@ export type WaitingFor =
       data: {
         pending: { player: PlayerId; mulligan_count: number; phase: MulliganDecisionPhase }[];
         free_first_mulligan: boolean;
+        declared?: { player: PlayerId; mulligan_count: number; kind: MulliganDeclarationKind }[];
       };
     }
   | {
@@ -2503,7 +2527,7 @@ export type WaitingFor =
   | { type: "DeclareAttackers"; data: { player: PlayerId; valid_attacker_ids: ObjectId[]; valid_attack_targets?: AttackTarget[]; valid_attack_targets_by_attacker?: Record<string, AttackTarget[]>; attacker_constraints?: Record<string, CombatRequirement> } }
   | { type: "DeclareBlockers"; data: { player: PlayerId; valid_blocker_ids: ObjectId[]; valid_block_targets: Record<string, ObjectId[]>; block_requirements?: Record<string, BlockRequirementInfo>; blocker_constraints?: Record<string, CombatRequirement>; must_be_blocked_targets?: Record<string, ObjectId[]>; block_capacities?: Record<string, number | null> } }
   | { type: "GameOver"; data: { winner: PlayerId | null } }
-  | { type: "ReplacementChoice"; data: { player: PlayerId; candidate_count: number; candidates?: ReplacementCandidateSummary[]; kind?: ReplacementChoiceKind; last_applied_decides?: boolean } }
+  | { type: "ReplacementChoice"; data: { player: PlayerId; candidate_count: number; candidates?: ReplacementCandidateSummary[]; kind?: ReplacementChoiceKind; last_applied_decides?: boolean; remember_identity?: ReplacementAutoChoiceRecord["key"] } }
   | { type: "EntryControllerChoice"; data: { player: PlayerId; candidates: PlayerId[] } }
   | { type: "OrderTriggers"; data: { player: PlayerId; triggers: PendingTriggerSummary[] } }
   | { type: "CopyTargetChoice"; data: { player: PlayerId; source_id: ObjectId; valid_targets: ObjectId[]; max_mana_value?: number | null; purpose?: { type: "BecomeCopy" | "PersistChosenAttribute" | "CopyTokenSource" } } }
@@ -2654,6 +2678,7 @@ export type WaitingFor =
   | { type: "ChooseFromZoneChoice"; data: { player: PlayerId; cards: ObjectId[]; count: number; up_to?: boolean; constraint?: ChooseFromZoneConstraint | null; source_id: ObjectId; reciprocal_role?: "Produce" | "Consume" | null } }
   | { type: "BeholdChoice"; data: { player: PlayerId; choices: ObjectId[] } }
   | { type: "EmpowerJaceChoice"; data: { player: PlayerId; source_id: ObjectId; choices: ObjectId[]; count: number } }
+  | { type: "SpellCopyOrderChoice"; data: { player: PlayerId; source_id: ObjectId; choices: ObjectId[] } }
   | { type: "EffectZoneChoice"; data: {
       player: PlayerId;
       cards: ObjectId[];
@@ -2847,6 +2872,9 @@ export type LearnOption =
 
 // ── Mulligan ─────────────────────────────────────────────────────────────
 
+// CR 103.5: what a held mulligan does when the declare round closes.
+export type MulliganDeclarationKind = { type: "Regular" } | { type: "FreeReveal" };
+
 // CR 103.5 + 103.5b: Player decision at a MulliganDecision prompt.
 //   Keep            — lock in the opening hand (CR 103.5).
 //   Mulligan        — shuffle hand back, redraw the starting hand size (CR 103.5).
@@ -2854,10 +2882,13 @@ export type LearnOption =
 //                     the same number; mulligan counter unchanged (CR 103.5b
 //                     + Serum Powder Oracle text). `object_id` must reference
 //                     a card named "Serum Powder" in the actor's hand.
+//   FreeReveal      — Dandan: reveal a qualifying hand, return it and redraw
+//                     without taking a regular mulligan (CR 103.5 as modified).
 export type MulliganChoice =
   | { type: "Keep" }
   | { type: "Mulligan" }
-  | { type: "UseSerumPowder"; data: { object_id: ObjectId } };
+  | { type: "UseSerumPowder"; data: { object_id: ObjectId } }
+  | { type: "FreeReveal" };
 
 // ── Distribution ─────────────────────────────────────────────────────────
 
@@ -3100,6 +3131,8 @@ export type GameAction =
   | { type: "ChooseTarget"; data: { target: TargetRef | null } }
   | { type: "ChoosePair"; data: { partner: ObjectId | null } }
   | { type: "ChooseReplacement"; data: { index: number } }
+  | { type: "ChooseReplacementAndRemember"; data: { choice: ReplacementAutoChoice } }
+  | { type: "SetReplacementAutoChoice"; data: { selector: string | null } }
   | { type: "ChooseEntryController"; data: { opponent: PlayerId } }
   | { type: "OrderTriggers"; data: { order: number[] } }
   // CR 601.2f: the caster's elected cost-reduction order — a permutation of
@@ -3857,6 +3890,13 @@ export type TargetChoiceKind =
   | { type: "Objects"; data: { category: TargetObjectCategory } }
   | { type: "ObjectsAndPlayers"; data: { category: TargetObjectCategory } };
 
+export interface SharedPilesView {
+  /** The seat whose `Player.library` stores the shared library. */
+  library?: PlayerId;
+  /** The seat whose `Player.graveyard` stores the shared graveyard. */
+  graveyard?: PlayerId;
+}
+
 /**
  * Engine-authored projections computed at each state snapshot. Rides
  * alongside GameState through every adapter path. Frontend components
@@ -3866,6 +3906,8 @@ export type TargetChoiceKind =
  */
 export interface DerivedViews {
   unique_authorized_submitter?: PlayerId;
+  /** Engine-owned Scry prompt identity for this viewer, independent of opportunities. */
+  scry_prompt_id?: InteractionId;
   /** Viewer-visible object ids in each player's exile pile, keyed by PlayerId. */
   visible_exile_object_ids?: Record<string, ObjectId[]>;
   /**
@@ -3874,6 +3916,12 @@ export interface DerivedViews {
    * browser consumes this separately authorized projection.
    */
   debug_library_cards?: DebugLibraryCardView[];
+  /**
+   * Mirrors `engine::game::derived_views::SharedPilesView`. Present only for a
+   * format that shares a library or graveyard; a missing key means that zone is
+   * per-player.
+   */
+  shared_piles?: SharedPilesView;
   /**
    * Engine-classified live keyword badges for battlefield permanents. The
    * strip renders this map directly rather than deciding which keyword timing
@@ -4289,6 +4337,7 @@ export interface GameState {
   priority_yields?: PriorityYield[];
   /** CR 603.5: the viewer's stored "don't ask again" auto-choices for optional ("may") triggers. */
   may_trigger_auto_choices?: MayTriggerAutoChoiceRecord[];
+  replacement_auto_choices?: ReplacementAutoChoiceRecord[];
   lands_tapped_for_mana?: Record<number, number[]>;
   scheduled_turn_controls?: Array<{
     target_player: PlayerId;
@@ -4968,6 +5017,8 @@ export interface LlmDecisionRequestResult {
   optionCount?: number;
   request?: LlmHttpRequestSpec;
   error?: string;
+  /** The engine's typed refusal (`phase_llm::LlmError`), when it carries one. */
+  errorKind?: { kind: string };
 }
 
 /** Result of submitting an opaque AI proposal to its issuing authority. */
