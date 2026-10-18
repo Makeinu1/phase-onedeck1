@@ -155,7 +155,7 @@ fn resolve_put_sticker(
             ability.source_id,
             ability.controller,
         );
-        resolved.targets = ability.targets.clone();
+        resolved.mirror_targets_from(ability);
         resolved.context = ability.context.clone();
         resolved.chosen_x = ability.chosen_x;
         resolved.chosen_players = ability.chosen_players.clone();
@@ -237,11 +237,14 @@ fn resolve_put_sticker(
             controller: ability.controller,
             source_id: ability.source_id,
             branches,
-            parent_targets: ability.targets.clone(),
+            parent_occurrences: crate::types::game_state::ParentTargetOccurrences::of(ability),
             context: ability.context.clone(),
             replacement_applied: ability.replacement_applied.clone(),
             continuation: None,
             players: vec![ability.controller],
+            // CR 608.2 (run boon-blockers-20261010): synthetic sticker
+            // branches carry no trigger-event context — None is a no-op.
+            trigger_context: None,
         },
     );
     events.push(GameEvent::EffectResolved {
@@ -304,11 +307,14 @@ fn prompt_count_choice(
             controller: ability.controller,
             source_id: ability.source_id,
             branches,
-            parent_targets: ability.targets.clone(),
+            parent_occurrences: crate::types::game_state::ParentTargetOccurrences::of(ability),
             context: ability.context.clone(),
             replacement_applied: ability.replacement_applied.clone(),
             continuation: None,
             players: vec![ability.controller],
+            // CR 608.2 (run boon-blockers-20261010): synthetic sticker
+            // branches carry no trigger-event context — None is a no-op.
+            trigger_context: None,
         },
     );
 }

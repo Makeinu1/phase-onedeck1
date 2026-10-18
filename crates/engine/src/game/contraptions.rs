@@ -244,11 +244,14 @@ pub(crate) fn continue_assemble_batch(
             controller: player,
             source_id,
             branches: assemble_sprocket_branches(object_id, remaining),
-            parent_targets: Vec::new(),
+            parent_occurrences: Default::default(),
             context: crate::types::ability::SpellContext::default(),
             replacement_applied: Default::default(),
             continuation: None,
             players: vec![player],
+            // CR 608.2 (run boon-blockers-20261010): synthetic sprocket
+            // branches carry no trigger-event context — None is a no-op.
+            trigger_context: None,
         },
     );
 }
@@ -421,11 +424,14 @@ fn prompt_reassemble_sprocket_choice(
             controller: ability.controller,
             source_id: ability.source_id,
             branches,
-            parent_targets: ability.targets.clone(),
+            parent_occurrences: crate::types::game_state::ParentTargetOccurrences::of(ability),
             context: ability.context.clone(),
             replacement_applied: ability.replacement_applied.clone(),
             continuation: None,
             players: vec![ability.controller],
+            // CR 608.2 (run boon-blockers-20261010): synthetic sprocket
+            // branches carry no trigger-event context — None is a no-op.
+            trigger_context: None,
         },
     );
     Ok(())

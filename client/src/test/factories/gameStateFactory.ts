@@ -45,6 +45,7 @@ type ExploreChoiceWaitingFor = Extract<WaitingFor, { type: "ExploreChoice" }>;
 type PopulateChoiceWaitingFor = Extract<WaitingFor, { type: "PopulateChoice" }>;
 type RetargetChoiceWaitingFor = Extract<WaitingFor, { type: "RetargetChoice" }>;
 type ReturnAsAuraTargetWaitingFor = Extract<WaitingFor, { type: "ReturnAsAuraTarget" }>;
+type ChooseTokenHostWaitingFor = Extract<WaitingFor, { type: "ChooseTokenHost" }>;
 type ResolutionOptionalPaymentWaitingFor = Extract<
   WaitingFor,
   { type: "ResolutionOptionalPaymentChoice" }
@@ -445,6 +446,26 @@ export const buildReturnAsAuraTargetWaitingFor = (
   return returnAsAuraTargetWaitingForFactory.withData(overrides.data ?? {}).build();
 };
 
+export class ChooseTokenHostWaitingForFactory
+  extends PlayerWaitingForFactory<ChooseTokenHostWaitingFor> {}
+
+export const chooseTokenHostWaitingForFactory =
+  ChooseTokenHostWaitingForFactory.define((): ChooseTokenHostWaitingFor => ({
+    type: "ChooseTokenHost",
+    data: {
+      player: 0,
+      source_id: 1,
+      legal_targets: [],
+      pending_ability: null,
+    },
+  }));
+
+export const buildChooseTokenHostWaitingFor = (
+  overrides: Partial<ChooseTokenHostWaitingFor> = {},
+): ChooseTokenHostWaitingFor => {
+  return chooseTokenHostWaitingForFactory.withData(overrides.data ?? {}).build();
+};
+
 export class ChooseXValueWaitingForFactory extends PlayerWaitingForFactory<ChooseXValueWaitingFor> {}
 
 export const chooseXValueWaitingForFactory =
@@ -766,6 +787,7 @@ export const loopShortcutWaitingForFactory = LoopShortcutWaitingForFactory.defin
       points: [],
       convoke_tappable_count: 0,
     },
+    road: "Ring",
   },
 }));
 
@@ -808,6 +830,7 @@ export const respondToShortcutWaitingForFactory =
         count: "UntilLethal",
         unbounded: [{ DamageDealt: 1 }],
         win_kind: "LethalDamage",
+        road: "Ring",
       },
     },
   }));

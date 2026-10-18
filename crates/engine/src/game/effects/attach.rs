@@ -4,9 +4,9 @@ use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::game_object::AttachTarget;
 use crate::game::targeting::resolved_object_ids_for_filter;
 use crate::types::ability::{
-    AbilityCondition, AttachCardinality, AttachSelection, Effect, EffectError, EffectKind,
-    FilterProp, MultiTargetSpec, QuantityExpr, ResolvedAbility, TargetChoiceTiming, TargetFilter,
-    TargetRef, TypedFilter,
+    AbilityCondition, AttachCardinality, AttachSelection, AttachmentReferent, Effect, EffectError,
+    EffectKind, FilterProp, MultiTargetSpec, QuantityExpr, ResolvedAbility, TargetChoiceTiming,
+    TargetFilter, TargetRef, TypedFilter,
 };
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
@@ -944,10 +944,15 @@ pub(crate) fn attachment_candidates_from_zone_change(
     else {
         return Vec::new();
     };
+    // CR 603.12: a "When … this way" reflexive carries the zone change as its
+    // creation-gate event; it names the same event-scoped set as an "if" head.
     let Some(AbilityCondition::ZoneChangedThisWay {
         filter,
         destination: Some(Zone::Battlefield),
-    }) = ability.condition.as_ref()
+    }) = ability
+        .condition
+        .as_ref()
+        .and_then(AbilityCondition::zone_changed_this_way_head)
     else {
         return Vec::new();
     };
@@ -1278,7 +1283,7 @@ pub(crate) fn bind_resolution_attachment_choice(
                     .to_string(),
             ));
         }
-        choice_ability.targets.push(TargetRef::Object(selected_id));
+        choice_ability.push_target(TargetRef::Object(selected_id));
         let selected = state
             .objects
             .get(&selected_id)
@@ -1626,9 +1631,10 @@ fn resolve_object_filter<'a>(
             Some(source) if source.identity.reference.object_id != ability.source_id => {
                 Some(ability.source_id)
             }
-            _ => ability
+            Some(_) => ability
                 .source_is_current(state)
                 .then_some(ability.source_id),
+            None => ability.self_ref_binding(state),
         },
         TargetFilter::LastCreated => target_slots
             .find_map(|target| match target {
@@ -1692,10 +1698,14 @@ fn resolve_object_filter<'a>(
 
 fn filter_has_attached_to_source(filter: &TargetFilter) -> bool {
     match filter {
-        TargetFilter::Typed(tf) => tf
-            .properties
-            .iter()
-            .any(|p| matches!(p, FilterProp::AttachedToSource)),
+        TargetFilter::Typed(tf) => tf.properties.iter().any(|p| {
+            matches!(
+                p,
+                FilterProp::AttachedTo {
+                    to: AttachmentReferent::Source
+                }
+            )
+        }),
         TargetFilter::And { filters } | TargetFilter::Or { filters } => {
             filters.iter().any(filter_has_attached_to_source)
         }
@@ -1710,7 +1720,14 @@ fn strip_attached_to_source_prop(filter: &TargetFilter) -> TargetFilter {
             properties: tf
                 .properties
                 .iter()
-                .filter(|p| !matches!(p, FilterProp::AttachedToSource))
+                .filter(|p| {
+                    !matches!(
+                        p,
+                        FilterProp::AttachedTo {
+                            to: AttachmentReferent::Source
+                        }
+                    )
+                })
                 .cloned()
                 .collect(),
             ..tf.clone()
@@ -1977,15 +1994,13 @@ pub(crate) enum AttachIllegality {
     Prohibited,
 }
 
-/// Returns `Some(reason)` when an object host forbids `attachment` via
-/// protection or a can't-be-attached static, else `None`.
-///
-/// Does NOT evaluate the Enchant filter or zone — that legality is applied by
-/// the caller (`is_valid_attachment_target` checks it for the SBA path). The
-/// checks here are purely additive prohibitions that apply equally at attach
-/// time and continuously thereafter, so routing both paths through this resolver
-/// keeps them from drifting.
-pub(crate) fn attachment_illegality(
+/// Live-object convenience over [`attachment_illegality_projected`], kept for
+/// the unit tests below: production routes live reads through
+/// `sba::is_valid_attachment_target_for_attacher` (which feeds the stored
+/// object) and pre-entry reads through the projected resolver directly, so a
+/// second production entry point would be a second authority to drift.
+#[cfg(test)]
+fn attachment_illegality(
     state: &GameState,
     attachment_id: ObjectId,
     host_id: ObjectId,
@@ -5201,7 +5216,9 @@ mod tests {
                 attachment: TargetFilter::Typed(
                     TypedFilter::default()
                         .subtype("Equipment".to_string())
-                        .properties(vec![FilterProp::AttachedToSource]),
+                        .properties(vec![FilterProp::AttachedTo {
+                            to: AttachmentReferent::Source,
+                        }]),
                 ),
                 target: TargetFilter::ParentTarget,
                 selection: AttachSelection::Targeted,
@@ -5251,7 +5268,9 @@ mod tests {
                 attachment: TargetFilter::Typed(
                     TypedFilter::default()
                         .subtype("Equipment".to_string())
-                        .properties(vec![FilterProp::AttachedToSource]),
+                        .properties(vec![FilterProp::AttachedTo {
+                            to: AttachmentReferent::Source,
+                        }]),
                 ),
                 target: TargetFilter::ParentTarget,
                 selection: AttachSelection::Targeted,

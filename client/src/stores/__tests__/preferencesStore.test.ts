@@ -314,6 +314,36 @@ describe("preferencesStore", () => {
     expect(state.pacingMultipliers).toEqual({ effects: 1.0, combat: 1.0, banners: 1.0 });
   });
 
+  it("hydrates a v37 blob without the priority-alert fields with all three on, and reset restores them", () => {
+    localStorage.setItem(
+      "phase-preferences",
+      JSON.stringify({ state: { cardSize: "large" }, version: 37 }),
+    );
+    act(() => usePreferencesStore.persist.rehydrate());
+
+    const hydrated = usePreferencesStore.getState();
+    expect(hydrated.cardSize).toBe("large");
+    expect(hydrated.priorityAlertVisual).toBe(true);
+    expect(hydrated.priorityAlertSound).toBe(true);
+    expect(hydrated.priorityAlertTitle).toBe(true);
+
+    act(() => {
+      hydrated.setPriorityAlertVisual(false);
+      hydrated.setPriorityAlertSound(false);
+      hydrated.setPriorityAlertTitle(false);
+    });
+    expect(usePreferencesStore.getState().priorityAlertVisual).toBe(false);
+    expect(usePreferencesStore.getState().priorityAlertSound).toBe(false);
+    expect(usePreferencesStore.getState().priorityAlertTitle).toBe(false);
+
+    act(() => usePreferencesStore.getState().resetAllPreferences());
+
+    const reset = usePreferencesStore.getState();
+    expect(reset.priorityAlertVisual).toBe(true);
+    expect(reset.priorityAlertSound).toBe(true);
+    expect(reset.priorityAlertTitle).toBe(true);
+  });
+
   it("resetAllPreferences wipes everything back to defaults", () => {
     act(() => {
       usePreferencesStore.getState().setCardSize("large");
@@ -381,6 +411,24 @@ describe("preferencesStore", () => {
   });
 
   it("falls back from an unsupported current-version persisted locale", () => {
+    // `zh-Hans` used to be this test's unsupported tag; it now resolves to the
+    // shipped `zh`, so using it here asserted the opposite of the behaviour
+    // under test. `zh-Hant` is genuinely unsupported — no Traditional catalog
+    // ships — and must not be folded into Simplified.
+    localStorage.setItem(
+      "phase-preferences",
+      JSON.stringify({ state: { language: "zh-Hant" }, version: 34 }),
+    );
+
+    act(() => usePreferencesStore.persist.rehydrate());
+
+    expect(usePreferencesStore.getState().language).toBe("en");
+  });
+
+  it("normalizes a persisted Simplified Chinese tag to the shipped zh locale", () => {
+    // The positive half of the case above, so "zh is supported" is asserted
+    // directly rather than being implied by a membership check that a hardcoded
+    // list could quietly stop covering.
     localStorage.setItem(
       "phase-preferences",
       JSON.stringify({ state: { language: "zh-Hans" }, version: 34 }),
@@ -388,9 +436,7 @@ describe("preferencesStore", () => {
 
     act(() => usePreferencesStore.persist.rehydrate());
 
-    expect(["en", "es", "fr", "de", "it", "pt", "pl", "ja"]).toContain(
-      usePreferencesStore.getState().language,
-    );
+    expect(usePreferencesStore.getState().language).toBe("zh");
   });
 
   it("migrates pre-log-dock preferences to the prior right dock", () => {

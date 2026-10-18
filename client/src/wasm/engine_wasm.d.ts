@@ -139,6 +139,25 @@ export function customFormatFromLobbyConfig(name: string, format_config: any): a
 export function deckCopyLimit(name: string): any;
 
 /**
+ * Who supplies `format`'s deck; the lobby offers a pile choice only for `HostPile`.
+ */
+export function deckSupplyForFormat(format: any): any;
+
+/**
+ * Host the running Eye to Eye / Mouth to Mouth contest locally (single-player and
+ * P2P-host engines have no server to stamp time). The JS driver passes its own
+ * monotonic `now_ms` (`performance.now()`), the seats that are AI, and any clicks it
+ * collected since the last call — each stamped with its own `at_ms`. Clicks are
+ * applied in order, then the clock is advanced to `now_ms`, exactly as the server
+ * does; the engine's state machine decides everything.
+ *
+ * A contest's real-time result cannot be replayed from a recorded action list, so
+ * the first drive call invalidates an in-progress replay recording (the same
+ * treatment debug actions get).
+ */
+export function drive_contest_js(now_ms: number, ai_players: Uint8Array, away_players: Uint8Array, clicks: any): any;
+
+/**
  * Estimates a Commander deck's bracket without touching `GAME_STATE`.
  * Reads `CARD_DB` for bracket signals. Returns `null` (via serde) when the
  * deck has no commander or the card database is not loaded.
@@ -303,10 +322,10 @@ export function get_card_parse_details(name: string): any;
 export function get_card_rulings(name: string): any;
 
 /**
- * Filtered-viewer variant of `get_game_state`. Runs the viewer filter
- * first (hides opponent hand/library per standard multiplayer redaction),
- * then derives views over the filtered state so the wire shape is
- * identical to `get_game_state` regardless of filter path.
+ * Variant of `get_game_state` that takes the viewer seat as an argument.
+ * Runs the viewer filter first (hides opponent hand/library per standard
+ * multiplayer redaction), then wraps the result in the same
+ * `ClientGameStateRef` envelope `get_game_state` returns.
  */
 export function get_filtered_game_state(viewer: number): any;
 
@@ -725,6 +744,8 @@ export interface InitOutput {
     readonly companionCandidates: (a: any) => [number, number, number];
     readonly customFormatFromLobbyConfig: (a: number, b: number, c: any) => [number, number, number];
     readonly deckCopyLimit: (a: number, b: number) => any;
+    readonly deckSupplyForFormat: (a: any) => any;
+    readonly drive_contest_js: (a: number, b: number, c: number, d: number, e: number, f: any) => any;
     readonly estimate_bracket_for_deck: (a: any) => [number, number, number];
     readonly evaluateDeckFormatGate: (a: any) => [number, number, number];
     readonly evaluate_deck_compatibility_js: (a: any) => [number, number, number];

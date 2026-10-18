@@ -8,17 +8,18 @@ use crate::database::synthesis::KeywordTriggerInstaller;
 use crate::game::arithmetic::saturating_pt_add;
 use crate::game::combat::AttackTarget;
 use crate::game::conditions::{
-    counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_has_city_blessing,
-    eval_has_enduring_story, eval_is_initiative, eval_is_monarch, eval_no_monarch,
-    eval_recipient_attacking_owner_target, eval_shares_color_with_most_common_color,
-    eval_source_entered_this_turn, eval_source_has_dealt_damage, eval_source_in_zone,
-    eval_source_is_attacking, eval_source_is_tapped_on_battlefield,
+    counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_has_boon,
+    eval_has_city_blessing, eval_has_enduring_story, eval_is_initiative, eval_is_monarch,
+    eval_no_monarch, eval_recipient_attacking_owner_target,
+    eval_shares_color_with_most_common_color, eval_source_entered_this_turn,
+    eval_source_has_dealt_damage, eval_source_in_zone, eval_source_is_attacking,
+    eval_source_is_tapped_on_battlefield,
 };
 use crate::game::devotion::count_devotion;
 use crate::game::filter::{
-    matches_target_filter, target_filter_characteristic_reads,
+    attachment_relation_rejects, matches_target_filter, target_filter_characteristic_reads,
     target_filter_characteristic_reads_at, CharacteristicKinds, FilterContext,
-    CHARACTERISTIC_READ_DEPTH,
+    CHARACTERISTIC_READ_DEPTH, UNPAIRED_READS,
 };
 use crate::game::game_object::DisplaySource;
 use crate::game::printed_cards::{
@@ -31,11 +32,11 @@ use crate::game::quantity::{
 };
 use crate::game::speed::{effective_speed, has_max_speed};
 use crate::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, AttackedYouScope,
-    BasicLandType, CardTypeSetSource, CastingPermission, ChosenSubtypeKind, CommanderOwnership,
-    ContinuousModification, CopiableValues, Designation, Duration, Effect, FilterProp,
-    ManaContribution, ManaProduction, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef,
-    StaticCondition, StaticDefinition, TargetFilter, TriggerGrantProducerKey,
+    AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, AttachmentReferent,
+    AttackedYouScope, BasicLandType, CardTypeSetSource, CastingPermission, ChosenSubtypeKind,
+    CommanderOwnership, ContinuousModification, CopiableValues, Designation, Duration, Effect,
+    FilterProp, ManaContribution, ManaProduction, PlayerFilter, PlayerScope, QuantityExpr,
+    QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TriggerGrantProducerKey,
     TriggerProducerOrigin, TypedFilter,
 };
 use crate::types::ability_visit::{
@@ -43,7 +44,7 @@ use crate::types::ability_visit::{
 };
 use crate::types::attribution::EffectRef;
 use crate::types::card_type::{
-    is_land_subtype, noncreature_subtype_set, CoreType, SubtypeSet, Supertype,
+    is_land_subtype, noncreature_subtype_set, CardType, CoreType, SubtypeSet, Supertype,
 };
 use crate::types::counter::{has_positive_counters, CounterType};
 use crate::types::game_state::{
@@ -80,7 +81,20 @@ impl LayerZoneObjectCache {
         self.ids_by_zone.entry(zone).or_insert_with(|| {
             #[cfg(test)]
             record_layer_zone_materialization(zone);
-            super::targeting::zone_object_ids(state, zone)
+            let mut ids = super::targeting::zone_object_ids(state, zone);
+            // CR 608.2n + CR 613.1: an instant or sorcery whose resolution is
+            // paused for a choice is popped off `state.stack` but is still on the
+            // stack until its final part. The keyword-reset loop below already
+            // resets it, so a continuous effect granting it a keyword (Taigam's
+            // rebound) must be re-applied to it in the same pass.
+            if zone == Zone::Stack {
+                if let Some(entry) = super::stack::resolving_instant_or_sorcery_on_stack(state) {
+                    if !ids.contains(&entry.id) {
+                        ids.push(entry.id);
+                    }
+                }
+            }
+            ids
         })
     }
 
@@ -220,34 +234,69 @@ enum ContinuousEffectGroupKey {
 
 type StartedContinuousEffectSets = HashMap<ContinuousEffectGroupKey, Vec<ObjectId>>;
 
+/// CR 205.3: The subtype set a card type owns. Kindred (and the legacy Tribal
+/// type) share the creature types (CR 205.3m, CR 308.2, CR 308.3). Card types
+/// with no subtype list of their own correlate with no subtype set.
+fn core_type_subtype_set(core_type: CoreType) -> Option<SubtypeSet> {
+    match core_type {
+        // CR 205.3m + CR 308.2 + CR 308.3: creatures and kindreds share creature types.
+        CoreType::Creature | CoreType::Kindred | CoreType::Tribal => Some(SubtypeSet::Creature),
+        // CR 205.3g: artifact types.
+        CoreType::Artifact => Some(SubtypeSet::Artifact),
+        // CR 205.3h: enchantment types.
+        CoreType::Enchantment => Some(SubtypeSet::Enchantment),
+        // CR 205.3i: land types.
+        CoreType::Land => Some(SubtypeSet::Land),
+        // CR 205.3j: planeswalker types.
+        CoreType::Planeswalker => Some(SubtypeSet::Planeswalker),
+        // CR 205.3k: instants and sorceries share spell types.
+        CoreType::Instant | CoreType::Sorcery => Some(SubtypeSet::Spell),
+        // CR 205.3q: battle types.
+        CoreType::Battle => Some(SubtypeSet::Battle),
+        CoreType::Dungeon
+        | CoreType::Plane
+        | CoreType::Phenomenon
+        | CoreType::Scheme
+        | CoreType::Conspiracy => None,
+    }
+}
+
+/// CR 205.3: The subtype set a subtype belongs to. The fixed noncreature lists
+/// are authoritative; every other subtype is a creature type (CR 205.3m).
+fn subtype_set_of(subtype: &str) -> SubtypeSet {
+    noncreature_subtype_set(subtype).unwrap_or(SubtypeSet::Creature)
+}
+
 // CR 205.3c: Each subtype is correlated to its appropriate card type.
-/// CR 205.1a: Whether a subtype correlates to at least one of the given core
-/// types — i.e. whether it survives a card-type replacement. Shared with the
+/// CR 205.1a + CR 205.3d: Whether a subtype correlates to at least one of the
+/// given core types - i.e. whether it survives a card-type replacement or
+/// removal. A creature type correlates only to Creature, Kindred or Tribal, so
+/// it never survives on an object that has none of them. Shared with the
 /// token-copy "stamp at creation" path so both the layered and baked
 /// applications of `SetCardTypes` drop the same uncorrelated subtypes.
-pub(crate) fn subtype_matches_core_types(
-    subtype: &str,
-    core_types: &[CoreType],
-    all_creature_types: &[String],
-) -> bool {
-    let Some(set) = noncreature_subtype_set(subtype) else {
-        return core_types.contains(&CoreType::Creature)
-            || core_types.contains(&CoreType::Kindred)
-            || all_creature_types
-                .iter()
-                .any(|creature_type| creature_type == subtype);
+pub(crate) fn subtype_matches_core_types(subtype: &str, core_types: &[CoreType]) -> bool {
+    let set = subtype_set_of(subtype);
+    core_types
+        .iter()
+        .any(|core_type| core_type_subtype_set(*core_type) == Some(set))
+}
+
+/// CR 205.1a: Remove a card type. "If an object's card type is removed, the
+/// subtypes correlated with that card type will remain if they are also the
+/// subtypes of a card type the object currently has; otherwise, they are also
+/// removed for the entire time the object's card type is removed." Only
+/// subtypes of the removed type's own set are considered, so an unrelated
+/// subtype added by a later effect is untouched. Shared by the layered
+/// `RemoveType` application, the baked token-copy arms and the bestow form.
+pub(crate) fn remove_core_type(card_types: &mut CardType, core_type: CoreType) {
+    card_types.core_types.retain(|t| *t != core_type);
+    let Some(removed_set) = core_type_subtype_set(core_type) else {
+        return;
     };
-    core_types.iter().any(|core_type| {
-        matches!(
-            (core_type, set),
-            (CoreType::Artifact, SubtypeSet::Artifact)
-                | (CoreType::Enchantment, SubtypeSet::Enchantment)
-                | (CoreType::Land, SubtypeSet::Land)
-                | (CoreType::Planeswalker, SubtypeSet::Planeswalker)
-                | (CoreType::Instant | CoreType::Sorcery, SubtypeSet::Spell)
-                | (CoreType::Battle, SubtypeSet::Battle)
-        )
-    })
+    let remaining = &card_types.core_types;
+    card_types.subtypes.retain(|subtype| {
+        subtype_set_of(subtype) != removed_set || subtype_matches_core_types(subtype, remaining)
+    });
 }
 
 /// CR 205.3: Remove every subtype belonging to `set`. Creature-type membership
@@ -704,15 +753,20 @@ fn prune_casting_permissions_at(
     seam: PermissionSeam,
     active: Option<PlayerId>,
 ) {
-    for obj in state.objects.iter_mut().map(|(_, v)| v) {
-        obj.casting_permissions.retain(|p| {
-            let lifetime = p.lifetime();
-            match lifetime.duration {
-                Some(d) => !permission_duration_expires_at(seam, d, lifetime.keyed_player, active),
-                None => true,
-            }
-        });
-    }
+    state.objects.update_where(
+        |_, obj| !obj.casting_permissions.is_empty(),
+        |_, obj| {
+            obj.casting_permissions.retain(|p| {
+                let lifetime = p.lifetime();
+                match lifetime.duration {
+                    Some(d) => {
+                        !permission_duration_expires_at(seam, d, lifetime.keyed_player, active)
+                    }
+                    None => true,
+                }
+            });
+        },
+    );
 }
 
 /// CR 514.2: Remove durational casting permissions whose duration ends at the
@@ -776,29 +830,42 @@ pub fn prune_end_of_turn_casting_permissions(state: &mut GameState) {
 /// `state.transient_continuous_effects` only, which is not where a casting
 /// permission lives.
 pub fn prune_untap_step_casting_permissions(state: &mut GameState, active_player: PlayerId) {
-    for obj in state.objects.iter_mut().map(|(_, v)| v) {
-        for p in obj.casting_permissions.iter_mut() {
-            // CR 514.2: arming keys on the GRANTEE — "until the end of THEIR
-            // next turn" names the player the grant was made to, not the player
-            // a `PlayerScope::Controller` deadline resolves "your" against. See
-            // `CastingPermission::lifetime_mut` for why the two differ and what
-            // collapsing them costs (Suspend Aggression).
-            let (Some(duration), grantee) = p.lifetime_mut() else {
-                continue;
-            };
-            if matches!(
-                duration,
-                Duration::UntilEndOfNextTurnOf {
-                    player: PlayerScope::Controller
-                }
-            ) && grantee == Some(active_player)
-            {
-                *duration = Duration::UntilEndOfTurn;
-            }
-        }
-    }
+    arm_grantee_next_turn_casting_permissions(state, active_player);
     prune_casting_permissions_at(state, PermissionSeam::TurnStart, Some(active_player));
     prune_casting_permissions_at(state, PermissionSeam::UntapStep, Some(active_player));
+}
+
+/// Rewrites every casting permission that lasts "until the end of the
+/// grantee's next turn" and was granted to `active_player` so that it ends at
+/// the end of the turn now beginning. This is the arming step of
+/// `prune_untap_step_casting_permissions`, its only caller. Objects holding no
+/// casting permission are not written, so they stay shared with clones of the
+/// state.
+fn arm_grantee_next_turn_casting_permissions(state: &mut GameState, active_player: PlayerId) {
+    state.objects.update_where(
+        |_, obj| !obj.casting_permissions.is_empty(),
+        |_, obj| {
+            for p in obj.casting_permissions.iter_mut() {
+                // CR 514.2: arming keys on the GRANTEE — "until the end of THEIR
+                // next turn" names the player the grant was made to, not the player
+                // a `PlayerScope::Controller` deadline resolves "your" against. See
+                // `CastingPermission::lifetime_mut` for why the two differ and what
+                // collapsing them costs (Suspend Aggression).
+                let (Some(duration), grantee) = p.lifetime_mut() else {
+                    continue;
+                };
+                if matches!(
+                    duration,
+                    Duration::UntilEndOfNextTurnOf {
+                        player: PlayerScope::Controller
+                    }
+                ) && grantee == Some(active_player)
+                {
+                    *duration = Duration::UntilEndOfTurn;
+                }
+            }
+        },
+    );
 }
 
 /// CR 500.4 + CR 500.8 + CR 500.9 + CR 500.10: the casting-permission seam
@@ -996,15 +1063,18 @@ pub fn prune_host_left_effects(state: &mut GameState, departed_id: ObjectId) {
 /// carrying no duration at all, and are ended by
 /// `zones::apply_zone_exit_cleanup` when the card leaves exile.)
 pub fn prune_host_left_casting_permissions(state: &mut GameState, departed_id: ObjectId) {
-    for obj in state.objects.iter_mut().map(|(_, v)| v) {
-        obj.casting_permissions.retain(|p| {
-            let lifetime = p.lifetime();
-            let host_bound = lifetime
-                .duration
-                .is_some_and(Duration::ends_when_host_leaves_play);
-            !(host_bound && lifetime.source_id == Some(departed_id))
-        });
-    }
+    state.objects.update_where(
+        |_, obj| !obj.casting_permissions.is_empty(),
+        |_, obj| {
+            obj.casting_permissions.retain(|p| {
+                let lifetime = p.lifetime();
+                let host_bound = lifetime
+                    .duration
+                    .is_some_and(Duration::ends_when_host_leaves_play);
+                !(host_bound && lifetime.source_id == Some(departed_id))
+            });
+        },
+    );
 }
 
 /// CR 611.2b: revoke every casting permission whose stated lifetime has ended
@@ -1279,8 +1349,14 @@ pub(crate) fn prune_controller_controls_source_on_leave(
     use crate::types::ability::ReplacementCondition;
 
     let mut changed = false;
-    for (host_id, obj) in state.objects.iter_mut() {
-        let host_left = *host_id == departed_id;
+    // CR 400.7 + CR 611.2a: Only a lapsed `ControllerControlsSource` def, a
+    // turn-bound die-exile rider, or a host-lifetime exile rider
+    // (`UntilHostLeavesPlay`, CR 702.84a) on the departing host is eligible
+    // to be dropped. The host-left arm must not wipe printed replacements or
+    // unrelated runtime riders. Dropping the host-lifetime rider from
+    // base+live here is what prevents it reviving on a same-ObjectId
+    // re-entry (CR 400.7 — the returning object is new).
+    let drop = |host_left: bool, def: &crate::types::ability::ReplacementDefinition| {
         let is_lapsed = |def: &crate::types::ability::ReplacementDefinition| {
             host_left
                 || matches!(
@@ -1289,33 +1365,41 @@ pub(crate) fn prune_controller_controls_source_on_leave(
                         if source == departed_id
                 )
         };
-        // CR 400.7 + CR 611.2a: Only a lapsed `ControllerControlsSource` def, a
-        // turn-bound die-exile rider, or a host-lifetime exile rider
-        // (`UntilHostLeavesPlay`, CR 702.84a) on the departing host is eligible
-        // to be dropped. The host-left arm must not wipe printed replacements or
-        // unrelated runtime riders. Dropping the host-lifetime rider from
-        // base+live here is what prevents it reviving on a same-ObjectId
-        // re-entry (CR 400.7 — the returning object is new).
-        let drop = |def: &crate::types::ability::ReplacementDefinition| {
-            (matches!(
-                def.condition,
-                Some(ReplacementCondition::ControllerControlsSource { .. })
-            ) && is_lapsed(def))
-                || (host_left && is_runtime_target_die_exile_replacement(def))
-                || (host_left && is_runtime_host_lifetime_replacement(def))
-        };
-        let before_live = obj.replacement_definitions.len();
-        obj.replacement_definitions.retain(|d| !drop(d));
-        let before_base = obj.base_replacement_definitions.len();
-        if obj.base_replacement_definitions.iter().any(drop) {
-            std::sync::Arc::make_mut(&mut obj.base_replacement_definitions).retain(|d| !drop(d));
-        }
-        if obj.replacement_definitions.len() != before_live
-            || obj.base_replacement_definitions.len() != before_base
-        {
-            changed = true;
-        }
-    }
+        (matches!(
+            def.condition,
+            Some(ReplacementCondition::ControllerControlsSource { .. })
+        ) && is_lapsed(def))
+            || (host_left && is_runtime_target_die_exile_replacement(def))
+            || (host_left && is_runtime_host_lifetime_replacement(def))
+    };
+    state.objects.update_where(
+        |host_id, obj| {
+            let host_left = *host_id == departed_id;
+            obj.replacement_definitions
+                .iter_all()
+                .any(|d| drop(host_left, d))
+                || obj
+                    .base_replacement_definitions
+                    .iter()
+                    .any(|d| drop(host_left, d))
+        },
+        |host_id, obj| {
+            let host_left = *host_id == departed_id;
+            let drop = |def: &crate::types::ability::ReplacementDefinition| drop(host_left, def);
+            let before_live = obj.replacement_definitions.len();
+            obj.replacement_definitions.retain(|d| !drop(d));
+            let before_base = obj.base_replacement_definitions.len();
+            if obj.base_replacement_definitions.iter().any(drop) {
+                std::sync::Arc::make_mut(&mut obj.base_replacement_definitions)
+                    .retain(|d| !drop(d));
+            }
+            if obj.replacement_definitions.len() != before_live
+                || obj.base_replacement_definitions.len() != before_base
+            {
+                changed = true;
+            }
+        },
+    );
     if changed {
         state.layers_dirty.mark_full();
     }
@@ -1352,8 +1436,9 @@ pub(crate) struct ConditionContext {
     /// CR 113.1b + CR 109.5: the PLAYER who has the ability being evaluated,
     /// when that differs from the source object's controller — a permission a
     /// resolved effect granted to a player ("target player gains \"During your
-    /// turn, …\""). "You"/"your" in that ability mean this player, so the
-    /// whose-turn leaves (`DuringYourTurn`, `DuringOpponentsTurn`) read it in
+    /// turn, …\""), or the would-be caster of a graveyard-resident permission.
+    /// "You"/"your" in that ability mean this player, so the whose-turn leaves
+    /// (`DuringYourTurn`, `DuringOpponentsTurn`) and `IsPresent` read it in
     /// preference to the source object's controller. `None` everywhere else.
     pub ability_holder: Option<PlayerId>,
 }
@@ -1573,6 +1658,11 @@ fn condition_uses_recipient_context(condition: &StaticCondition) -> bool {
         StaticCondition::IsMonarch { player } => {
             matches!(player, PlayerScope::RecipientController)
         }
+        // Digital-only Alchemy (no CR entry): same recipient-anchored
+        // subject rule as the monarch arm above.
+        StaticCondition::HasBoon { player } => {
+            matches!(player, PlayerScope::RecipientController)
+        }
         // CR 105.2 + CR 611.3a: "Enchanted creature gets +3/+3 unless IT shares a
         // color…" — the color check is on the recipient (the enchanted creature),
         // not the Aura source, so it must route through the recipient-eval path.
@@ -1676,6 +1766,7 @@ fn static_condition_uses_object_population(condition: &StaticCondition) -> bool 
         | StaticCondition::SourceIsBlocking
         | StaticCondition::SourceIsBlocked
         | StaticCondition::IsMonarch { .. }
+        | StaticCondition::HasBoon { .. }
         | StaticCondition::IsInitiative
         | StaticCondition::NoMonarch
         | StaticCondition::HasCityBlessing
@@ -1718,6 +1809,7 @@ fn static_condition_uses_object_population(condition: &StaticCondition) -> bool 
         | StaticCondition::SourceIsFaceUp
         | StaticCondition::AdditionalCostPaid
         | StaticCondition::CastingAsVariant { .. }
+        | StaticCondition::FirstCombatPhaseOfTurn
         | StaticCondition::None => false,
     }
 }
@@ -1834,6 +1926,7 @@ fn static_condition_characteristic_reads_at(
         | StaticCondition::SourceIsBlocking
         | StaticCondition::SourceIsBlocked
         | StaticCondition::IsMonarch { .. }
+        | StaticCondition::HasBoon { .. }
         | StaticCondition::IsInitiative
         | StaticCondition::NoMonarch
         | StaticCondition::HasCityBlessing
@@ -1867,6 +1960,7 @@ fn static_condition_characteristic_reads_at(
         | StaticCondition::SourceIsFaceUp
         | StaticCondition::AdditionalCostPaid
         | StaticCondition::CastingAsVariant { .. }
+        | StaticCondition::FirstCombatPhaseOfTurn
         | StaticCondition::None => CharacteristicKinds::EMPTY,
     }
 }
@@ -1964,6 +2058,7 @@ fn entered_object_perturbs_static_condition(
         | StaticCondition::SourceIsBlocking
         | StaticCondition::SourceIsBlocked
         | StaticCondition::IsMonarch { .. }
+        | StaticCondition::HasBoon { .. }
         | StaticCondition::IsInitiative
         | StaticCondition::NoMonarch
         | StaticCondition::HasCityBlessing
@@ -2006,6 +2101,7 @@ fn entered_object_perturbs_static_condition(
         | StaticCondition::SourceIsFaceUp
         | StaticCondition::AdditionalCostPaid
         | StaticCondition::CastingAsVariant { .. }
+        | StaticCondition::FirstCombatPhaseOfTurn
         | StaticCondition::None => false,
     }
 }
@@ -2075,7 +2171,11 @@ fn evaluate_condition_inner(
         }
         StaticCondition::IsPresent { filter } => match filter {
             Some(f) => {
-                let ctx = FilterContext::from_source(state, source_id);
+                // CR 113.1b + CR 109.5: a bound holder is the "you" of "you control".
+                let ctx = match context.ability_holder {
+                    Some(holder) => FilterContext::from_source_with_controller(source_id, holder),
+                    None => FilterContext::from_source(state, source_id),
+                };
                 state
                     .objects
                     .keys()
@@ -2219,6 +2319,12 @@ fn evaluate_condition_inner(
                     .unwrap_or(controller)
             });
             super::players::is_opponent(state, source_controller, state.active_player)
+        }
+        // CR 500.8 + CR 506.1 + CR 608.2c: the first combat phase of the turn
+        // must be the phase in progress (shared predicate; the composed
+        // possessive form carries its `DuringYourTurn` scope separately).
+        StaticCondition::FirstCombatPhaseOfTurn => {
+            super::conditions::first_combat_phase_in_progress(state)
         }
         // CR 103.1: True when the scoped player took the first turn of the
         // game (fixed at game start). The parser emits `ControllerRef::You`.
@@ -2530,6 +2636,13 @@ fn evaluate_condition_inner(
             designation_player(state, player, controller, source_id, context)
                 .is_some_and(|player| eval_is_monarch(state, player))
         }
+        // Digital-only Alchemy (no CR entry): "if you have a boon" — the
+        // player axis resolves like `IsMonarch`'s; the leaf reads the held
+        // boon list instead of a designation.
+        StaticCondition::HasBoon { player } => {
+            designation_player(state, player, controller, source_id, context)
+                .is_some_and(|player| eval_has_boon(state, player))
+        }
         // CR 726.3: True when the controller has the initiative.
         StaticCondition::IsInitiative => eval_is_initiative(state, controller),
         // CR 725.1: True when no player holds the monarch designation.
@@ -2795,6 +2908,8 @@ fn seed_live_characteristics_from_base(obj: &mut crate::game::game_object::GameO
     // (The door-gated Room NAME is derived at layer-1 exit, in
     // `derive_room_battlefield_names`, from the post-copy effective form.)
     obj.copied_room_halves = None;
+    // CR 722.2b + CR 613.1a: likewise the copied prepare spell.
+    obj.copied_prepare_face = None;
     // CR 707.9b: restore the persistent base origin (materialized exception
     // names); a Layer-1 copy application overwrites it within the pass.
     obj.layer1_name_origin = obj.base_name_origin;
@@ -3112,11 +3227,13 @@ fn derive_layer_characteristics(state: &mut GameState) -> Vec<ObjectId> {
     // needed it is the NON-RESOLVING stack exit — a stolen spell countered and
     // exiled (Dissipate), the CR 724.1b "end the turn" / CR 724.2b "end the
     // combat phase" stack exiles, and stack-exile riders. A stolen spell that
-    // exiles ON RESOLUTION (rebound, CR 702.88a) is NOT that class: MEASURED,
-    // the mid-resolution flush re-seeds the object from
-    // `resolving_stack_entry.controller` while the layer-2 scan can no longer
-    // reach it (`zone_object_ids(Stack)` no longer lists the popped entry), so
-    // the caster is already restored before the move.
+    // exiles ON RESOLUTION (rebound, CR 702.88a) is NOT that class: the
+    // mid-resolution flush re-seeds the object from
+    // `resolving_stack_entry.controller` (the `.chain()` above), and the layer-2
+    // scan reaches the popped resolving spell too, because
+    // `LayerZoneObjectCache::ids_for` adds it back into the Stack-zone population
+    // (CR 608.2n). The seed is what restores the caster's control before the move;
+    // the scan only re-applies the continuous effects over that restored state.
 
     // CR 611.2 + CR 613.1: Rebuild the static-effect-source index from the
     // just-reset base `static_definitions` so the Copy / main gathers below
@@ -3265,10 +3382,12 @@ fn derive_layer_characteristics(state: &mut GameState) -> Vec<ObjectId> {
         }
 
         if *layer == Layer::Type {
+            // A pass step before layer 6; `LateGrantPassSteps` counts its writes.
             apply_prototype_characteristics(state, bf_ids.iter().copied());
             apply_intrinsic_basic_land_mana_abilities(state, &bf_ids);
         }
         if matches!(*layer, Layer::Control | Layer::Type) {
+            // A pass step before layer 6; `LateGrantPassSteps` counts its writes.
             super::pairing::cleanup_invalid_pairs(state);
         }
     }
@@ -3280,10 +3399,13 @@ fn derive_layer_characteristics(state: &mut GameState) -> Vec<ObjectId> {
     // covered by its own CDA static definition.
     if !state.all_creature_types.is_empty() {
         for &id in &bf_ids {
-            let has_changeling = state
-                .objects
-                .get(&id)
-                .is_some_and(|o| o.has_keyword(&Keyword::Changeling));
+            let has_changeling = state.objects.get(&id).is_some_and(|o| {
+                // CR 205.3d/m: the derived types must still own the creature set.
+                o.has_keyword(&Keyword::Changeling)
+                    && o.card_types.core_types.iter().any(|core_type| {
+                        core_type_subtype_set(*core_type) == Some(SubtypeSet::Creature)
+                    })
+            });
             if has_changeling {
                 let all_types = state.all_creature_types.clone();
                 if let Some(obj) = state.objects.get_mut(&id) {
@@ -3406,6 +3528,69 @@ fn derive_layer_characteristics(state: &mut GameState) -> Vec<ObjectId> {
     bf_ids
 }
 
+/// Collects the grant instance of every trigger definition on `obj` that was
+/// materialized from a grant (keyword companion, copy-retained, granted or
+/// expanded grant). Printed, copied-value and unmaterialized definitions carry
+/// no grant instance and are skipped. Used by `retire_absent_trigger_grants`
+/// as the live set a recipient's active grants are reconciled against.
+fn live_trigger_grant_instances(
+    obj: &crate::game::game_object::GameObject,
+) -> Vec<crate::types::ability::TriggerGrantInstanceRef> {
+    obj.trigger_definitions
+        .iter_all()
+        .filter_map(|entry| match &entry.occurrence {
+            crate::types::ability::TriggerDefinitionOccurrenceRef::KeywordCompanion {
+                grant_instance,
+                ..
+            }
+            | crate::types::ability::TriggerDefinitionOccurrenceRef::CopyRetained {
+                grant_instance,
+                ..
+            }
+            | crate::types::ability::TriggerDefinitionOccurrenceRef::Granted { grant_instance }
+            | crate::types::ability::TriggerDefinitionOccurrenceRef::ExpandedGrant {
+                grant_instance,
+                ..
+            } => Some(*grant_instance),
+            crate::types::ability::TriggerDefinitionOccurrenceRef::Printed { .. }
+            | crate::types::ability::TriggerDefinitionOccurrenceRef::CopiedValue { .. }
+            | crate::types::ability::TriggerDefinitionOccurrenceRef::Unmaterialized => None,
+        })
+        .collect::<Vec<_>>()
+}
+
+/// Complete the Layer-6 producer reconciliation only after the entire pass
+/// has materialized every candidate. A producer absent from this finalized
+/// live set is retired; reappearing later receives a fresh monotonic grant
+/// generation rather than resurrecting an old identity.
+/// Objects with no active grant to retire are not written, so they stay
+/// shared with clones of the state.
+fn retire_absent_trigger_grants(state: &mut GameState) {
+    state.objects.update_where(
+        |_, obj| {
+            obj.trigger_occurrence_state
+                .active_grants()
+                .next()
+                .is_some()
+                && obj
+                    .trigger_occurrence_state
+                    .has_absent_grants(&live_trigger_grant_instances(obj))
+        },
+        |_, obj| {
+            let live_instances = live_trigger_grant_instances(obj);
+            obj.trigger_occurrence_state
+                .retire_absent_grants(&live_instances);
+        },
+    );
+}
+
+/// Finishes a full layer evaluation once every layer has been applied: runs
+/// the post-layer bookkeeping over the derived board (rule-changing effects,
+/// control-change consequences, cache and index refreshes) and leaves the
+/// state ready for the next incremental flush. Grant retirement
+/// (`retire_absent_trigger_grants`) runs here only after the entire pass has
+/// materialized every candidate, and before the trigger index is rebuilt from
+/// the finalized trigger sets.
 fn finish_layer_evaluation(
     state: &mut GameState,
     bf_ids: Vec<ObjectId>,
@@ -3430,12 +3615,27 @@ fn finish_layer_evaluation(
     // `GameObject::reset_for_battlefield_entry`). Clearing back to false is
     // the sole responsibility of `turns::start_next_turn` for the active
     // player's permanents.
+    let mut controller_changed: Vec<ObjectId> = Vec::new();
     for (id, prev) in prev_controllers {
         if let Some(obj) = state.objects.get_mut(&id) {
             if obj.controller != prev {
                 obj.summoning_sick = true;
+                controller_changed.push(id);
             }
         }
+    }
+
+    // CR 506.4 + CR 613.1b: the same settled delta removes each changed
+    // permanent from combat. Any removed role (attacking or blocking) can change
+    // a Layer 6 combat-role grant or a `SourceIsAttacking` / `SourceIsBlocking`
+    // gate (CR 613.1f), so it must be re-derived; the unconditional
+    // `LayersDirty::Clean` below would discard the removal's own `mark_full`, so
+    // re-run the pass here, as ring normalization does. The nested pass
+    // snapshots the new controllers, so its delta is empty and the recursion is
+    // exactly one pass deep.
+    if remove_controller_changed_from_combat(state, &controller_changed, retirement_owner) {
+        evaluate_layers_with_retirement_owner(state, retirement_owner);
+        return;
     }
 
     super::pairing::cleanup_invalid_pairs(state);
@@ -3471,46 +3671,11 @@ fn finish_layer_evaluation(
     // eval always leaves a precise presence index for the next scan-gate consult.
     refresh_static_mode_presence(state);
 
-    // Complete the Layer-6 producer reconciliation only after the entire pass
-    // has materialized every candidate. A producer absent from this finalized
-    // live set is retired; reappearing later receives a fresh monotonic grant
-    // generation rather than resurrecting an old identity.
-    let trigger_object_ids = state.objects.keys().copied().collect::<Vec<_>>();
-    for object_id in trigger_object_ids {
-        let Some(obj) = state.objects.get_mut(&object_id) else {
-            continue;
-        };
-        let live_instances = obj
-            .trigger_definitions
-            .iter_all()
-            .filter_map(|entry| match &entry.occurrence {
-                crate::types::ability::TriggerDefinitionOccurrenceRef::KeywordCompanion {
-                    grant_instance,
-                    ..
-                }
-                | crate::types::ability::TriggerDefinitionOccurrenceRef::CopyRetained {
-                    grant_instance,
-                    ..
-                }
-                | crate::types::ability::TriggerDefinitionOccurrenceRef::Granted {
-                    grant_instance,
-                }
-                | crate::types::ability::TriggerDefinitionOccurrenceRef::ExpandedGrant {
-                    grant_instance,
-                    ..
-                } => Some(*grant_instance),
-                crate::types::ability::TriggerDefinitionOccurrenceRef::Printed { .. }
-                | crate::types::ability::TriggerDefinitionOccurrenceRef::CopiedValue { .. }
-                | crate::types::ability::TriggerDefinitionOccurrenceRef::Unmaterialized => None,
-            })
-            .collect::<Vec<_>>();
-        obj.trigger_occurrence_state
-            .retire_absent_grants(&live_instances);
-    }
+    retire_absent_trigger_grants(state);
 
-    // CR 603.6a + CR 611.2e: Layer evaluation just finalized post-layer
+    // Layer evaluation just finalized post-layer
     // trigger sets on every battlefield permanent (granted triggers from
-    // sliver lords, Changeling, Bramble Sovereign, suppress-triggers statics).
+    // sliver lords, Changeling).
     // Rebuild the TriggerIndex so the next event scan reads the post-layer
     // trigger set — CR 603.2 requires the post-layer view. Destructive
     // rebuild replaces both `by_key` and `unclassified` from scratch.
@@ -3536,6 +3701,39 @@ fn finish_layer_evaluation(
     // (Clean / EnteredObjects / Full).
     crate::game::effects::attach::refresh_protection_start_attachment_snapshots(state);
     state.layers_dirty = LayersDirty::Clean;
+}
+
+/// CR 506.4: "A permanent is removed from combat if ... its controller ...
+/// changes." Removes every permanent whose settled effective controller
+/// (CR 613.1b) changed in this pass from combat, and returns whether combat
+/// membership changed (any combat edge naming one of them was pruned).
+///
+/// A blocker's removal leaves the attacker it blocked blocked (CR 509.1h); the
+/// shared prune authority leaves `AttackerInfo::blocked` untouched. An
+/// attacker's removal leaves every creature that was blocking it a blocking
+/// creature, possibly with no attacker assigned (CR 509.1g, CR 510.1d).
+///
+/// Journal ownership follows `retire_ended_effects`: a settlement-owned pass
+/// journals each removal with its exact participation receipt, while an
+/// attachment-owned pass prunes structurally, because replaying that attachment
+/// command re-runs this same settlement and so re-derives the prune.
+fn remove_controller_changed_from_combat(
+    state: &mut GameState,
+    changed: &[ObjectId],
+    owner: StateDurationRetirementOwner,
+) -> bool {
+    let mut membership_changed = false;
+    for &id in changed {
+        membership_changed |= match owner {
+            StateDurationRetirementOwner::LayerSettlement => {
+                super::effects::remove_from_combat::remove_object_from_combat(state, id)
+            }
+            StateDurationRetirementOwner::AttachmentCommand => {
+                super::combat::prune_object_from_combat(state, id)
+            }
+        };
+    }
+    membership_changed
 }
 
 /// CR 400.1 + CR 404 + CR 611.3a: Does a `TargetFilter` test membership of a
@@ -3681,6 +3879,10 @@ fn player_filter_reads_zone(filter: &PlayerFilter, zone: Zone) -> bool {
             .is_some_and(|f| target_filter_reads_zone(f, zone)),
         // CR 608.2c: self-composing exclusion anchor — recurse on the exclude.
         PlayerFilter::AllExcept { exclude } => player_filter_reads_zone(exclude, zone),
+        // CR 102.1 + CR 608.2c: the union reads what any member reads.
+        PlayerFilter::AnyOf { filters } => {
+            filters.iter().any(|f| player_filter_reads_zone(f, zone))
+        }
         // CR 109.4 + CR 109.5: controls-count routes its object `filter` and its
         // comparison `count` expression.
         PlayerFilter::ControlsCount { filter, count, .. } => {
@@ -3721,6 +3923,7 @@ fn player_filter_reads_zone(filter: &PlayerFilter, zone: Zone) -> bool {
         | PlayerFilter::ParentObjectTargetController
         | PlayerFilter::ChosenPlayer { .. }
         | PlayerFilter::ParentObjectTargetOwner
+        | PlayerFilter::TargetPlayer
         | PlayerFilter::GrantingObjectCaster => false,
     }
 }
@@ -3844,6 +4047,7 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::ChosenNumber
         | QuantityRef::PlayerChosenNumber { .. }
+        | QuantityRef::NotedNumber
         | QuantityRef::ColorsInCommandersColorIdentity
         | QuantityRef::CommanderCastFromCommandZoneCount
         | QuantityRef::ConvokedCreatureCount
@@ -4170,6 +4374,7 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         | QuantityRef::TurnsTaken
         | QuantityRef::ChosenNumber
         | QuantityRef::PlayerChosenNumber { .. }
+        | QuantityRef::NotedNumber
         | QuantityRef::DescendedThisTurn
         | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
         | QuantityRef::SpellsCastLastTurn
@@ -4206,6 +4411,8 @@ fn player_filter_reads_life(pf: &PlayerFilter) -> bool {
             .is_some_and(target_filter_reads_life_total),
         // CR 608.2c: self-composing exclusion anchor — recurse on the exclude.
         PlayerFilter::AllExcept { exclude } => player_filter_reads_life(exclude),
+        // CR 102.1 + CR 608.2c: the union reads what any member reads.
+        PlayerFilter::AnyOf { filters } => filters.iter().any(player_filter_reads_life),
         // CR 109.4 + CR 109.5: controls-count routes its object `filter` and its
         // comparison `count` expression.
         PlayerFilter::ControlsCount { filter, count, .. } => {
@@ -4241,6 +4448,7 @@ fn player_filter_reads_life(pf: &PlayerFilter) -> bool {
         | PlayerFilter::ParentObjectTargetController
         | PlayerFilter::ChosenPlayer { .. }
         | PlayerFilter::ParentObjectTargetOwner
+        | PlayerFilter::TargetPlayer
         | PlayerFilter::GrantingObjectCaster => false,
     }
 }
@@ -4299,6 +4507,7 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         | FilterProp::Untapped
         | FilterProp::IsSaddled
         | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
         | FilterProp::ConvokedSource
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::HasHasteOrControlledSinceTurnBegan
@@ -4314,9 +4523,18 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         | FilterProp::HasAdventure
         | FilterProp::EnchantedBy
         | FilterProp::EquippedBy
-        | FilterProp::AttachedToSource
-        | FilterProp::AttachedToRecipient
-        | FilterProp::AttachedToPlayer { .. }
+        | FilterProp::AttachedTo {
+            to: AttachmentReferent::Source,
+        }
+        | FilterProp::AttachedTo {
+            to: AttachmentReferent::Recipient,
+        }
+        | FilterProp::AttachedTo {
+            to: AttachmentReferent::Player { .. },
+        }
+        | FilterProp::AttachedTo {
+            to: AttachmentReferent::DeclaredTarget { .. },
+        }
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::Another
@@ -4335,6 +4553,7 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         | FilterProp::MatchesLastChosenCardPredicate
         | FilterProp::HasSingleTarget
         | FilterProp::Modal
+        | FilterProp::PrepareSpell
         | FilterProp::NotColor { .. }
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
@@ -4435,6 +4654,7 @@ fn target_filter_reads_life_total(filter: &TargetFilter) -> bool {
         | TargetFilter::EventTargetController
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::ParentTargetController
         | TargetFilter::ParentTargetOwner
         | TargetFilter::SourceChosenPlayer
@@ -4497,6 +4717,7 @@ fn static_condition_reads_life(condition: &StaticCondition) -> bool {
         | StaticCondition::SourceIsBlocking
         | StaticCondition::SourceIsBlocked
         | StaticCondition::IsMonarch { .. }
+        | StaticCondition::HasBoon { .. }
         | StaticCondition::IsInitiative
         | StaticCondition::NoMonarch
         | StaticCondition::HasCityBlessing
@@ -4533,6 +4754,7 @@ fn static_condition_reads_life(condition: &StaticCondition) -> bool {
         | StaticCondition::EnchantedIsFaceDown
         | StaticCondition::AdditionalCostPaid
         | StaticCondition::CastingAsVariant { .. }
+        | StaticCondition::FirstCombatPhaseOfTurn
         | StaticCondition::None => false,
     }
 }
@@ -4652,7 +4874,9 @@ fn flush_layers_with_retirement_owner(
                 flush_lapsed_durations(state, retirement_owner);
                 return;
             }
-            if let Some(prepared) = prepare_incremental_flush(state, &ids) {
+            if let Some(prepared) =
+                prepare_incremental_flush(state, &ids, StaticGateTruth::Evaluate)
+            {
                 super::perf_counters::record_layers_incremental();
                 apply_layers_incremental(state, prepared, retirement_owner);
                 // Rebuild the presence index so the incremental arm leaves a PRECISE index
@@ -4743,9 +4967,39 @@ fn reset_recipient_to_base(obj: &mut crate::game::game_object::GameObject) {
     derive_suspected_abilities(obj);
 }
 
+/// How the incremental flush's truth-delta stage answers for a
+/// population-conditioned static that an entrant perturbs (CR 611.3a).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaticGateTruth {
+    /// The flush asks whether THIS entry flipped the gate: it re-evaluates the
+    /// condition and compares it with the truth cached at the last full pass.
+    Evaluate,
+    /// Bulk admission asks whether ANY of a run of identical entries could flip
+    /// it, so a perturbed gate counts as flipped whatever its current value.
+    AssumeChanged,
+}
+
+/// CR 611.3a + CR 613.1: whether entering `entered_ids` could change a layered
+/// value of any object other than the entrants themselves, for a run of
+/// identical entries rather than for this one entry. It is the incremental
+/// flush's own escalation verdict (`prepare_incremental_flush`) with the
+/// truth-delta stage set to [`StaticGateTruth::AssumeChanged`]: a
+/// population-conditioned static the entrant perturbs is treated as flipped,
+/// because a later identical entry can flip a gate this one only moved toward.
+/// Read-only: the verdict is computed on a scratch clone, since the prepare
+/// step resets recipients to base.
+pub(crate) fn entry_perturbs_layer_reads(
+    state: &GameState,
+    entered_ids: &BTreeSet<ObjectId>,
+) -> bool {
+    let mut scratch = state.clone();
+    prepare_incremental_flush(&mut scratch, entered_ids, StaticGateTruth::AssumeChanged).is_none()
+}
+
 fn prepare_incremental_flush(
     state: &mut GameState,
     entered_ids: &BTreeSet<ObjectId>,
+    truth: StaticGateTruth,
 ) -> Option<PreparedIncrementalFlush> {
     for &id in entered_ids {
         let obj = state.objects.get(&id)?;
@@ -4767,7 +5021,7 @@ fn prepare_incremental_flush(
     }
     crate::types::game_state::StaticSourceIndex::rebuild_from_state(state);
 
-    let active_effects = collect_layer_pass_active_continuous_effects(state);
+    let active_effects = collect_layer_pass_active_continuous_effects(state, Some(&recipient_ids));
     if active_effects.iter().any(|effect| {
         recipient_ids.contains(&effect.source_id)
             && !effect_is_restricted_to_incremental_recipients(effect, &recipient_ids)
@@ -4780,7 +5034,7 @@ fn prepare_incremental_flush(
             entered_ids,
             &active_effects,
         )
-        || any_active_static_condition_perturbed_by_entry(state, entered_ids)
+        || any_active_static_condition_perturbed_by_entry(state, entered_ids, truth)
         // CR 613.1 + CR 613.1b: the incremental arm re-derives only BATTLEFIELD recipients
         // (`incremental_recipient_ids`), so a continuous effect naming a STACK object as a
         // recipient would leave that object's controller at whatever the last full pass wrote
@@ -4798,7 +5052,7 @@ fn prepare_incremental_flush(
             matches!(
                 effect.modification,
                 ContinuousModification::SubstituteTextWord { .. }
-            ) && effect_can_reach_incremental_recipients(effect, &recipient_ids)
+            ) && effect_can_reach_incremental_recipients(state, effect, &recipient_ids)
         })
     {
         return None;
@@ -4832,14 +5086,14 @@ fn prepare_incremental_flush(
     // recipient anything, and escalating for it would put every board that has
     // ever cast a clone back on the O(|battlefield|) full pass this module exists
     // to avoid. A copy that does name a recipient still escalates; so does any
-    // copy whose affected set is a predicate, since that set is not decidable
-    // here.
+    // copy whose affected set is a predicate, unless that predicate requires an
+    // attachment relation no recipient has (`attachment_relation_rejects`).
     //
     // O(active-effect-count), and zero on the overwhelmingly common board with no
     // copy effect at all.
     if active_effects.iter().any(|effect| {
         effect.layer == Layer::Copy
-            && effect_can_reach_incremental_recipients(effect, &recipient_ids)
+            && effect_can_reach_incremental_recipients(state, effect, &recipient_ids)
             && copy_grants_continuous_static(&effect.modification)
     }) {
         return None;
@@ -4851,7 +5105,7 @@ fn prepare_incremental_flush(
     // when any granted-static child of such a carrier can reach an entrant.
     if active_effects.iter().any(|effect| {
         !recipient_ids.contains(&effect.source_id)
-            && effect_can_reach_incremental_recipients(effect, &recipient_ids)
+            && effect_can_reach_incremental_recipients(state, effect, &recipient_ids)
             && granted_static_child_origin(effect).is_some()
     }) {
         return None;
@@ -4898,7 +5152,7 @@ pub(crate) fn incremental_flush_must_escalate(
     entered_ids: &BTreeSet<ObjectId>,
 ) -> bool {
     let mut scratch = state.clone();
-    prepare_incremental_flush(&mut scratch, entered_ids).is_none()
+    prepare_incremental_flush(&mut scratch, entered_ids, StaticGateTruth::Evaluate).is_none()
 }
 
 /// The two population-read channels of a single effect, computed once:
@@ -5332,7 +5586,9 @@ fn population_probe_blinded_by_entrant_characteristic_change(
 /// [`population_probe_blinded_by_entrant_characteristic_change`]. A variant that
 /// writes several kinds returns their union; a variant whose effect cannot be
 /// bounded returns [`CharacteristicKinds::ALL`].
-fn modification_characteristic_writes(m: &ContinuousModification) -> CharacteristicKinds {
+pub(crate) fn modification_characteristic_writes(
+    m: &ContinuousModification,
+) -> CharacteristicKinds {
     modification_characteristic_writes_at(m, GRANTED_STATIC_WRITE_DEPTH)
 }
 
@@ -5351,16 +5607,27 @@ fn modification_characteristic_writes_at(
     };
     match m {
         // ---- CR 613.1d (layer 4): typeline. ----
-        ContinuousModification::AddType { .. }
-        | ContinuousModification::RemoveType { .. }
-        | ContinuousModification::SetCardTypes { .. }
-        | ContinuousModification::AddSubtype { .. }
-        | ContinuousModification::RemoveSubtype { .. }
-        | ContinuousModification::RemoveAllSubtypes { .. }
-        | ContinuousModification::AddAllCreatureTypes
+        // CR 305.6: a land has the intrinsic mana ability of each basic land type
+        // it has, so a type write that can change whether an object is a land or
+        // which basic land types it has also writes its abilities.
+        ContinuousModification::AddType { core_type }
+        | ContinuousModification::RemoveType { core_type } => {
+            land_type_line_writes(*core_type == CoreType::Land)
+        }
+        ContinuousModification::AddSubtype { subtype }
+        | ContinuousModification::RemoveSubtype { subtype } => {
+            land_type_line_writes(subtype.parse::<BasicLandType>().is_ok())
+        }
+        ContinuousModification::RemoveAllSubtypes { set } => {
+            land_type_line_writes(*set == SubtypeSet::Land)
+        }
+        ContinuousModification::AddChosenSubtype { kind } => {
+            land_type_line_writes(*kind == ChosenSubtypeKind::BasicLandType)
+        }
+        ContinuousModification::SetCardTypes { .. }
         | ContinuousModification::AddAllBasicLandTypes
-        | ContinuousModification::AddAllLandTypes
-        | ContinuousModification::AddChosenSubtype { .. }
+        | ContinuousModification::AddAllLandTypes => land_type_line_writes(true),
+        ContinuousModification::AddAllCreatureTypes
         | ContinuousModification::AddSupertype { .. }
         | ContinuousModification::RemoveSupertype { .. } => CharacteristicKinds::CARD_TYPES,
         // CR 305.7: setting a basic land type replaces the land's subtypes AND
@@ -5471,6 +5738,16 @@ fn modification_characteristic_writes_at(
     }
 }
 
+/// CR 613.1d + CR 305.6: a typeline write; one that can change a land's basic
+/// land types also writes the intrinsic mana abilities they give it.
+fn land_type_line_writes(can_change_basic_land_types: bool) -> CharacteristicKinds {
+    if can_change_basic_land_types {
+        CharacteristicKinds::CARD_TYPES.union(CharacteristicKinds::ABILITIES)
+    } else {
+        CharacteristicKinds::CARD_TYPES
+    }
+}
+
 fn active_effects_force_incremental_escalation(
     state: &GameState,
     entered_ids: &BTreeSet<ObjectId>,
@@ -5567,6 +5844,7 @@ fn active_effects_force_incremental_escalation(
 fn any_active_static_condition_perturbed_by_entry(
     state: &GameState,
     entered_ids: &BTreeSet<ObjectId>,
+    truth: StaticGateTruth,
 ) -> bool {
     let mut found = false;
     for_each_static_effect_source(state, |state, obj| {
@@ -5615,6 +5893,9 @@ fn any_active_static_condition_perturbed_by_entry(
                     Some(&b) => b,
                     None => return true,
                 };
+                if truth == StaticGateTruth::AssumeChanged {
+                    return true;
+                }
                 let after = source_condition_gate_passes(state, condition, obj.controller, obj.id);
                 before != after
             })
@@ -5812,11 +6093,24 @@ fn effect_is_restricted_to_incremental_recipients(
 /// iff it is reached) but their conservative answers for an unknown affected set
 /// are OPPOSITE, because both must escalate on doubt and doubt sits on different
 /// sides of the two questions.
+///
+/// CR 301.5f + CR 303.4: a predicate filter is still provably unable to reach a
+/// recipient when it requires an attachment relation ("equipped creature",
+/// "enchanted creature") and no recipient stands in one with anything
+/// (`attachment_relation_rejects`). No layer writes attachment, so that verdict
+/// holds at every layer of the pass. With no recipient at all, the answer is
+/// "cannot reach", as it is for an id-naming filter.
 fn effect_can_reach_incremental_recipients(
+    state: &GameState,
     effect: &ActiveContinuousEffect,
     recipient_ids: &BTreeSet<ObjectId>,
 ) -> bool {
-    effect_names_single_affected_object(effect).is_none_or(|id| recipient_ids.contains(&id))
+    match effect_names_single_affected_object(effect) {
+        Some(id) => recipient_ids.contains(&id),
+        None => !recipient_ids.iter().all(|&recipient| {
+            attachment_relation_rejects(state, &effect.affected_filter, effect.source_id, recipient)
+        }),
+    }
 }
 
 /// CR 613.2a + CR 613.2c: does applying this layer-1 copy modification hand its
@@ -6150,7 +6444,7 @@ fn copy_sublayer_effect_id(
 /// EXISTING global continuous-effect set (restricted to the entered objects via
 /// `apply_continuous_effect_to`), runs the per-object counter / keyword-counter /
 /// P-T-counter / loyalty fixups and the combat-assignment-rule application, then
-/// rebuilds the TriggerIndex (CR 603.6a + CR 611.2e — granted-trigger
+/// rebuilds the TriggerIndex (CR 613.1f — granted-trigger
 /// visibility). It does NOT clear attribution globally or touch the rest of the
 /// battlefield: pre-existing objects keep their already-derived characteristics.
 ///
@@ -6215,16 +6509,18 @@ fn apply_layers_incremental(
 
     // Step 2: Copy effects first (Layer 1), restricted to recipient objects.
     //
-    // `effect_can_reach_incremental_recipients` drops a copy that provably names a
-    // NON-recipient — the ordinary resolved-clone shape. `apply_continuous_effect_to`
-    // would skip every one of its objects at the `restrict_to` test anyway, so this
+    // `effect_can_reach_incremental_recipients` drops a copy that provably cannot
+    // reach a recipient (it names a non-recipient, or it requires an attachment
+    // relation no recipient has); naming a non-recipient is the ordinary
+    // resolved-clone shape. `apply_continuous_effect_to` would skip every one of
+    // its objects at the `restrict_to` test anyway, so this
     // changes no state; what it buys is an accurate `copy_effects.is_empty()` below,
     // which is what decides whether this flush pays a second board-wide gather.
     let copy_effects: Vec<ActiveContinuousEffect> = active_effects
         .iter()
         .filter(|effect| {
             effect.layer == Layer::Copy
-                && effect_can_reach_incremental_recipients(effect, &recipient_ids)
+                && effect_can_reach_incremental_recipients(state, effect, &recipient_ids)
         })
         .cloned()
         .collect();
@@ -6241,6 +6537,8 @@ fn apply_layers_incremental(
     }
 
     let recipient_vec: Vec<ObjectId> = recipient_ids.iter().copied().collect();
+    // Runs after `prepare_incremental_flush` collected the late granted-static
+    // candidates; `LateGrantPassSteps` counts its writes as late.
     let stickers_changed = finish_layer_one(state, &recipient_vec);
     // CR 613.2a + CR 613.2c: deliberately no copy disjunct on this rebuild, unlike
     // the full pass. A copy applied here could only add a generator by landing on
@@ -6258,8 +6556,8 @@ fn apply_layers_incremental(
     // `TargetFilter::SpecificObject`. What rules that case out is the escalation
     // guard in `prepare_incremental_flush`: any active copy that can REACH a
     // recipient and whose payload grants a continuous static sends the whole flush
-    // to `evaluate_layers`. The copies it lets through are exactly those confined
-    // to a named non-recipient, which the `copy_effects` filter above then drops —
+    // to `evaluate_layers`. The copies it lets through are exactly those that
+    // provably reach no recipient, which the `copy_effects` filter above then drops —
     // so either way no copy surviving to this line can turn a recipient into a
     // `StaticSourceIndex` generator. The index built there still names exactly the
     // right sources and a rebuild would find the identical set. (It would also be
@@ -6278,11 +6576,11 @@ fn apply_layers_incremental(
         // gather. If a sticker grants a continuous static ability, refresh the
         // generator index so the recipient can source that effect in this pass.
         crate::types::game_state::StaticSourceIndex::rebuild_from_state(state);
-        collect_layer_pass_active_continuous_effects(state)
+        collect_layer_pass_active_continuous_effects(state, Some(&recipient_ids))
     } else if copy_effects.is_empty() {
         active_effects
     } else {
-        collect_layer_pass_active_continuous_effects(state)
+        collect_layer_pass_active_continuous_effects(state, Some(&recipient_ids))
     };
 
     // Step 3-4: Remaining layers in order, restricted to recipient objects.
@@ -6333,6 +6631,7 @@ fn apply_layers_incremental(
             apply_pt_counter_modifications(state, recipient_ids.iter().copied());
         }
         if *layer == Layer::Type {
+            // A pass step before layer 6; `LateGrantPassSteps` counts its writes.
             apply_prototype_characteristics(state, recipient_ids.iter().copied());
             apply_intrinsic_basic_land_mana_abilities(state, &recipient_vec);
         }
@@ -6342,10 +6641,13 @@ fn apply_layers_incremental(
     // has Changeling but no CDA covered it.
     if !state.all_creature_types.is_empty() {
         for &id in &recipient_ids {
-            let has_changeling = state
-                .objects
-                .get(&id)
-                .is_some_and(|o| o.has_keyword(&Keyword::Changeling));
+            let has_changeling = state.objects.get(&id).is_some_and(|o| {
+                // CR 205.3d/m: the derived types must still own the creature set.
+                o.has_keyword(&Keyword::Changeling)
+                    && o.card_types.core_types.iter().any(|core_type| {
+                        core_type_subtype_set(*core_type) == Some(SubtypeSet::Creature)
+                    })
+            });
             if has_changeling {
                 let all_types = state.all_creature_types.clone();
                 if let Some(obj) = state.objects.get_mut(&id) {
@@ -6404,7 +6706,7 @@ fn apply_layers_incremental(
     // CR 613.11: Combat-assignment rule effects, restricted to recipient objects.
     apply_combat_assignment_rule_effects_filtered(state, Some(&recipient_ids));
 
-    // CR 603.6a + CR 611.2e: Rebuild the TriggerIndex so the next event scan
+    // Rebuild the TriggerIndex so the next event scan
     // sees the entered objects' (and any granted) trigger sets.
     crate::types::game_state::TriggerIndex::rebuild_from_battlefield(state);
 
@@ -6430,11 +6732,6 @@ fn gather_active_effects_for_layer(state: &GameState, layer: Layer) -> Vec<Activ
         .into_iter()
         .filter(|effect| effect.layer == layer)
         .collect()
-}
-
-#[cfg(test)]
-pub(crate) fn has_active_copy_layer_effects(state: &GameState) -> bool {
-    !gather_active_effects_for_layer(state, Layer::Copy).is_empty()
 }
 
 /// CR 718.3b: A prototyped spell and the permanent it becomes have only their
@@ -6501,7 +6798,7 @@ fn apply_pt_counter_modifications(state: &mut GameState, ids: impl IntoIterator<
 fn gather_active_continuous_effects(
     state: &GameState,
 ) -> Vec<(Layer, Vec<ActiveContinuousEffect>)> {
-    bucket_effects_by_layer(collect_layer_pass_active_continuous_effects(state))
+    bucket_effects_by_layer(collect_layer_pass_active_continuous_effects(state, None))
 }
 
 fn bucket_effects_by_layer(
@@ -6529,28 +6826,219 @@ fn bucket_effects_by_layer(
     effects
 }
 
+/// Which modifications a gather pass keeps.
+#[derive(Clone, Copy)]
+enum ModificationAdmission {
+    /// Keep everything (the full gather).
+    Every,
+    /// Keep only modifications the total predicate accepts. The predicate must
+    /// be decidable for every variant; in particular it must never call
+    /// `ContinuousModification::layer()`, which is unreachable for the
+    /// never-layered and combat-assignment variants.
+    Matching(fn(&ContinuousModification) -> bool),
+}
+
+impl ModificationAdmission {
+    /// Whether the pass keeps an effect whose own modification is `modification`.
+    fn admits(self, modification: &ContinuousModification) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Matching(keep) => keep(modification),
+        }
+    }
+
+    /// Whether gathering `modification` can yield a kept effect: either the
+    /// modification itself is kept, or it is a `GrantStaticAbility` whose
+    /// expansion would synthesize at least one kept child. One level is enough
+    /// because `expand_granted_static_effects` does not recurse into a nested
+    /// grant.
+    fn reaches_admitted(self, modification: &ContinuousModification) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Matching(keep) => {
+                if keep(modification) {
+                    return true;
+                }
+                let ContinuousModification::GrantStaticAbility { definition: inner } = modification
+                else {
+                    return false;
+                };
+                inner.mode == StaticMode::Continuous
+                    && inner
+                        .modifications
+                        .iter()
+                        .any(|granted| !continuous_gather_skips(granted) && keep(granted))
+            }
+        }
+    }
+
+    /// Whether any modification of one transient effect can yield a kept
+    /// effect. The full gather answers `true` without scanning, so it reaches
+    /// the liveness check for every stored transient exactly as before.
+    fn reaches_any_admitted(self, modifications: &[ContinuousModification]) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Matching(_) => modifications
+                .iter()
+                .any(|modification| self.reaches_admitted(modification)),
+        }
+    }
+}
+
+/// Whether the continuous-effect gather drops this modification before
+/// producing an effect for it. The single skip predicate shared by the static
+/// loop (top-level modifications), `expand_granted_static_effects` (a granted
+/// definition's inner modifications) and the admission scan in
+/// `ModificationAdmission::reaches_admitted`, which tests it before the
+/// admission predicate.
+fn continuous_gather_skips(modification: &ContinuousModification) -> bool {
+    is_combat_assignment_rule_modification(modification)
+        || matches!(
+            modification,
+            ContinuousModification::AddStaticMode {
+                mode: StaticMode::Goaded
+            }
+        )
+}
+
+/// Whether a gather evaluated a filter or condition (which can read ambient
+/// call-stack state) or only object-local and definition-local gates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GatherDependence {
+    /// Only object-local and definition-local gates ran, so the result is a
+    /// pure function of the state.
+    Structural,
+    /// A host filter or a transient liveness check ran, so the result may
+    /// depend on the caller's ambient query context.
+    ContextDependent,
+}
+
+/// Proof that a gather pass recorded a `GrantStaticAbility` host walk before
+/// evaluating the host's affected filter.
+struct GrantExpansion(());
+
+/// Proof that a gather pass recorded a transient liveness evaluation before
+/// evaluating the transient's gates.
+struct TransientLiveness(());
+
+/// One gather pass: what it admits and what it has had to evaluate so far.
+struct GatherPass {
+    admission: ModificationAdmission,
+    dependence: GatherDependence,
+}
+
+impl GatherPass {
+    /// A pass that keeps every modification (the full gather).
+    fn every() -> Self {
+        Self {
+            admission: ModificationAdmission::Every,
+            dependence: GatherDependence::Structural,
+        }
+    }
+
+    /// A pass that keeps only the modifications `keep` accepts.
+    fn matching(keep: fn(&ContinuousModification) -> bool) -> Self {
+        Self {
+            admission: ModificationAdmission::Matching(keep),
+            dependence: GatherDependence::Structural,
+        }
+    }
+
+    /// What this pass keeps.
+    fn admission(&self) -> ModificationAdmission {
+        self.admission
+    }
+
+    /// Ends the pass, reporting what it had to evaluate.
+    fn into_dependence(self) -> GatherDependence {
+        self.dependence
+    }
+
+    /// Records that the pass is about to match a grant host's affected filter
+    /// and returns the token that statement requires.
+    fn enter_grant_expansion(&mut self) -> GrantExpansion {
+        self.dependence = GatherDependence::ContextDependent;
+        GrantExpansion(())
+    }
+
+    /// Records that the pass is about to evaluate one transient's liveness and
+    /// returns the token those statements require.
+    fn enter_transient_liveness(&mut self) -> TransientLiveness {
+        self.dependence = GatherDependence::ContextDependent;
+        TransientLiveness(())
+    }
+}
+
+/// The host-filter matcher for a grant expansion inside a gather pass. Taking
+/// the token keeps the filter evaluation unreachable without recording it.
+fn granted_static_host_matches_in_pass<'a>(
+    _entered: &GrantExpansion,
+    state: &'a GameState,
+    parent: &'a ActiveContinuousEffect,
+) -> impl Fn(&ObjectId) -> bool + 'a {
+    granted_static_host_matches(state, parent)
+}
+
+/// The first liveness evaluation for one transient inside a gather pass.
+fn transient_participates_in_pass(
+    _entered: &TransientLiveness,
+    state: &GameState,
+    tce: &TransientContinuousEffect,
+    participates: fn(&GameState, &TransientContinuousEffect) -> bool,
+) -> bool {
+    participates(state, tce)
+}
+
+/// The source-condition gate for one transient inside a gather pass, guarded
+/// by the same token as its liveness evaluation.
+fn transient_source_condition_passes_in_pass(
+    _entered: &TransientLiveness,
+    state: &GameState,
+    tce: &TransientContinuousEffect,
+    condition: &StaticCondition,
+) -> bool {
+    source_condition_gate_passes(state, condition, tce.controller, tce.source_id)
+}
+
+/// Gathers every continuous effect that is active independently of any one
+/// recipient: functioning statics, live transients, and the Ring emblem.
 pub(crate) fn collect_shared_active_continuous_effects(
     state: &GameState,
 ) -> Vec<ActiveContinuousEffect> {
-    collect_continuous_effects(state, gather_transient_continuous_effects)
+    collect_continuous_effects(state, transient_effect_is_live, &mut GatherPass::every())
+}
+
+/// The shared gather narrowed to the modifications `keep` accepts, in the same
+/// relative order as [`collect_shared_active_continuous_effects`]. Work whose
+/// every output would be dropped is skipped, and the returned
+/// [`GatherDependence`] says whether what remained had to evaluate a filter or
+/// a condition. `keep` must be total (see [`ModificationAdmission::Matching`]).
+pub(crate) fn collect_shared_active_continuous_effects_matching(
+    state: &GameState,
+    keep: fn(&ContinuousModification) -> bool,
+) -> (Vec<ActiveContinuousEffect>, GatherDependence) {
+    let mut pass = GatherPass::matching(keep);
+    let effects = collect_continuous_effects(state, transient_effect_is_live, &mut pass);
+    (effects, pass.into_dependence())
 }
 
 /// CR 611.2b + CR 613.1: installed state durations participate while deriving
 /// the candidate board. Their irreversible end is checked only after every
 /// layer has settled, never against a temporarily reset controller or P/T.
 fn collect_derivation_continuous_effects(state: &GameState) -> Vec<ActiveContinuousEffect> {
-    collect_continuous_effects(state, |state, effects| {
-        gather_transient_continuous_effects_with(
-            state,
-            effects,
-            transient_effect_passes_other_gates,
-        );
-    })
+    collect_continuous_effects(
+        state,
+        transient_effect_passes_other_gates,
+        &mut GatherPass::every(),
+    )
 }
 
+/// Runs one gather pass: static sources, then transients admitted by
+/// `transient_participates`, then the Ring emblem.
 fn collect_continuous_effects(
     state: &GameState,
-    gather_transients: fn(&GameState, &mut Vec<ActiveContinuousEffect>),
+    transient_participates: fn(&GameState, &TransientContinuousEffect) -> bool,
+    pass: &mut GatherPass,
 ) -> Vec<ActiveContinuousEffect> {
     #[cfg(test)]
     record_active_effect_collection();
@@ -6558,17 +7046,27 @@ fn collect_continuous_effects(
     let mut effects = Vec::new();
 
     for_each_static_effect_source(state, |state, obj| {
-        effects.extend(active_continuous_effects_from_static_source(state, obj));
+        effects.extend(static_source_effects_in_pass(state, obj, pass));
     });
-    gather_transients(state, &mut effects);
-    gather_ring_emblem_continuous_effects(state, &mut effects);
+    gather_transient_continuous_effects_with(state, &mut effects, transient_participates, pass);
+    gather_ring_emblem_continuous_effects(state, &mut effects, pass.admission());
     effects
 }
 
+/// Appends the Ring emblem's legendary effect for each Ring-bearer, unless the
+/// pass does not keep that modification.
 fn gather_ring_emblem_continuous_effects(
     state: &GameState,
     effects: &mut Vec<ActiveContinuousEffect>,
+    admission: ModificationAdmission,
 ) {
+    // The only modification produced here; a pass that drops it reads no ring
+    // state at all.
+    if !admission.admits(&ContinuousModification::AddSupertype {
+        supertype: Supertype::Legendary,
+    }) {
+        return;
+    }
     for &player in state.ring_level.keys() {
         let Some(bearer_id) = super::effects::ring::ring_bearer_for(state, player) else {
             continue;
@@ -6732,9 +7230,21 @@ pub(crate) fn for_each_static_effect_source(
     }
 }
 
+/// The continuous effects one source's live static definitions contribute to
+/// the full gather.
 pub(crate) fn active_continuous_effects_from_static_source(
     state: &GameState,
     source: &crate::game::game_object::GameObject,
+) -> Vec<ActiveContinuousEffect> {
+    static_source_effects_in_pass(state, source, &mut GatherPass::every())
+}
+
+/// The continuous effects one source's live static definitions contribute to
+/// `pass`.
+fn static_source_effects_in_pass(
+    state: &GameState,
+    source: &crate::game::game_object::GameObject,
+    pass: &mut GatherPass,
 ) -> Vec<ActiveContinuousEffect> {
     // CR 613.7n: a static ability's continuous effect inherits `source.timestamp`,
     // which is the object's battlefield-entry timestamp drawn in `move_to_zone`
@@ -6751,12 +7261,18 @@ pub(crate) fn active_continuous_effects_from_static_source(
         source.timestamp,
         source.static_definitions.as_slice(),
         StaticZoneAdmission::LiveSource,
+        pass,
     )
 }
 
+/// The continuous effects an object's own base static definitions contribute
+/// to an off-zone keyword query about that object, narrowed to the
+/// modifications `keep` accepts. These effects are per object and never
+/// shared, so the pass's dependence is not reported.
 pub(crate) fn active_continuous_effects_from_base_static_source(
     state: &GameState,
     source: &crate::game::game_object::GameObject,
+    keep: fn(&ContinuousModification) -> bool,
 ) -> Vec<ActiveContinuousEffect> {
     let static_definitions: Vec<StaticDefinition> = source
         .base_static_definitions
@@ -6771,6 +7287,7 @@ pub(crate) fn active_continuous_effects_from_base_static_source(
         source.timestamp,
         &static_definitions,
         StaticZoneAdmission::PreFilteredBaseStatic,
+        &mut GatherPass::matching(keep),
     )
 }
 
@@ -6835,6 +7352,10 @@ enum StaticZoneAdmission {
     PreFilteredBaseStatic,
 }
 
+/// Builds the continuous effects of `static_definitions` that `pass` keeps,
+/// expanding each `GrantStaticAbility` over its current battlefield hosts.
+/// `admission` says which zone-of-function screening the caller already
+/// applied (see [`StaticZoneAdmission`]).
 fn active_continuous_effects_from_static_definitions(
     state: &GameState,
     source_id: ObjectId,
@@ -6842,6 +7363,7 @@ fn active_continuous_effects_from_static_definitions(
     timestamp: u64,
     static_definitions: &[StaticDefinition],
     admission: StaticZoneAdmission,
+    pass: &mut GatherPass,
 ) -> Vec<ActiveContinuousEffect> {
     let mut effects = Vec::new();
     let source_obj = state.objects.get(&source_id);
@@ -6889,18 +7411,18 @@ fn active_continuous_effects_from_static_definitions(
 
         let retained_condition = def.condition.clone();
 
-        let affected_filter = def.affected.clone().unwrap_or(TargetFilter::Any);
+        let affected_filter = static_affected_filter(def).into_owned();
         for (mod_index, modification) in def.modifications.iter().enumerate() {
             // CR 701.15b: Goaded is a designation, not an ability granted
             // to the affected permanent. Combat reads this functioning source.
-            if is_combat_assignment_rule_modification(modification)
-                || matches!(
-                    modification,
-                    ContinuousModification::AddStaticMode {
-                        mode: StaticMode::Goaded
-                    }
-                )
-            {
+            if continuous_gather_skips(modification) {
+                continue;
+            }
+            // A narrowed pass drops, before any further work, a modification
+            // that can yield no kept effect. This runs after the skip above
+            // and before `layer()` below, and uses only the pass's total
+            // predicate.
+            if !pass.admission().reaches_admitted(modification) {
                 continue;
             }
             let trigger_producer_origin =
@@ -6912,6 +7434,27 @@ fn active_continuous_effects_from_static_definitions(
                         definition_index: def_idx,
                         modification_index: mod_index,
                     });
+            // CR 611.3a + CR 613.1f: Referenced-provider grants stay as their
+            // original static effects until layer 6. Earlier layers may change
+            // provider membership, and other layer-6 effects may change the
+            // abilities they donate before this effect applies.
+            let effect = ActiveContinuousEffect {
+                source_id,
+                controller,
+                def_index: Some(def_idx),
+                transient_id: None,
+                trigger_producer_origin,
+                expanded_trigger_provider: None,
+                mod_index,
+                layer: modification.layer(),
+                timestamp,
+                modification: modification.clone(),
+                affected_filter: affected_filter.clone(),
+                condition: retained_condition.clone(),
+                mode: def.mode.clone(),
+                characteristic_defining: def.characteristic_defining,
+                granter: def.granting_object,
+            };
             // CR 113.3d + CR 604.1 + CR 611.2c: A `GrantStaticAbility` modification
             // installs the inner static onto every recipient in the host's live
             // affected set. The recipient is the granted-static's *source*
@@ -6929,48 +7472,30 @@ fn active_continuous_effects_from_static_definitions(
             // `append_late_granted_static_effects`, and application gates every
             // child through `granted_static_parent_qualifies`.
             if let ContinuousModification::GrantStaticAbility { definition: inner } = modification {
+                let entered = pass.enter_grant_expansion();
                 effects.extend(expand_granted_static_effects(
                     state,
                     source_id,
                     timestamp,
                     inner.as_ref(),
-                    trigger_producer_origin.clone(),
+                    effect.trigger_producer_origin.clone(),
                     state
                         .battlefield
                         .iter()
                         .copied()
-                        .filter(granted_static_host_matches(
-                            state,
-                            source_id,
-                            &affected_filter,
+                        .filter(granted_static_host_matches_in_pass(
+                            &entered, state, &effect,
                         )),
+                    pass.admission(),
                 ));
                 // Continue: also push the meta-effect below so layer-6 apply
                 // pushes the inner static onto the recipient's
                 // `static_definitions` for inspectability and downstream
                 // queries (e.g., parser/coverage walks).
             }
-            // CR 611.3a + CR 613.1f: Referenced-provider grants stay as their
-            // original static effects until layer 6. Earlier layers may change
-            // provider membership, and other layer-6 effects may change the
-            // abilities they donate before this effect applies.
-            effects.push(ActiveContinuousEffect {
-                source_id,
-                controller,
-                def_index: Some(def_idx),
-                transient_id: None,
-                trigger_producer_origin,
-                expanded_trigger_provider: None,
-                mod_index,
-                layer: modification.layer(),
-                timestamp,
-                modification: modification.clone(),
-                affected_filter: affected_filter.clone(),
-                condition: retained_condition.clone(),
-                mode: def.mode.clone(),
-                characteristic_defining: def.characteristic_defining,
-                granter: def.granting_object,
-            });
+            if pass.admission().admits(modification) {
+                effects.push(effect);
+            }
         }
     }
 
@@ -6988,9 +7513,11 @@ fn active_continuous_effects_from_static_definitions(
 ///
 /// Candidates come from two places. Gather-time expansion passes the objects
 /// that match the host's affected filter after layer 1;
-/// `append_late_granted_static_effects` adds the remainder for layer passes
-/// whose host filter reads a layer-writable characteristic. Neither decides
-/// existence: `granted_static_parent_qualifies` gates every child at
+/// `append_late_granted_static_effects` adds, for layer passes whose host filter
+/// reads a layer-writable characteristic, the non-matching objects that could
+/// still join before the grant's group starts (all outside-slice objects in a
+/// restricted pass, kept only when their child can reach a recipient). Neither
+/// decides existence: `granted_static_parent_qualifies` gates every child at
 /// application against its exact parent's live affected set.
 ///
 /// Single-pass limitation: if `inner.modifications` itself contains another
@@ -7009,6 +7536,10 @@ fn active_continuous_effects_from_static_definitions(
 /// `depends_on` would suppress the cross-grant edge between them as if they were one
 /// static. No known card grants two such interacting static abilities to the same
 /// recipient; documented here for the next maintainer who hits that case.
+///
+/// `admission` narrows the synthesized children to the inner modifications the
+/// calling gather pass keeps; the late-grant path passes
+/// `ModificationAdmission::Every`.
 fn expand_granted_static_effects(
     state: &GameState,
     host_source_id: ObjectId,
@@ -7016,6 +7547,7 @@ fn expand_granted_static_effects(
     inner: &StaticDefinition,
     host_origin: Option<TriggerProducerOrigin>,
     recipients: impl IntoIterator<Item = ObjectId>,
+    admission: ModificationAdmission,
 ) -> Vec<ActiveContinuousEffect> {
     if inner.mode != StaticMode::Continuous {
         return Vec::new();
@@ -7042,14 +7574,12 @@ fn expand_granted_static_effects(
         // preceding layers have established that controller.
         let retained_inner_condition = inner.condition.clone();
         for (mod_index, modification) in inner.modifications.iter().enumerate() {
-            if is_combat_assignment_rule_modification(modification)
-                || matches!(
-                    modification,
-                    ContinuousModification::AddStaticMode {
-                        mode: StaticMode::Goaded
-                    }
-                )
-            {
+            if continuous_gather_skips(modification) {
+                continue;
+            }
+            // After the skip above and before `layer()` below: a narrowed
+            // pass synthesizes no child for a modification it does not keep.
+            if !admission.admits(modification) {
                 continue;
             }
             out.push(ActiveContinuousEffect {
@@ -7169,43 +7699,355 @@ pub(crate) fn stamp_static_granter(def: &mut StaticDefinition, granter: ObjectIn
     }
 }
 
-/// Whether an object matches a granting host's affected filter, from the host's
-/// point of view. Builds the filter context once for every candidate.
+/// CR 109.5 + CR 611.2c: whether an object is in a grant parent's affected set,
+/// matched under the context `apply_continuous_effect_filtered` binds for that
+/// set — "you" is `active_effect_condition_controller(parent)`, a transient's own
+/// controller or a printed static's live source controller. Every normal/late
+/// partition of a grant's children calls this one matcher, so each battlefield
+/// object lands in exactly one partition, computed under the context that
+/// decides membership. Builds the filter context once for every candidate.
 fn granted_static_host_matches<'a>(
     state: &'a GameState,
-    host_source_id: ObjectId,
-    host_affected_filter: &'a TargetFilter,
+    parent: &'a ActiveContinuousEffect,
 ) -> impl Fn(&ObjectId) -> bool + 'a {
-    let ctx = FilterContext::from_source(state, host_source_id);
-    move |&id| matches_target_filter(state, id, host_affected_filter, &ctx)
+    let ctx = FilterContext::from_source_with_controller(
+        parent.source_id,
+        active_effect_condition_controller(state, parent),
+    );
+    move |&id| matches_target_filter(state, id, &parent.affected_filter, &ctx)
 }
 
-/// CR 611.3a + CR 613.1: a carrier can enter the grant's affected set through
-/// any layer-written characteristic its filter reads (including CR 718.3b
-/// prototype values rewritten after layer 4); a filter that reads none fixes
-/// membership after layer 1.
+/// The object-local facts behind the pass steps `derive_layer_characteristics`
+/// and `apply_layers_incremental` run between a layer pass's effect collection
+/// and layer 6. Observed once per collection over the pass's candidate objects:
+/// the battlefield in a full pass, the recipients in a restricted pass. Each
+/// field is a fact about some object, never a mode. A new pass step in that
+/// window must be added here (see `late_grant_writable_kinds`).
+#[derive(Default)]
+struct LateGrantPassSteps {
+    /// Some object has a prototype form (`apply_prototype_characteristics`).
+    prototype: bool,
+    /// Some object is a land (`apply_intrinsic_basic_land_mana_abilities`).
+    land: bool,
+    /// Full pass only: some object is paired (`pairing::cleanup_invalid_pairs`).
+    paired: bool,
+    /// Restricted pass only: some recipient has a door-gated Room name
+    /// (`finish_layer_one`).
+    door_gated_name: bool,
+    /// Restricted pass only: some recipient carries stickers (`finish_layer_one`).
+    stickered: bool,
+}
+
+impl LateGrantPassSteps {
+    fn scan(state: &GameState, restrict_to: Option<&BTreeSet<ObjectId>>) -> Self {
+        let ids: Box<dyn Iterator<Item = &ObjectId>> = match restrict_to {
+            None => Box::new(state.battlefield.iter()),
+            Some(recipients) => Box::new(recipients.iter()),
+        };
+        let mut steps = Self::default();
+        for obj in ids.filter_map(|id| state.objects.get(id)) {
+            steps.prototype |= obj.prototype_form.is_some();
+            steps.land |= obj.card_types.core_types.contains(&CoreType::Land);
+            if restrict_to.is_none() {
+                steps.paired |= obj.paired_with.is_some();
+            } else {
+                steps.door_gated_name |=
+                    crate::game::room::door_gated_battlefield_name(obj).is_some();
+                steps.stickered |= !obj.stickers.is_empty();
+            }
+        }
+        steps
+    }
+
+    /// The kinds these pass steps can write before a group that starts in
+    /// `start`. `effect_writes` is what the effects at or before `start` can
+    /// write (clauses 1 and 2 of `late_grant_writable_kinds`).
+    fn writes_before(
+        &self,
+        start: Layer,
+        effect_writes: CharacteristicKinds,
+    ) -> CharacteristicKinds {
+        let mut kinds = CharacteristicKinds::EMPTY;
+        // The `Layer::Type` hooks run at the end of that layer's iteration.
+        if start > Layer::Type {
+            // CR 718.3b: a prototyped permanent has only its alternative mana cost
+            // and power/toughness, and is that cost's colors.
+            if self.prototype {
+                kinds = kinds
+                    .union(CharacteristicKinds::MANA_COST)
+                    .union(CharacteristicKinds::POWER_TOUGHNESS)
+                    .union(CharacteristicKinds::COLOR);
+            }
+            // CR 305.6: a land with a basic land type has that type's intrinsic
+            // mana ability. The hook can add it to a land at collection, or to an
+            // object a layer-4 effect makes a land.
+            if self.land || effect_writes.intersects(CharacteristicKinds::CARD_TYPES) {
+                kinds = kinds.union(CharacteristicKinds::ABILITIES);
+            }
+        }
+        // CR 702.95e: `cleanup_invalid_pairs` runs at the end of the `Control` and
+        // `Type` iterations and breaks every pair whose halves are no longer both
+        // creatures under the pair controller. It needs no writer — the step-1
+        // reset alone can break a pair — and it only clears pairs, so it matters
+        // only on a board that holds one. It contributes the kinds every pairing
+        // read is classified with.
+        if start > Layer::Control && self.paired {
+            kinds = kinds.union(UNPAIRED_READS);
+        }
+        // CR 709.5: `finish_layer_one` completes a door-gated Room's name on the
+        // recipients after the restricted collection.
+        if self.door_gated_name {
+            kinds = kinds.union(CharacteristicKinds::NAME_TEXT);
+        }
+        // CR 123.6c: `finish_layer_one` re-applies name and ability stickers on
+        // the recipients after the restricted collection.
+        if self.stickered {
+            kinds = kinds
+                .union(CharacteristicKinds::NAME_TEXT)
+                .union(CharacteristicKinds::ABILITIES);
+        }
+        kinds
+    }
+}
+
+/// CR 613.1 + CR 613.6: the kinds a granted static's inner parts at or before
+/// `start` can write, recursing through nested `GrantStaticAbility` up to
+/// `depth` (`ALL` past it, as `modification_characteristic_writes_at` does).
+fn granted_inner_writes_at_or_before(
+    def: &StaticDefinition,
+    start: Layer,
+    depth: u32,
+) -> CharacteristicKinds {
+    let Some(depth) = depth.checked_sub(1) else {
+        return CharacteristicKinds::ALL;
+    };
+    def.modifications
+        .iter()
+        .fold(CharacteristicKinds::EMPTY, |acc, m| {
+            let own = if m.layer() <= start {
+                modification_characteristic_writes(m)
+            } else {
+                CharacteristicKinds::EMPTY
+            };
+            let nested = match m {
+                ContinuousModification::GrantStaticAbility { definition } => {
+                    granted_inner_writes_at_or_before(definition, start, depth)
+                }
+                _ => CharacteristicKinds::EMPTY,
+            };
+            acc.union(own).union(nested)
+        })
+}
+
+/// The parent-independent inputs of `late_grant_writable_kinds`, computed once
+/// per collection and read by every grant parent. They are pure functions of
+/// the collection and of `state`, which collection does not change.
+struct LateGrantWindow<'a> {
+    steps: LateGrantPassSteps,
+    /// Each collected effect's CR 613.6 group key and layer, with the kinds it
+    /// writes when it counts as a foreign writer in this pass (else `EMPTY`).
+    writers: Vec<(Option<ContinuousEffectGroupKey>, Layer, CharacteristicKinds)>,
+    /// The first layer each group applies in.
+    starts: HashMap<ContinuousEffectGroupKey, Layer>,
+    /// Every collected grant's inner definition.
+    inner_defs: Vec<&'a StaticDefinition>,
+}
+
+impl<'a> LateGrantWindow<'a> {
+    fn collect(
+        state: &GameState,
+        effects: &'a [ActiveContinuousEffect],
+        restrict_to: Option<&BTreeSet<ObjectId>>,
+    ) -> Self {
+        let writers: Vec<_> = effects
+            .iter()
+            .map(|e| {
+                // CR 613.2c: a full pass collects after the copy fixed point, so
+                // layer-1 results are already on the board. A restricted pass
+                // changes only the recipients an effect can reach.
+                let foreign = match restrict_to {
+                    None => e.layer != Layer::Copy,
+                    Some(recipients) => {
+                        effect_can_reach_incremental_recipients(state, e, recipients)
+                    }
+                };
+                let writes = if foreign {
+                    modification_characteristic_writes(&e.modification)
+                } else {
+                    CharacteristicKinds::EMPTY
+                };
+                (continuous_effect_group_key(state, e), e.layer, writes)
+            })
+            .collect();
+        let mut starts: HashMap<ContinuousEffectGroupKey, Layer> = HashMap::new();
+        for (key, layer, _) in &writers {
+            if let Some(key) = key {
+                starts
+                    .entry(key.clone())
+                    .and_modify(|start| *start = (*start).min(*layer))
+                    .or_insert(*layer);
+            }
+        }
+        Self {
+            steps: LateGrantPassSteps::scan(state, restrict_to),
+            writers,
+            starts,
+            inner_defs: effects
+                .iter()
+                .filter_map(granted_static_definition)
+                .collect(),
+        }
+    }
+}
+
+/// CR 613.6 + CR 613.1: the characteristic kinds something could still write on
+/// a late candidate between this collection and the first application of
+/// `parent`'s group. CR 613.6 fixes the group's affected set when it starts, so
+/// an object that does not match at collection, and whose host verdict reads
+/// none of these kinds, cannot be in that set: its late children never apply.
+///
+/// `ALL` when the parent has no group key, or when its group starts in
+/// `Layer::Copy`: the full pass collects after the copy fixed point and the
+/// restricted pass re-collects after its copy step, so a group with a layer-1
+/// part may have fixed its set before collection. Otherwise, with `start` the
+/// group's first layer, the union of:
+///
+/// 1. Foreign collected writers at or before `start` (a same-layer effect may
+///    order first, CR 613.3 + CR 613.8). The parent's own group is excluded,
+///    because CR 613.6 fixes its set at its first part
+///    (`AffectedFilterReadTally::excluding_own_group` is the same relation). A
+///    full pass skips layer-1 writers, already applied (CR 613.2c); a restricted
+///    pass counts only writers that can reach a recipient.
+/// 2. Every collected grant's inner parts at or before `start`, whether or not
+///    that grant has a collected child: `granted_static_parent_qualifies`
+///    previews a child's inner part at its own layer.
+/// 3. The `Layer::Type` and `Control|Type` pass steps (`LateGrantPassSteps`).
+/// 4. In a restricted pass, `finish_layer_one`'s steps on the recipients.
+///
+/// Stated boundary: clauses 3 and 4 enumerate the non-effect writes
+/// `derive_layer_characteristics` and `apply_layers_incremental` perform
+/// between collection and layer 6; a future pass step in that window must be
+/// added to `LateGrantPassSteps`. The later steps (the Changeling fixup, keyword
+/// counters, `apply_cant_have_keyword_denials`, `finish_layer_evaluation`'s own
+/// `cleanup_invalid_pairs`) run at the end of layer 6 or after it. Every grant
+/// parent's group has started by then, because `GrantStaticAbility` is a
+/// layer-6 part, so they cannot affect a started set. The write and read
+/// classifiers are exhaustive and fall back to `ALL`, so this over-approximates:
+/// it can keep a useless candidate but never drops one that could join.
+fn late_grant_writable_kinds(
+    state: &GameState,
+    window: &LateGrantWindow<'_>,
+    parent: &ActiveContinuousEffect,
+) -> CharacteristicKinds {
+    let Some(parent_key) = continuous_effect_group_key(state, parent) else {
+        return CharacteristicKinds::ALL;
+    };
+    let start = window
+        .starts
+        .get(&parent_key)
+        .copied()
+        .unwrap_or(parent.layer);
+    if start == Layer::Copy {
+        return CharacteristicKinds::ALL;
+    }
+    let foreign = window
+        .writers
+        .iter()
+        .filter(|(key, layer, _)| *layer <= start && key.as_ref() != Some(&parent_key))
+        .fold(CharacteristicKinds::EMPTY, |acc, (_, _, writes)| {
+            acc.union(*writes)
+        });
+    let inner = window
+        .inner_defs
+        .iter()
+        .fold(CharacteristicKinds::EMPTY, |acc, def| {
+            acc.union(granted_inner_writes_at_or_before(
+                def,
+                start,
+                GRANTED_STATIC_WRITE_DEPTH,
+            ))
+        });
+    let effect_writes = foreign.union(inner);
+    effect_writes.union(window.steps.writes_before(start, effect_writes))
+}
+
+/// CR 611.3a + CR 613.6: adds the granted-static children only a layer pass can
+/// gate — those for battlefield objects that do not match the host filter at
+/// collection. A carrier can still enter the grant's affected set only through
+/// a kind its host filter reads that something before the group's first layer
+/// can write (`late_grant_writable_kinds`, including CR 718.3b prototype values
+/// rewritten after layer 4). Objects that cannot join get no late children; a
+/// host filter that reads no kind fixes membership after layer 1 and gets none
+/// at all.
+///
+/// In a restricted pass (`restrict_to`), recipients follow the same rule, and a
+/// child carried by an object outside the slice is kept only when it can reach
+/// a recipient (`effect_can_reach_incremental_recipients`). Dropping the rest is
+/// sound:
+/// 1. Inert: the parent's started set is built over `restrict_to`, and the
+///    preview in `granted_static_parent_qualifies` uses the same `restrict_to`,
+///    so an outside carrier is never in it and its child applies to nothing.
+/// 2. Guard verdicts are unchanged: `prepare_incremental_flush`'s outside-child
+///    guard escalates only on children that reach a recipient, under this same
+///    predicate. A dropped child whose carrier really holds the grant is
+///    duplicated by the carrier's installed copy on `static_definitions`, with
+///    the same modification, affected filter and condition; one whose carrier
+///    does not hold it never applies, so it can make no derived value stale.
+/// 3. Ordering: the prepare guards escalate whenever an entrant could perturb an
+///    outside object's layered values, so an outside carrier's grant membership
+///    is the last full pass's, and its installed copy contributes the same
+///    modification to `order_with_dependencies` that a real child would. Only
+///    dependency edges through an inert candidate disappear.
+///
+/// CR 613.8a: a dependency runs through an effect's application, and a dropped
+/// child never applies, so any dependency edge or loop through it was spurious.
 fn append_late_granted_static_effects(
     state: &GameState,
     effects: &mut Vec<ActiveContinuousEffect>,
+    restrict_to: Option<&BTreeSet<ObjectId>>,
 ) {
-    let late: Vec<ActiveContinuousEffect> = effects
+    let collected: &[ActiveContinuousEffect] = effects;
+    let parents: Vec<_> = collected
         .iter()
         .filter_map(|parent| {
             let inner = granted_static_definition(parent)?;
-            (!target_filter_characteristic_reads(&parent.affected_filter).is_empty())
-                .then_some((parent, inner))
+            let reads = target_filter_characteristic_reads(&parent.affected_filter);
+            (!reads.is_empty()).then_some((parent, inner, reads))
         })
-        .flat_map(|(parent, inner)| {
-            let matches =
-                granted_static_host_matches(state, parent.source_id, &parent.affected_filter);
+        .collect();
+    if parents.is_empty() {
+        return;
+    }
+    let window = LateGrantWindow::collect(state, collected, restrict_to);
+    let late: Vec<ActiveContinuousEffect> = parents
+        .into_iter()
+        .flat_map(|(parent, inner, reads)| {
+            let joinable = late_grant_writable_kinds(state, &window, parent).intersects(reads);
+            let matches = granted_static_host_matches(state, parent);
+            // Outside-slice objects are always expanded, then filtered by reach.
+            let candidates: Vec<ObjectId> = state
+                .battlefield
+                .iter()
+                .copied()
+                .filter(|id| joinable || restrict_to.is_some_and(|r| !r.contains(id)))
+                .filter(|id| !matches(id))
+                .collect();
             expand_granted_static_effects(
                 state,
                 parent.source_id,
                 parent.timestamp,
                 inner,
                 parent.trigger_producer_origin.clone(),
-                state.battlefield.iter().copied().filter(|id| !matches(id)),
+                candidates,
+                ModificationAdmission::Every,
             )
+            .into_iter()
+            .filter(move |child| {
+                restrict_to.is_none_or(|recipients| {
+                    recipients.contains(&child.source_id)
+                        || effect_can_reach_incremental_recipients(state, child, recipients)
+                })
+            })
         })
         .collect();
     effects.extend(late);
@@ -7213,9 +8055,12 @@ fn append_late_granted_static_effects(
 
 /// CR 613.1: the effect set a layer pass applies — the derivation collection
 /// plus the late granted-static candidates only a layer pass can gate.
-fn collect_layer_pass_active_continuous_effects(state: &GameState) -> Vec<ActiveContinuousEffect> {
+fn collect_layer_pass_active_continuous_effects(
+    state: &GameState,
+    restrict_to: Option<&BTreeSet<ObjectId>>,
+) -> Vec<ActiveContinuousEffect> {
     let mut effects = collect_derivation_continuous_effects(state);
-    append_late_granted_static_effects(state, &mut effects);
+    append_late_granted_static_effects(state, &mut effects, restrict_to);
     effects
 }
 
@@ -7519,25 +8364,43 @@ fn transient_effect_passes_other_gates(state: &GameState, tce: &TransientContinu
     true
 }
 
+/// Appends the effects of every live transient continuous effect (the full
+/// transient gather).
 pub(crate) fn gather_transient_continuous_effects(
     state: &GameState,
     effects: &mut Vec<ActiveContinuousEffect>,
 ) {
-    gather_transient_continuous_effects_with(state, effects, transient_effect_is_live);
+    gather_transient_continuous_effects_with(
+        state,
+        effects,
+        transient_effect_is_live,
+        &mut GatherPass::every(),
+    );
 }
 
+/// Appends the effects of every stored transient that `participates` admits
+/// and `pass` keeps. A narrowed pass skips, before any liveness evaluation, a
+/// transient none of whose modifications can yield a kept effect.
 fn gather_transient_continuous_effects_with(
     state: &GameState,
     effects: &mut Vec<ActiveContinuousEffect>,
     participates: fn(&GameState, &TransientContinuousEffect) -> bool,
+    pass: &mut GatherPass,
 ) {
     for tce in &state.transient_continuous_effects {
-        if !participates(state, tce) {
+        // Scans the raw modification list with the pass's total predicate
+        // only. It over-approximates: a modification the per-modification
+        // skips below would drop still lets the transient through.
+        if !pass.admission().reaches_any_admitted(&tce.modifications) {
+            continue;
+        }
+        let entered = pass.enter_transient_liveness();
+        if !transient_participates_in_pass(&entered, state, tce, participates) {
             continue;
         }
 
         let retained_condition = if let Some(condition) = &tce.condition {
-            if !source_condition_gate_passes(state, condition, tce.controller, tce.source_id) {
+            if !transient_source_condition_passes_in_pass(&entered, state, tce, condition) {
                 continue;
             }
             condition_uses_recipient_context(condition).then(|| condition.clone())
@@ -7587,30 +8450,10 @@ fn gather_transient_continuous_effects_with(
             ) {
                 continue;
             }
-            // CR 113.3d + CR 604.1 + CR 611.2c: Mirror the printed-static gather
-            // path — a transient `GrantStaticAbility` must expand its inner
-            // modifications to recipients during the same layer pass (Roar of the
-            // Fifth People chapter II: saga gains "Creatures you control have …").
-            if let ContinuousModification::GrantStaticAbility { definition: inner } = modification {
-                effects.extend(expand_granted_static_effects(
-                    state,
-                    tce.source_id,
-                    tce.timestamp,
-                    inner.as_ref(),
-                    Some(TriggerProducerOrigin::Transient {
-                        continuous_effect_id: tce.id,
-                        modification_index: mod_index,
-                    }),
-                    state
-                        .battlefield
-                        .iter()
-                        .copied()
-                        .filter(granted_static_host_matches(
-                            state,
-                            tce.source_id,
-                            &tce.affected,
-                        )),
-                ));
+            // After both skips above and before `layer()` below: a narrowed
+            // pass drops a modification that can yield no kept effect.
+            if !pass.admission().reaches_admitted(modification) {
+                continue;
             }
             let effect = ActiveContinuousEffect {
                 source_id: tce.source_id,
@@ -7632,7 +8475,31 @@ fn gather_transient_continuous_effects_with(
                 characteristic_defining: false,
                 granter: tce.granting_object,
             };
-            effects.push(effect);
+            // CR 113.3d + CR 604.1 + CR 611.2c: Mirror the printed-static gather
+            // path — a transient `GrantStaticAbility` must expand its inner
+            // modifications to recipients during the same layer pass (Roar of the
+            // Fifth People chapter II: saga gains "Creatures you control have …").
+            if let ContinuousModification::GrantStaticAbility { definition: inner } = modification {
+                let expansion = pass.enter_grant_expansion();
+                effects.extend(expand_granted_static_effects(
+                    state,
+                    tce.source_id,
+                    tce.timestamp,
+                    inner.as_ref(),
+                    effect.trigger_producer_origin.clone(),
+                    state
+                        .battlefield
+                        .iter()
+                        .copied()
+                        .filter(granted_static_host_matches_in_pass(
+                            &expansion, state, &effect,
+                        )),
+                    pass.admission(),
+                ));
+            }
+            if pass.admission().admits(modification) {
+                effects.push(effect);
+            }
         }
     }
 }
@@ -8141,7 +9008,7 @@ fn active_combat_assignment_rule_effects_from_static_definitions(
 
         let retained_condition = def.condition.clone();
 
-        let affected_filter = def.affected.clone().unwrap_or(TargetFilter::Any);
+        let affected_filter = static_affected_filter(def).into_owned();
         effects.extend(
             def.modifications
                 .iter()
@@ -9462,6 +10329,7 @@ fn original_granted_static_parent(
                 state,
                 &mut effects,
                 transient_effect_passes_other_gates,
+                &mut GatherPass::every(),
             );
             effects
         }
@@ -10117,12 +10985,12 @@ fn apply_continuous_effect_filtered(
     // WHICH CARDS: only those whose magnitude is recipient-INDEPENDENT, since a
     // recipient-DEPENDENT one is resolved inside the loop below and never
     // reaches this binding at all. That excludes Rat Colony ("each OTHER Rat"
-    // carries `FilterProp::Another`, which `quantity::filter_uses_recipient`
-    // reports as recipient-relative) and includes the 161 corpus cards shaped
-    // like Beanstalk Giant / Ashaya / Adeline ("equal to the number of lands you
-    // control"). The test pair below is built on the latter for exactly that
-    // reason — a Rat Colony fixture would assert zero against a counter that can
-    // never move.
+    // carries `FilterProp::Another`) and Ancient Ooze (an aggregate over
+    // "other" creatures): the exhaustive quantity classifier reports both as
+    // recipient-relative. Beanstalk Giant / Ashaya / Adeline ("equal to the
+    // number of lands you control") remain recipient-independent.
+    // The test pair below uses the latter class; a Rat Colony fixture would
+    // assert zero against a counter that can never move.
     //
     // Skipping it is a pure evaluation-order change, not a semantic one: the
     // affected set is already fixed above (and CR 613.6-retained through
@@ -10534,56 +11402,6 @@ fn apply_continuous_effect_filtered(
                 obj.keywords.clear();
                 abilities_suppressed.insert(id);
             }
-            ContinuousModification::AddType { core_type } => {
-                if !obj.card_types.core_types.contains(core_type) {
-                    obj.card_types.core_types.push(*core_type);
-                }
-            }
-            ContinuousModification::RemoveType { core_type } => {
-                obj.card_types.core_types.retain(|t| t != core_type);
-            }
-            ContinuousModification::SetColor { colors } => {
-                obj.color = colors.clone();
-            }
-            ContinuousModification::AddColor { color } => {
-                if !obj.color.contains(color) {
-                    obj.color.push(*color);
-                }
-            }
-            ContinuousModification::AddSubtype { ref subtype } => {
-                if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
-                    obj.card_types.subtypes.push(subtype.clone());
-                }
-            }
-            ContinuousModification::RemoveSubtype { ref subtype } => {
-                obj.card_types.subtypes.retain(|s| s != subtype);
-            }
-            // CR 205.1a + CR 613.1d: Replace the entire core card-type set.
-            ContinuousModification::SetCardTypes { ref core_types } => {
-                obj.card_types.core_types = core_types.clone();
-                obj.card_types.subtypes.retain(|subtype| {
-                    subtype_matches_core_types(subtype, core_types, &all_creature_types)
-                });
-            }
-            // CR 205.1a + CR 613.1d: Remove every subtype belonging to the
-            // named subtype set. Membership for the `Creature` set is resolved
-            // against the runtime-populated `state.all_creature_types` — the
-            // same source `AddAllCreatureTypes` uses below.
-            ContinuousModification::RemoveAllSubtypes { set } => {
-                remove_subtype_set(&mut obj.card_types.subtypes, *set, &all_creature_types);
-            }
-            // CR 205.4 + CR 707.9d: "in addition to its other types" — append
-            // the supertype if absent. Idempotent.
-            ContinuousModification::AddSupertype { supertype } => {
-                if !obj.card_types.supertypes.contains(supertype) {
-                    obj.card_types.supertypes.push(*supertype);
-                }
-            }
-            // CR 205.4 + CR 707.9b: "isn't legendary" / "isn't basic" copy
-            // exception. Strip the supertype from the layered view.
-            ContinuousModification::RemoveSupertype { supertype } => {
-                obj.card_types.supertypes.retain(|s| s != supertype);
-            }
             // CR 122.1 + CR 614.1c: One-shot counter placement is consumed at
             // copy resolution by token_copy::resolve / become_copy::resolve.
             // Reaching this arm means a wiring bug.
@@ -10616,57 +11434,32 @@ fn apply_continuous_effect_filtered(
                      not via apply_continuous_effect"
                 );
             }
-            ContinuousModification::AddAllCreatureTypes => {
-                for subtype in &state.all_creature_types {
-                    if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
-                        obj.card_types.subtypes.push(subtype.clone());
-                    }
-                }
-            }
-            // CR 305.6 + CR 305.7: Add all five basic land types (additive).
-            ContinuousModification::AddAllBasicLandTypes => {
-                for land_type in BasicLandType::all() {
-                    let subtype = land_type.as_subtype_str().to_string();
-                    if !obj.card_types.subtypes.iter().any(|s| s == &subtype) {
-                        obj.card_types.subtypes.push(subtype);
-                    }
-                }
-            }
-            // CR 205.3i: every land type is one of the 17 land subtypes.
-            // CR 305.7: a land that gains land types in addition to its own
-            // keeps its types and gains the new land types and their mana
-            // abilities. The basic types among the 17 grant their mana ability
-            // automatically via `apply_intrinsic_basic_land_mana_abilities`.
-            ContinuousModification::AddAllLandTypes => {
-                for subtype in crate::types::card_type::LAND_SUBTYPES {
-                    if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
-                        obj.card_types.subtypes.push((*subtype).to_string());
-                    }
-                }
-            }
-            ContinuousModification::AddChosenSubtype { .. } => {
-                if let Some(ref subtype) = chosen_subtype {
-                    if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
-                        obj.card_types.subtypes.push(subtype.clone());
-                    }
-                }
-            }
-            // CR 105.3 + CR 613.1e: Apply the source's chosen color. `Set`
-            // replaces prior colors; `Add` retains them (Painter's Servant
-            // "in addition to their other colors").
-            ContinuousModification::AddChosenColor { mode } => {
-                if let Some(color) = chosen_color {
-                    match mode {
-                        crate::types::ability::ColorChangeMode::Set => {
-                            obj.color = vec![color];
-                        }
-                        crate::types::ability::ColorChangeMode::Add => {
-                            if !obj.color.contains(&color) {
-                                obj.color.push(color);
-                            }
-                        }
-                    }
-                }
+            // CR 613.1d + CR 613.1e: the type- and colour-changing modifications
+            // share one per-object applier with the CR 614.12 entry projection
+            // (`filter::EntryProjection`), so the two can't drift.
+            modification @ (ContinuousModification::AddType { .. }
+            | ContinuousModification::RemoveType { .. }
+            | ContinuousModification::SetColor { .. }
+            | ContinuousModification::AddColor { .. }
+            | ContinuousModification::AddSubtype { .. }
+            | ContinuousModification::RemoveSubtype { .. }
+            | ContinuousModification::SetCardTypes { .. }
+            | ContinuousModification::RemoveAllSubtypes { .. }
+            | ContinuousModification::AddSupertype { .. }
+            | ContinuousModification::RemoveSupertype { .. }
+            | ContinuousModification::AddAllCreatureTypes
+            | ContinuousModification::AddAllBasicLandTypes
+            | ContinuousModification::AddAllLandTypes
+            | ContinuousModification::AddChosenSubtype { .. }
+            | ContinuousModification::AddChosenColor { .. }) => {
+                let applied = apply_type_or_color_modification(
+                    obj,
+                    modification,
+                    chosen_subtype.as_deref(),
+                    chosen_color,
+                    &all_creature_types,
+                );
+                debug_assert_eq!(applied, TypeColorModification::Applied);
             }
             ContinuousModification::SetDynamicPower { .. } => {
                 if let Some(val) = dynamic_pt {
@@ -10982,6 +11775,197 @@ fn apply_continuous_effect_filtered(
     None
 }
 
+/// CR 613.1: the set of objects a continuous static affects. An absent
+/// `affected` filter is every object. The single reading shared by the layer
+/// pass and the CR 614.12 entry projection (`filter::EntryProjection`).
+pub(crate) fn static_affected_filter(def: &StaticDefinition) -> std::borrow::Cow<'_, TargetFilter> {
+    def.affected.as_ref().map_or(
+        std::borrow::Cow::Owned(TargetFilter::Any),
+        std::borrow::Cow::Borrowed,
+    )
+}
+
+/// What [`apply_type_or_color_modification`] did with one modification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypeColorModification {
+    /// A layer-4 / layer-5 modification, applied to the object.
+    Applied,
+    /// A layer-4 modification this per-object applier cannot perform: setting a
+    /// land subtype also removes the land's rules-text abilities (CR 305.7), a
+    /// layer-wide side effect only the layer pass owns.
+    Unsupported,
+    /// Not a type- or colour-changing modification.
+    OtherLayer,
+}
+
+/// CR 613.1d (layer 4, type-changing) + CR 613.1e (layer 5, colour-changing):
+/// apply one modification to one object. The single per-object authority for
+/// these modifications, shared by the layer pass and the CR 614.12 entry
+/// projection (`filter::EntryProjection`). `chosen_subtype` / `chosen_color`
+/// are the modification source's chosen values (CR 607.2d).
+pub(crate) fn apply_type_or_color_modification(
+    obj: &mut crate::game::game_object::GameObject,
+    modification: &ContinuousModification,
+    chosen_subtype: Option<&str>,
+    chosen_color: Option<crate::types::mana::ManaColor>,
+    all_creature_types: &[String],
+) -> TypeColorModification {
+    match modification {
+        ContinuousModification::AddType { core_type } => {
+            if !obj.card_types.core_types.contains(core_type) {
+                obj.card_types.core_types.push(*core_type);
+            }
+        }
+        // CR 205.1a: removing a card type also removes its correlated subtypes
+        // (unless another remaining type owns the same subtype set), so an
+        // object that stops being a creature has no creature types while it
+        // isn't one. A later `AddType` never resurrects them (CR 613.7).
+        ContinuousModification::RemoveType { core_type } => {
+            remove_core_type(&mut obj.card_types, *core_type);
+        }
+        ContinuousModification::SetColor { colors } => {
+            obj.color = colors.clone();
+        }
+        ContinuousModification::AddColor { color } => {
+            if !obj.color.contains(color) {
+                obj.color.push(*color);
+            }
+        }
+        ContinuousModification::AddSubtype { subtype } => {
+            if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
+                obj.card_types.subtypes.push(subtype.clone());
+            }
+        }
+        ContinuousModification::RemoveSubtype { subtype } => {
+            obj.card_types.subtypes.retain(|s| s != subtype);
+        }
+        // CR 205.1a + CR 613.1d: Replace the entire core card-type set.
+        ContinuousModification::SetCardTypes { core_types } => {
+            obj.card_types.core_types = core_types.clone();
+            obj.card_types
+                .subtypes
+                .retain(|subtype| subtype_matches_core_types(subtype, core_types));
+        }
+        // CR 205.1a + CR 613.1d: Remove every subtype belonging to the
+        // named subtype set. Membership for the `Creature` set is resolved
+        // against the runtime-populated `state.all_creature_types` — the
+        // same source `AddAllCreatureTypes` uses below.
+        ContinuousModification::RemoveAllSubtypes { set } => {
+            remove_subtype_set(&mut obj.card_types.subtypes, *set, all_creature_types);
+        }
+        // CR 205.4 + CR 707.9d: "in addition to its other types" — append
+        // the supertype if absent. Idempotent.
+        ContinuousModification::AddSupertype { supertype } => {
+            if !obj.card_types.supertypes.contains(supertype) {
+                obj.card_types.supertypes.push(*supertype);
+            }
+        }
+        // CR 205.4 + CR 707.9b: "isn't legendary" / "isn't basic" copy
+        // exception. Strip the supertype from the layered view.
+        ContinuousModification::RemoveSupertype { supertype } => {
+            obj.card_types.supertypes.retain(|s| s != supertype);
+        }
+        ContinuousModification::AddAllCreatureTypes => {
+            for subtype in all_creature_types {
+                if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
+                    obj.card_types.subtypes.push(subtype.clone());
+                }
+            }
+        }
+        // CR 305.6 + CR 305.7: Add all five basic land types (additive).
+        ContinuousModification::AddAllBasicLandTypes => {
+            for land_type in BasicLandType::all() {
+                let subtype = land_type.as_subtype_str().to_string();
+                if !obj.card_types.subtypes.iter().any(|s| s == &subtype) {
+                    obj.card_types.subtypes.push(subtype);
+                }
+            }
+        }
+        // CR 205.3i: every land type is one of the 17 land subtypes.
+        // CR 305.7: a land that gains land types in addition to its own
+        // keeps its types and gains the new land types and their mana
+        // abilities. The basic types among the 17 grant their mana ability
+        // automatically via `apply_intrinsic_basic_land_mana_abilities`.
+        ContinuousModification::AddAllLandTypes => {
+            for subtype in crate::types::card_type::LAND_SUBTYPES {
+                if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
+                    obj.card_types.subtypes.push((*subtype).to_string());
+                }
+            }
+        }
+        ContinuousModification::AddChosenSubtype { .. } => {
+            if let Some(subtype) = chosen_subtype {
+                if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
+                    obj.card_types.subtypes.push(subtype.to_string());
+                }
+            }
+        }
+        // CR 105.3 + CR 613.1e: Apply the source's chosen color. `Set`
+        // replaces prior colors; `Add` retains them (Painter's Servant
+        // "in addition to their other colors").
+        ContinuousModification::AddChosenColor { mode } => {
+            if let Some(color) = chosen_color {
+                match mode {
+                    crate::types::ability::ColorChangeMode::Set => {
+                        obj.color = vec![color];
+                    }
+                    crate::types::ability::ColorChangeMode::Add => {
+                        if !obj.color.contains(&color) {
+                            obj.color.push(color);
+                        }
+                    }
+                }
+            }
+        }
+        ContinuousModification::SetBasicLandType { .. }
+        | ContinuousModification::SetChosenBasicLandType => {
+            return TypeColorModification::Unsupported;
+        }
+        ContinuousModification::CopyValues { .. }
+        | ContinuousModification::CopyChosen
+        | ContinuousModification::SetName { .. }
+        | ContinuousModification::SetTextName { .. }
+        | ContinuousModification::SubstituteTextWord { .. }
+        | ContinuousModification::AddPower { .. }
+        | ContinuousModification::AddToughness { .. }
+        | ContinuousModification::SetPower { .. }
+        | ContinuousModification::SetToughness { .. }
+        | ContinuousModification::AddKeyword { .. }
+        | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::GrantAbility { .. }
+        | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
+        | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
+        | ContinuousModification::GrantTrigger { .. }
+        | ContinuousModification::GrantReplacement { .. }
+        | ContinuousModification::RemoveAllAbilities
+        | ContinuousModification::SetDynamicPower { .. }
+        | ContinuousModification::SetDynamicToughness { .. }
+        | ContinuousModification::SetPowerDynamic { .. }
+        | ContinuousModification::SetToughnessDynamic { .. }
+        | ContinuousModification::AddDynamicPower { .. }
+        | ContinuousModification::AddDynamicToughness { .. }
+        | ContinuousModification::AddDynamicKeyword { .. }
+        | ContinuousModification::AddKeywordWithDerivedCost { .. }
+        | ContinuousModification::RemoveChosenKeyword
+        | ContinuousModification::AddChosenKeyword
+        | ContinuousModification::AddStaticMode { .. }
+        | ContinuousModification::GrantStaticAbility { .. }
+        | ContinuousModification::SwitchPowerToughness
+        | ContinuousModification::AssignDamageFromToughness
+        | ContinuousModification::AssignDamageAsThoughUnblocked
+        | ContinuousModification::AssignNoCombatDamage
+        | ContinuousModification::ChangeController
+        | ContinuousModification::SetChosenName
+        | ContinuousModification::RetainPrintedTriggerFromSource { .. }
+        | ContinuousModification::RetainPrintedAbilityFromSource { .. }
+        | ContinuousModification::RetainAllOtherAbilitiesFromSource
+        | ContinuousModification::AddCounterOnEnter { .. }
+        | ContinuousModification::SetStartingLoyalty { .. }
+        | ContinuousModification::RemoveManaCost => return TypeColorModification::OtherLayer,
+    }
+    TypeColorModification::Applied
+}
+
 // CR 305.7: Setting a land subtype replaces old land subtypes and removes the
 // land's rules-text abilities; layer 6 reapplies abilities from other effects.
 fn set_land_subtype_replacing(obj: &mut crate::game::game_object::GameObject, subtype: String) {
@@ -11007,22 +11991,29 @@ fn set_land_subtype_replacing(obj: &mut crate::game::game_object::GameObject, su
 /// intrinsic basic-land mana abilities before layer 6 ability effects apply.
 fn apply_intrinsic_basic_land_mana_abilities(state: &mut GameState, battlefield_ids: &[ObjectId]) {
     for &id in battlefield_ids {
-        let Some(obj) = state.objects.get_mut(&id) else {
-            continue;
-        };
-        if !obj.card_types.core_types.contains(&CoreType::Land) {
-            continue;
+        if let Some(obj) = state.objects.get_mut(&id) {
+            derive_intrinsic_basic_land_mana_abilities(obj);
         }
+    }
+}
 
-        let land_types: Vec<BasicLandType> = obj
-            .card_types
-            .subtypes
-            .iter()
-            .filter_map(|subtype| subtype.parse().ok())
-            .collect();
-        for land_type in land_types {
-            add_basic_land_mana_ability(obj, land_type);
-        }
+/// CR 305.6: give a land the intrinsic mana ability of each basic land type it
+/// has. The single authority shared by the layer pass and the CR 614.12 entry
+/// projection.
+pub(crate) fn derive_intrinsic_basic_land_mana_abilities(
+    obj: &mut crate::game::game_object::GameObject,
+) {
+    if !obj.card_types.core_types.contains(&CoreType::Land) {
+        return;
+    }
+    let land_types: Vec<BasicLandType> = obj
+        .card_types
+        .subtypes
+        .iter()
+        .filter_map(|subtype| subtype.parse().ok())
+        .collect();
+    for land_type in land_types {
+        add_basic_land_mana_ability(obj, land_type);
     }
 }
 
@@ -11256,6 +12247,45 @@ pub(crate) fn compute_current_copiable_values(
 
 #[cfg(test)]
 mod tests {
+
+    /// CR 500.8 + CR 506.1 + CR 506.2 + CR 611.3a (structural review round 4):
+    /// the static "As long as it's the first combat phase of your turn" gate
+    /// admits its effect only while that phase is in progress — the phase-start
+    /// tally alone (one `BeginCombat` this turn) leaves the buff on through the
+    /// postcombat main and the ending phase, and an added combat phase makes the
+    /// gate false while the second one runs. `Phase::group` recovers the
+    /// CR 506.1 phase from the engine's flattened combat-step variants, so every
+    /// step of the first combat phase qualifies.
+    #[test]
+    fn first_combat_phase_static_requires_the_phase_in_progress() {
+        let mut state = GameState::new_two_player(42);
+        let source = ObjectId(1);
+        for (phase, begin_combat_starts, expected) in [
+            (Phase::PreCombatMain, 0, false),
+            (Phase::DeclareAttackers, 1, true),
+            (Phase::EndCombat, 1, true),
+            (Phase::PostCombatMain, 1, false),
+            (Phase::End, 1, false),
+            (Phase::DeclareAttackers, 2, false),
+        ] {
+            state.steps_started_this_turn.clear();
+            for _ in 0..begin_combat_starts {
+                state.steps_started_this_turn.record(Phase::BeginCombat);
+            }
+            state.phase = phase;
+            assert_eq!(
+                evaluate_condition_inner(
+                    &state,
+                    &StaticCondition::FirstCombatPhaseOfTurn,
+                    PlayerId(0),
+                    source,
+                    ConditionContext::NONE,
+                ),
+                expected,
+                "phase {phase:?} with {begin_combat_starts} BeginCombat start(s)"
+            );
+        }
+    }
 
     /// CR 201.5a: the predicate is true exactly for grant bodies that name their granter.
     #[test]
@@ -11528,31 +12558,365 @@ mod tests {
         let mut state = setup();
         state.all_creature_types = vec!["Bear".to_string(), "Berserker".to_string()];
 
-        assert!(subtype_matches_core_types(
-            "Bear",
-            &[CoreType::Creature],
-            &state.all_creature_types
-        ));
+        assert!(subtype_matches_core_types("Bear", &[CoreType::Creature]));
         assert!(!subtype_matches_core_types(
             "Equipment",
-            &[CoreType::Creature],
-            &state.all_creature_types
+            &[CoreType::Creature]
         ));
         assert!(!subtype_matches_core_types(
             "Mountain",
-            &[CoreType::Creature],
-            &state.all_creature_types
+            &[CoreType::Creature]
         ));
         assert!(subtype_matches_core_types(
             "Equipment",
-            &[CoreType::Artifact, CoreType::Creature],
-            &state.all_creature_types
+            &[CoreType::Artifact, CoreType::Creature]
         ));
-        assert!(subtype_matches_core_types(
-            "Siege",
-            &[CoreType::Battle],
-            &state.all_creature_types
-        ));
+        assert!(subtype_matches_core_types("Siege", &[CoreType::Battle]));
+    }
+
+    /// CR 205.3m + CR 308.2 + CR 308.3 + CR 205.1a/205.3d: creature types
+    /// correlate only to Creature, Kindred or Tribal; every other subtype set is
+    /// fixed. Registry-free by signature.
+    #[test]
+    fn subtype_matches_core_types_creature_types_require_creature_kindred_or_tribal() {
+        for (subtype, core_types, expected) in [
+            ("Avatar", vec![CoreType::Enchantment], false),
+            (
+                "Avatar",
+                vec![CoreType::Enchantment, CoreType::Creature],
+                true,
+            ),
+            (
+                "Avatar",
+                vec![CoreType::Kindred, CoreType::Enchantment],
+                true,
+            ),
+            ("Avatar", vec![CoreType::Tribal, CoreType::Artifact], true),
+            ("Equipment", vec![CoreType::Artifact], true),
+            ("Equipment", vec![CoreType::Creature], false),
+            ("Heartwood", vec![CoreType::Artifact], true),
+            ("Heartwood", vec![CoreType::Creature], false),
+            ("Vibranium", vec![CoreType::Artifact], true),
+            ("Vibranium", vec![CoreType::Creature], false),
+            ("Forest", vec![CoreType::Land, CoreType::Creature], true),
+            ("Forest", vec![CoreType::Creature], false),
+            ("Siege", vec![CoreType::Battle], true),
+            ("Adventure", vec![CoreType::Instant], true),
+        ] {
+            assert_eq!(
+                subtype_matches_core_types(subtype, &core_types),
+                expected,
+                "{subtype} vs {core_types:?}"
+            );
+        }
+    }
+
+    /// CR 205.1a + CR 205.3d: `SetCardTypes` to a result with no creature type
+    /// drops registered creature types (the registry no longer keeps them alive).
+    /// Deliberately synthetic: the registry clause has no real-card owner.
+    #[test]
+    fn set_card_types_drops_registered_creature_types_from_a_noncreature_result() {
+        for (result_type, keeps_bear) in [(CoreType::Land, false), (CoreType::Creature, true)] {
+            let mut state = setup();
+            state.all_creature_types = vec!["Bear".to_string()];
+            let target = make_creature(&mut state, "Bear Object", 2, 2, PlayerId(0));
+            {
+                let obj = state.objects.get_mut(&target).unwrap();
+                obj.card_types.subtypes = vec!["Bear".to_string()];
+                obj.base_card_types = obj.card_types.clone();
+            }
+            let source = make_creature(&mut state, "Type Setter", 1, 1, PlayerId(0));
+            state
+                .objects
+                .get_mut(&source)
+                .unwrap()
+                .static_definitions
+                .push(
+                    StaticDefinition::continuous()
+                        .affected(TargetFilter::SpecificObject { id: target })
+                        .modifications(vec![ContinuousModification::SetCardTypes {
+                            core_types: vec![result_type],
+                        }]),
+                );
+
+            evaluate_layers(&mut state);
+
+            let obj = &state.objects[&target];
+            assert_eq!(obj.card_types.core_types, vec![result_type]);
+            assert_eq!(
+                obj.card_types.subtypes.iter().any(|s| s == "Bear"),
+                keeps_bear,
+                "SetCardTypes to {result_type:?}"
+            );
+        }
+    }
+
+    /// CR 205.1a + CR 613.7: a creature type removed with the Creature type is
+    /// not resurrected by a later `AddType { Creature }`, in either timestamp
+    /// order.
+    #[test]
+    fn remove_type_then_later_add_type_creature_keeps_creature_types_removed() {
+        for (remove_ts, add_ts, ends_creature) in [(5, 10, true), (10, 5, false)] {
+            let mut state = setup();
+            state.all_creature_types = vec!["Bear".to_string()];
+            let target = make_creature(&mut state, "Bear Object", 2, 2, PlayerId(0));
+            {
+                let obj = state.objects.get_mut(&target).unwrap();
+                obj.card_types.subtypes = vec!["Bear".to_string()];
+                obj.base_card_types = obj.card_types.clone();
+            }
+            for (name, ts, modification) in [
+                (
+                    "Remover",
+                    remove_ts,
+                    ContinuousModification::RemoveType {
+                        core_type: CoreType::Creature,
+                    },
+                ),
+                (
+                    "Adder",
+                    add_ts,
+                    ContinuousModification::AddType {
+                        core_type: CoreType::Creature,
+                    },
+                ),
+            ] {
+                let source = make_creature(&mut state, name, 1, 1, PlayerId(0));
+                let obj = state.objects.get_mut(&source).unwrap();
+                obj.timestamp = ts;
+                obj.static_definitions.push(
+                    StaticDefinition::continuous()
+                        .affected(TargetFilter::SpecificObject { id: target })
+                        .modifications(vec![modification]),
+                );
+            }
+
+            evaluate_layers(&mut state);
+
+            let obj = &state.objects[&target];
+            assert_eq!(
+                obj.card_types.core_types.contains(&CoreType::Creature),
+                ends_creature,
+                "reach guard: remove ts {remove_ts}, add ts {add_ts}"
+            );
+            assert!(
+                !obj.card_types.subtypes.iter().any(|s| s == "Bear"),
+                "CR 205.1a: a later AddType Creature must not restore Bear (remove ts {remove_ts}, add ts {add_ts})"
+            );
+        }
+    }
+
+    /// CR 205.1a: `remove_core_type` drops the removed type's correlated
+    /// subtypes unless a remaining type owns the same subtype set.
+    #[test]
+    fn remove_core_type_helper_cases() {
+        use crate::types::card_type::CardType;
+        use CoreType::*;
+
+        fn card_type(core_types: &[CoreType], subtypes: &[&str]) -> CardType {
+            CardType {
+                supertypes: vec![],
+                core_types: core_types.to_vec(),
+                subtypes: subtypes.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+        fn removed(core_types: &[CoreType], subtypes: &[&str], remove: CoreType) -> CardType {
+            let mut ct = card_type(core_types, subtypes);
+            remove_core_type(&mut ct, remove);
+            ct
+        }
+
+        // Land Creature - Forest Dryad (Dryad Arbor shape).
+        let empty = removed(&[Artifact, Creature], &[], Creature);
+        assert_eq!(empty.core_types, vec![Artifact]);
+        assert!(empty.subtypes.is_empty());
+        for subtype in ["Heartwood", "Vibranium"] {
+            for (remove, remaining, expected) in [
+                (Creature, Artifact, vec![subtype]),
+                (Artifact, Creature, vec!["Bear"]),
+            ] {
+                let mut actual = card_type(&[Artifact, Creature], &[subtype, "Bear"]);
+                actual.supertypes.push(Supertype::Legendary);
+                remove_core_type(&mut actual, remove);
+                assert_eq!(actual.core_types, vec![remaining]);
+                assert_eq!(actual.subtypes, expected);
+                assert_eq!(actual.supertypes, vec![Supertype::Legendary]);
+            }
+        }
+        assert_eq!(
+            removed(&[Land, Creature], &["Forest", "Dryad"], Creature),
+            card_type(&[Land], &["Forest"])
+        );
+        assert_eq!(
+            removed(&[Land, Creature], &["Forest", "Dryad"], Land),
+            card_type(&[Creature], &["Dryad"])
+        );
+        // Kindred / Tribal keep the creature set (CR 308.2, CR 308.3).
+        assert_eq!(
+            removed(&[Kindred, Creature], &["Eldrazi"], Creature),
+            card_type(&[Kindred], &["Eldrazi"])
+        );
+        assert_eq!(
+            removed(&[Tribal, Creature], &["Eldrazi"], Creature),
+            card_type(&[Tribal], &["Eldrazi"])
+        );
+        assert_eq!(
+            removed(&[Kindred, Creature], &["Eldrazi"], Kindred),
+            card_type(&[Creature], &["Eldrazi"])
+        );
+        // Already lacks the type (the bestow shape): the set is still pruned.
+        assert_eq!(
+            removed(&[Enchantment], &["Insect", "Aura"], Creature),
+            card_type(&[Enchantment], &["Aura"])
+        );
+        // A type with no subtype set changes nothing.
+        assert_eq!(
+            removed(&[Dungeon], &["Insect"], Dungeon),
+            card_type(&[], &["Insect"])
+        );
+        // The remaining sets.
+        assert_eq!(
+            removed(&[Enchantment, Creature], &["Saga", "Insect"], Enchantment),
+            card_type(&[Creature], &["Insect"])
+        );
+        assert_eq!(
+            removed(&[Planeswalker, Creature], &["Jace", "Human"], Planeswalker),
+            card_type(&[Creature], &["Human"])
+        );
+        assert_eq!(removed(&[Battle], &["Siege"], Battle), card_type(&[], &[]));
+        assert_eq!(
+            removed(&[Instant, Sorcery], &["Adventure"], Instant),
+            card_type(&[Sorcery], &["Adventure"])
+        );
+        assert_eq!(
+            removed(&[Artifact, Creature], &["Equipment", "Cat"], Artifact),
+            card_type(&[Creature], &["Cat"])
+        );
+    }
+
+    /// CR 205.1a/205.3g: canonical artifact types survive exactly their owner.
+    /// Synthetic primitive inputs exercise the ordinary production layer pass.
+    #[test]
+    fn artifact_subtype_correlation_survives_layered_removal_and_replacement() {
+        for subtype in ["Heartwood", "Vibranium"] {
+            for (modification, remaining, expected) in [
+                (
+                    ContinuousModification::RemoveType {
+                        core_type: CoreType::Creature,
+                    },
+                    CoreType::Artifact,
+                    subtype,
+                ),
+                (
+                    ContinuousModification::RemoveType {
+                        core_type: CoreType::Artifact,
+                    },
+                    CoreType::Creature,
+                    "Bear",
+                ),
+                (
+                    ContinuousModification::SetCardTypes {
+                        core_types: vec![CoreType::Artifact],
+                    },
+                    CoreType::Artifact,
+                    subtype,
+                ),
+                (
+                    ContinuousModification::SetCardTypes {
+                        core_types: vec![CoreType::Creature],
+                    },
+                    CoreType::Creature,
+                    "Bear",
+                ),
+            ] {
+                let mut state = setup();
+                state.all_creature_types = vec!["Bear".into(), "Elf".into()];
+                let target = make_creature(&mut state, "Artifact Creature", 2, 2, PlayerId(0));
+                let obj = state.objects.get_mut(&target).unwrap();
+                obj.card_types.core_types = vec![CoreType::Artifact, CoreType::Creature];
+                obj.card_types.subtypes = vec![subtype.into(), "Bear".into()];
+                obj.card_types.supertypes = vec![Supertype::Legendary];
+                obj.base_card_types = obj.card_types.clone();
+                let source = make_creature(&mut state, "Type Setter", 1, 1, PlayerId(0));
+                state
+                    .objects
+                    .get_mut(&source)
+                    .unwrap()
+                    .static_definitions
+                    .push(
+                        StaticDefinition::continuous()
+                            .affected(TargetFilter::SpecificObject { id: target })
+                            .modifications(vec![modification]),
+                    );
+                evaluate_layers(&mut state);
+                let actual = &state.objects[&target].card_types;
+                assert_eq!(actual.core_types, vec![remaining]);
+                assert_eq!(actual.subtypes, vec![expected.to_string()]);
+                assert_eq!(actual.supertypes, vec![Supertype::Legendary]);
+            }
+        }
+    }
+
+    /// CR 205.3d/m + CR 702.73a: both final append sites require a live owner.
+    #[test]
+    fn changeling_postfix_respects_correlated_type_in_full_and_incremental_paths() {
+        for incremental in [false, true] {
+            for registry in [vec!["Bear".to_string(), "Elf".to_string()], vec![]] {
+                let mut state = setup();
+                state.all_creature_types = registry.clone();
+                let mut cases = Vec::new();
+                for (core, changeling, base_subtype, eligible) in [
+                    (CoreType::Creature, true, "Shapeshifter", true),
+                    (CoreType::Kindred, true, "Shapeshifter", true),
+                    (CoreType::Tribal, true, "Shapeshifter", true),
+                    (CoreType::Enchantment, true, "Aura", false),
+                    (CoreType::Artifact, true, "Equipment", false),
+                    (CoreType::Creature, false, "Human", false),
+                ] {
+                    let id = make_creature(&mut state, "Postfix recipient", 2, 2, PlayerId(0));
+                    let obj = state.objects.get_mut(&id).unwrap();
+                    obj.card_types.core_types = vec![core];
+                    obj.card_types.subtypes = vec![base_subtype.into()];
+                    obj.base_card_types = obj.card_types.clone();
+                    obj.keywords = if changeling {
+                        vec![Keyword::Changeling]
+                    } else {
+                        vec![]
+                    };
+                    obj.base_keywords = obj.keywords.clone();
+                    cases.push((id, core, changeling, base_subtype, eligible));
+                }
+                if incremental {
+                    let entered = cases.iter().map(|(id, ..)| *id).collect();
+                    let prepared = prepare_incremental_flush(
+                        &mut state,
+                        &entered,
+                        StaticGateTruth::AssumeChanged,
+                    )
+                    .expect("reach: the actual incremental preparation accepts these entrants");
+                    apply_layers_incremental(
+                        &mut state,
+                        prepared,
+                        StateDurationRetirementOwner::LayerSettlement,
+                    );
+                } else {
+                    evaluate_layers(&mut state);
+                }
+                for (id, core, changeling, base_subtype, eligible) in cases {
+                    let obj = &state.objects[&id];
+                    assert_eq!(obj.card_types.core_types, vec![core]);
+                    assert_eq!(obj.has_keyword(&Keyword::Changeling), changeling);
+                    let mut expected = vec![base_subtype.to_string()];
+                    if eligible {
+                        expected.extend(registry.clone());
+                    }
+                    assert_eq!(
+                        obj.card_types.subtypes, expected,
+                        "incremental={incremental}, core={core:?}"
+                    );
+                }
+            }
+        }
     }
 
     fn make_creature(
@@ -15462,7 +16826,9 @@ mod tests {
                     TypeFilter::Subtype("Equipment".into()),
                 ])],
                 controller: None,
-                properties: vec![FilterProp::AttachedToRecipient],
+                properties: vec![FilterProp::AttachedTo {
+                    to: AttachmentReferent::Recipient,
+                }],
             });
             let qty = QuantityExpr::Multiply {
                 factor: 2,
@@ -15817,7 +17183,9 @@ mod tests {
                                 TypeFilter::Subtype("Equipment".into()),
                             ])],
                             controller: None,
-                            properties: vec![FilterProp::AttachedToRecipient],
+                            properties: vec![FilterProp::AttachedTo {
+                                to: AttachmentReferent::Recipient,
+                            }],
                         }),
                     },
                 }),
@@ -22086,6 +23454,7 @@ mod tests {
                 single_use: false,
                 cast_cost_modifier: None,
                 alt_ability_cost: None,
+                without_paying_mana_cost: false,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
@@ -22113,7 +23482,7 @@ mod tests {
             source_id,
             graveyard_replacement: None,
             enters_with_counter: None,
-            enters_with_modifications: Vec::new(),
+            enters_with_modifications: Default::default(),
             mana_spend_permission: None,
             cast_cost_modifier: None,
         }
@@ -22444,6 +23813,7 @@ mod tests {
             single_use: false,
             cast_cost_modifier: None,
             alt_ability_cost: None,
+            without_paying_mana_cost: false,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         };
 
@@ -22516,6 +23886,7 @@ mod tests {
             single_use: false,
             cast_cost_modifier: None,
             alt_ability_cost: None,
+            without_paying_mana_cost: false,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
         perms.push(CastingPermission::PlayFromExile {
@@ -22533,6 +23904,7 @@ mod tests {
             single_use: false,
             cast_cost_modifier: None,
             alt_ability_cost: None,
+            without_paying_mana_cost: false,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
         perms.push(CastingPermission::AdventureCreature);
@@ -22590,6 +23962,7 @@ mod tests {
                     single_use: false,
                     cast_cost_modifier: None,
                     alt_ability_cost: None,
+                    without_paying_mana_cost: false,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 });
         };
@@ -22654,6 +24027,7 @@ mod tests {
                 single_use: false,
                 cast_cost_modifier: None,
                 alt_ability_cost: None,
+                without_paying_mana_cost: false,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
@@ -22799,6 +24173,7 @@ mod tests {
                 single_use: false,
                 cast_cost_modifier: None,
                 alt_ability_cost: None,
+                without_paying_mana_cost: false,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
@@ -22951,6 +24326,7 @@ mod tests {
                 single_use: false,
                 cast_cost_modifier: None,
                 alt_ability_cost: None,
+                without_paying_mana_cost: false,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
         state
@@ -22975,6 +24351,7 @@ mod tests {
                 single_use: false,
                 cast_cost_modifier: None,
                 alt_ability_cost: None,
+                without_paying_mana_cost: false,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
@@ -23034,6 +24411,7 @@ mod tests {
                         single_use: false,
                         cast_cost_modifier: None,
                         alt_ability_cost: None,
+                        without_paying_mana_cost: false,
                         land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     });
             }
@@ -23093,6 +24471,7 @@ mod tests {
                 single_use: false,
                 cast_cost_modifier: None,
                 alt_ability_cost: None,
+                without_paying_mana_cost: false,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
@@ -25946,6 +27325,7 @@ mod tests {
             replacement_definitions: Default::default(),
             static_definitions: Default::default(),
             room_halves: None,
+            prepare_face: None,
             name_origin: Default::default(),
         };
         let _ = state
@@ -26112,77 +27492,345 @@ mod tests {
         );
     }
 
-    /// Structural guard for the layer-pass collector: a granted static's
-    /// candidates cover every battlefield object whenever the host filter reads
-    /// a layer-writable characteristic, and only the post-layer-1 matches when
-    /// it reads none. Existence is decided later, at application.
-    #[test]
-    fn layer_pass_collector_adds_late_granted_static_candidates_by_host_filter_reads() {
-        let inner = StaticDefinition::continuous()
-            .affected(TargetFilter::SelfRef)
+    /// Host and Recipient are 1/1 creatures; the third object is a noncreature
+    /// artifact.
+    fn late_grant_board() -> (GameState, ObjectId, ObjectId, ObjectId) {
+        let mut state = setup();
+        let host = make_creature(&mut state, "Host", 1, 1, PlayerId(0));
+        let recipient = make_creature(&mut state, "Recipient", 1, 1, PlayerId(0));
+        let artifact = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Noncreature Artifact".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&artifact).unwrap();
+        obj.card_types.core_types.push(CoreType::Artifact);
+        obj.base_card_types = obj.card_types.clone();
+        (state, host, recipient, artifact)
+    }
+
+    fn push_static_def(state: &mut GameState, id: ObjectId, def: StaticDefinition) {
+        state
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .static_definitions
+            .push(def);
+    }
+
+    fn grant_of(affected: TargetFilter, inner: &StaticDefinition) -> StaticDefinition {
+        StaticDefinition::continuous()
+            .affected(affected)
+            .modifications(vec![ContinuousModification::GrantStaticAbility {
+                definition: Box::new(inner.clone()),
+            }])
+    }
+
+    fn pump_static(affected: TargetFilter) -> StaticDefinition {
+        StaticDefinition::continuous()
+            .affected(affected)
             .modifications(vec![
                 ContinuousModification::AddPower { value: 1 },
                 ContinuousModification::AddToughness { value: 1 },
-            ]);
-        let creature_host = |_: ObjectId| TargetFilter::Typed(TypedFilter::creature());
-        let specific_host = |recipient: ObjectId| TargetFilter::SpecificObject { id: recipient };
-        let power_host = |_: ObjectId| {
-            TargetFilter::Typed(
-                TypedFilter::default().properties(vec![FilterProp::PtComparison {
-                    stat: PtStat::Power,
-                    scope: PtValueScope::Current,
-                    comparator: Comparator::GE,
-                    value: QuantityExpr::Fixed { value: 3 },
-                }]),
-            )
-        };
-        let legs: [(&dyn Fn(ObjectId) -> TargetFilter, bool); 3] = [
-            (&creature_host, true),
-            (&specific_host, false),
-            (&power_host, true),
-        ];
-        for (host_filter, every_object) in legs {
-            let mut state = setup();
-            let host = make_creature(&mut state, "Host", 1, 1, PlayerId(0));
-            let recipient = make_creature(&mut state, "Recipient", 1, 1, PlayerId(0));
-            let artifact = create_object(
-                &mut state,
-                CardId(0),
-                PlayerId(0),
-                "Noncreature Artifact".to_string(),
-                Zone::Battlefield,
-            );
-            {
-                let obj = state.objects.get_mut(&artifact).unwrap();
-                obj.card_types.core_types.push(CoreType::Artifact);
-                obj.base_card_types = obj.card_types.clone();
-            }
-            state
-                .objects
-                .get_mut(&host)
-                .unwrap()
-                .static_definitions
-                .push(
-                    StaticDefinition::continuous()
-                        .affected(host_filter(recipient))
-                        .modifications(vec![ContinuousModification::GrantStaticAbility {
-                            definition: Box::new(inner.clone()),
-                        }]),
-                );
+            ])
+    }
 
-            let mut children: HashMap<ObjectId, usize> = HashMap::new();
-            for effect in collect_layer_pass_active_continuous_effects(&state) {
-                if granted_static_child_origin(&effect).is_some() {
-                    *children.entry(effect.source_id).or_default() += 1;
-                }
+    fn subtype_writer(subtype: &str) -> StaticDefinition {
+        StaticDefinition::continuous()
+            .affected(TargetFilter::SelfRef)
+            .modifications(vec![ContinuousModification::AddSubtype {
+                subtype: subtype.to_string(),
+            }])
+    }
+
+    /// Granted-static children per carrier in one layer-pass collection.
+    fn granted_children(
+        state: &GameState,
+        restrict_to: Option<&BTreeSet<ObjectId>>,
+    ) -> HashMap<ObjectId, usize> {
+        let mut children: HashMap<ObjectId, usize> = HashMap::new();
+        for effect in collect_layer_pass_active_continuous_effects(state, restrict_to) {
+            if granted_static_child_origin(&effect).is_some() {
+                *children.entry(effect.source_id).or_default() += 1;
             }
-            let expected: HashMap<ObjectId, usize> = if every_object {
+        }
+        children
+    }
+
+    /// Reads `POWER_TOUGHNESS` only; no board object matches it.
+    fn power_at_least_three() -> TargetFilter {
+        TargetFilter::Typed(
+            TypedFilter::default().properties(vec![FilterProp::PtComparison {
+                stat: PtStat::Power,
+                scope: PtValueScope::Current,
+                comparator: Comparator::GE,
+                value: QuantityExpr::Fixed { value: 3 },
+            }]),
+        )
+    }
+
+    fn red_prototype_form() -> crate::game::game_object::PrototypeFormState {
+        crate::game::game_object::PrototypeFormState {
+            mana_cost: ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 1,
+            },
+            power: 1,
+            toughness: 1,
+            colors: vec![ManaColor::Red],
+        }
+    }
+
+    /// Structural guard for the layer-pass collector: a granted static's
+    /// candidates cover every battlefield object whenever something before the
+    /// group's first layer can write a kind the host filter reads, and only the
+    /// post-layer-1 matches otherwise. Existence is decided later, at
+    /// application. Each leg names the window clause it pins
+    /// (`late_grant_writable_kinds`).
+    #[test]
+    fn layer_pass_collector_adds_late_granted_static_candidates_by_host_filter_reads() {
+        let inner = pump_static(TargetFilter::SelfRef);
+        let creature_host = TargetFilter::Typed(TypedFilter::creature());
+
+        // 1. Nothing can write CARD_TYPES before layer 6: only the matches.
+        let (mut state, host, recipient, _) = late_grant_board();
+        push_static_def(&mut state, host, grant_of(creature_host.clone(), &inner));
+        assert_eq!(
+            granted_children(&state, None),
+            [(host, 2), (recipient, 2)].into(),
+            "no writer"
+        );
+
+        // 2. Clause 1: a foreign layer-4 writer makes every object a candidate.
+        let (mut state, host, recipient, artifact) = late_grant_board();
+        push_static_def(&mut state, host, grant_of(creature_host.clone(), &inner));
+        push_static_def(&mut state, artifact, subtype_writer("Gold"));
+        assert_eq!(
+            granted_children(&state, None),
+            [(host, 2), (recipient, 2), (artifact, 2)].into(),
+            "foreign writer"
+        );
+
+        // 3. An id-naming host reads no kind: only the named object.
+        let (mut state, host, recipient, _) = late_grant_board();
+        push_static_def(
+            &mut state,
+            host,
+            grant_of(TargetFilter::SpecificObject { id: recipient }, &inner),
+        );
+        assert_eq!(
+            granted_children(&state, None),
+            [(recipient, 2)].into(),
+            "id-naming host"
+        );
+
+        // 4. A power host with nothing that writes power before layer 6.
+        let (mut state, host, _, _) = late_grant_board();
+        push_static_def(&mut state, host, grant_of(power_at_least_three(), &inner));
+        assert_eq!(
+            granted_children(&state, None),
+            HashMap::new(),
+            "power host, no writer"
+        );
+
+        // 5. Clause 3: the CR 718.3b prototype hook writes power at layer 4.
+        let (mut state, host, recipient, artifact) = late_grant_board();
+        push_static_def(&mut state, host, grant_of(power_at_least_three(), &inner));
+        state.objects.get_mut(&artifact).unwrap().prototype_form = Some(red_prototype_form());
+        assert_eq!(
+            granted_children(&state, None),
+            [(host, 2), (recipient, 2), (artifact, 2)].into(),
+            "prototype hook"
+        );
+
+        // 6. CR 613.6: the group's own layer-4 part cannot change its own set
+        // (the Dan Lewis shape), so only the matching artifact gets children.
+        let (mut state, host, _, artifact) = late_grant_board();
+        push_static_def(
+            &mut state,
+            host,
+            StaticDefinition::continuous()
+                .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)))
+                .modifications(vec![
+                    ContinuousModification::AddSubtype {
+                        subtype: "Equipment".to_string(),
+                    },
+                    ContinuousModification::GrantStaticAbility {
+                        definition: Box::new(inner.clone()),
+                    },
+                ]),
+        );
+        assert_eq!(
+            granted_children(&state, None),
+            [(artifact, 2)].into(),
+            "own-group writer"
+        );
+
+        // 7. Clause 2: another grant with no current match whose inner part
+        // writes in layer 4 still counts.
+        let (mut state, host, recipient, artifact) = late_grant_board();
+        push_static_def(&mut state, host, grant_of(creature_host.clone(), &inner));
+        push_static_def(
+            &mut state,
+            host,
+            grant_of(
+                TargetFilter::Typed(TypedFilter::land()),
+                &subtype_writer("Gold"),
+            ),
+        );
+        assert_eq!(
+            granted_children(&state, None),
+            [(host, 3), (recipient, 3), (artifact, 3)].into(),
+            "inner writer of an unmatched grant"
+        );
+
+        // 8. Clause 3: the CR 702.95e pairing hook on a board holding a pair.
+        let (mut state, host, recipient, artifact) = late_grant_board();
+        push_static_def(&mut state, host, grant_of(creature_host.clone(), &inner));
+        state.objects.get_mut(&artifact).unwrap().paired_with = Some(recipient);
+        assert_eq!(
+            granted_children(&state, None),
+            [(host, 2), (recipient, 2), (artifact, 2)].into(),
+            "paired object"
+        );
+
+        // 9. A host that names one object but also reads CARD_TYPES: no
+        // candidates without a writer, every object with a foreign writer.
+        for with_writer in [false, true] {
+            let (mut state, host, recipient, artifact) = late_grant_board();
+            push_static_def(
+                &mut state,
+                host,
+                grant_of(
+                    TargetFilter::And {
+                        filters: vec![
+                            TargetFilter::SpecificObject { id: recipient },
+                            TargetFilter::Typed(TypedFilter::land()),
+                        ],
+                    },
+                    &inner,
+                ),
+            );
+            let expected: HashMap<ObjectId, usize> = if with_writer {
+                push_static_def(&mut state, artifact, subtype_writer("Gold"));
                 [(host, 2), (recipient, 2), (artifact, 2)].into()
             } else {
-                [(recipient, 2)].into()
+                HashMap::new()
             };
-            assert_eq!(children, expected);
+            assert_eq!(
+                granted_children(&state, None),
+                expected,
+                "id-and-land host, writer={with_writer}"
+            );
         }
+    }
+
+    /// CR 613.6 + CR 613.2c: a group with a layer-1 part may fix its set before
+    /// collection, so its window is never narrowed.
+    #[test]
+    fn late_grant_window_does_not_narrow_a_copy_layer_group() {
+        let (mut state, host, _, _) = late_grant_board();
+        push_static_def(
+            &mut state,
+            host,
+            grant_of(
+                TargetFilter::Typed(TypedFilter::creature()),
+                &pump_static(TargetFilter::SelfRef),
+            ),
+        );
+        let mut effects = collect_layer_pass_active_continuous_effects(&state, None);
+        let parent = effects
+            .iter()
+            .find(|e| granted_static_definition(e).is_some())
+            .unwrap()
+            .clone();
+        assert_eq!(
+            late_grant_writable_kinds(
+                &state,
+                &LateGrantWindow::collect(&state, &effects, None),
+                &parent
+            ),
+            CharacteristicKinds::EMPTY
+        );
+        // Same source and definition index, hence the same CR 613.6 group.
+        let mut copy_part = parent.clone();
+        copy_part.layer = Layer::Copy;
+        effects.push(copy_part);
+        assert_eq!(
+            late_grant_writable_kinds(
+                &state,
+                &LateGrantWindow::collect(&state, &effects, None),
+                &parent
+            ),
+            CharacteristicKinds::ALL
+        );
+    }
+
+    /// Restricted collector: a late child carried outside the slice is kept
+    /// only when it can reach a recipient; a recipient's own late children
+    /// follow the window independently (here, the CR 718.3b prototype hook).
+    #[test]
+    fn restricted_collector_keeps_only_reaching_outside_late_children() {
+        let creature_you_control =
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+        let equipped_creature =
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::EquippedBy]));
+        for (inner_filter, outside_reaches) in [
+            (TargetFilter::SelfRef, false),
+            (equipped_creature, false),
+            (creature_you_control, true),
+        ] {
+            let (mut state, host, recipient, artifact) = late_grant_board();
+            push_static_def(
+                &mut state,
+                host,
+                grant_of(power_at_least_three(), &pump_static(inner_filter.clone())),
+            );
+            let recipients: BTreeSet<ObjectId> = [recipient].into();
+            let expected: HashMap<ObjectId, usize> = if outside_reaches {
+                [(host, 2), (artifact, 2)].into()
+            } else {
+                HashMap::new()
+            };
+            assert_eq!(
+                granted_children(&state, Some(&recipients)),
+                expected,
+                "{inner_filter:?}"
+            );
+            state.objects.get_mut(&recipient).unwrap().prototype_form = Some(red_prototype_form());
+            let mut with_recipient = expected;
+            with_recipient.insert(recipient, 2);
+            assert_eq!(
+                granted_children(&state, Some(&recipients)),
+                with_recipient,
+                "prototyped recipient, {inner_filter:?}"
+            );
+        }
+    }
+
+    /// CR 109.5 + CR 611.2c: a transient grant's normal/late partition uses the
+    /// effect's controller, the "you" its affected set is matched under, not
+    /// its source's controller.
+    #[test]
+    fn transient_grant_partitions_children_under_effect_controller() {
+        let mut state = setup();
+        let grant_source = make_creature(&mut state, "Grant Source", 1, 1, PlayerId(1));
+        let own_bear = make_creature(&mut state, "Own Bear", 2, 2, PlayerId(0));
+        state
+            .add_transient_continuous_effect(
+                grant_source,
+                PlayerId(0),
+                Duration::UntilEndOfTurn,
+                TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+                vec![ContinuousModification::GrantStaticAbility {
+                    definition: Box::new(pump_static(TargetFilter::SelfRef)),
+                }],
+                None,
+            )
+            .unwrap();
+        assert_eq!(granted_children(&state, None), [(own_bear, 2)].into());
     }
 
     /// CR 613.7a (1st sentence): a granted static ability's continuous effect uses
@@ -28816,6 +30464,7 @@ mod tests {
                     replacement_definitions: Arc::new(Vec::new()),
                     static_definitions: Arc::new(Vec::new()),
                     room_halves: None,
+                    prepare_face: None,
                     name_origin: Default::default(),
                 }),
                 display_source: Default::default(),
@@ -29163,5 +30812,1440 @@ mod state_duration_retirement_recording_tests {
                 )
             );
         }
+    }
+}
+
+/// CR 506.4 + CR 613.1b: a settled Layer 2 controller change removes the
+/// permanent from combat.
+#[cfg(test)]
+mod controller_change_combat_removal_tests {
+    use super::*;
+    use crate::game::combat::{
+        apply_resolved_combat_membership, AttackerInfo, CombatParticipation, CombatState,
+    };
+    use crate::game::effects::attach::{apply_resolved_attachment, attach_to};
+    use crate::game::scenario::{GameRunner, GameScenario, P0, P1};
+    use crate::types::identifiers::CardId;
+    use crate::types::resolved_commands::{
+        ResolvedAttachmentCommand, ResolvedCombatMembershipCommand, ResolvedCombatMembershipEdit,
+        ResolvedRulesCommand,
+    };
+
+    /// Controller-agnostic Layer 6 grant keyed on `FilterProp::Attacking`.
+    const ATTACKING_DEATHTOUCH: &str = "Attacking creatures have deathtouch.";
+    /// Controller-agnostic Layer 6 grant keyed on `FilterProp::Blocking`:
+    /// "blocking creatures have deathtouch". Built typed because the static
+    /// parser reads a bare "Blocking creatures have …" subject as a creature
+    /// subtype, and no printed card grants a keyword this way.
+    fn blocking_deathtouch() -> StaticDefinition {
+        StaticDefinition::continuous()
+            .affected(TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::Blocking]),
+            ))
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Deathtouch,
+            }])
+    }
+    const CONTROL_MAGIC: &str = "Enchant creature\nYou control enchanted creature.";
+
+    struct Board {
+        runner: GameRunner,
+        /// P0's creature attacking P1, blocked by `blocker`.
+        attacker: ObjectId,
+        /// P1's creature blocking `attacker`.
+        blocker: ObjectId,
+        /// P1's creature attacking P0, unblocked.
+        rival: ObjectId,
+        /// Owned by P1, controlled by P0 through `base_controller`, attacking P1.
+        borrowed: ObjectId,
+        /// P1's unattached Control Magic.
+        control_magic: ObjectId,
+    }
+
+    fn board() -> Board {
+        board_with(None)
+    }
+
+    /// [`board`], plus an optional extra P0 enchantment carrying a Layer 6
+    /// grant to blocking creatures ([`blocking_deathtouch`]).
+    fn board_with(blocking_grant: Option<StaticDefinition>) -> Board {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_enchantment_from_oracle(P0, "Deathtouch Grant", ATTACKING_DEATHTOUCH);
+        let expects_blocking_grant = blocking_grant.is_some();
+        if let Some(grant) = blocking_grant {
+            scenario
+                .add_creature(P0, "Blocking Grant", 0, 0)
+                .as_enchantment()
+                .with_static_definition(grant);
+        }
+        let control_magic = scenario
+            .add_enchantment_from_oracle(P1, "Control Magic", CONTROL_MAGIC)
+            .with_subtypes(vec!["Aura"])
+            .id();
+        let attacker = scenario.add_vanilla(P0, 2, 2);
+        let blocker = scenario.add_vanilla(P1, 2, 2);
+        let rival = scenario.add_vanilla(P1, 2, 2);
+        let borrowed = scenario
+            .add_creature(P1, "Borrowed", 2, 2)
+            .controlled_by(P0)
+            .id();
+        let mut runner = scenario.build();
+
+        let state = runner.state_mut();
+        let mut combat = CombatState {
+            attackers: vec![
+                AttackerInfo {
+                    object_id: attacker,
+                    defending_player: P1,
+                    attack_target: AttackTarget::Player(P1),
+                    blocked: true,
+                    band_id: None,
+                },
+                AttackerInfo::attacking_player(rival, P0),
+                AttackerInfo::attacking_player(borrowed, P1),
+            ],
+            ..Default::default()
+        };
+        combat.blocker_assignments.insert(attacker, vec![blocker]);
+        combat.blocker_to_attacker.insert(blocker, vec![attacker]);
+        state.combat = Some(combat);
+        mark_layers_full(state);
+        flush_layers(state);
+
+        // Reach guards shared by every row: the grant machinery is live and
+        // reads combat membership.
+        for id in [attacker, rival, borrowed] {
+            assert!(
+                state.objects[&id].has_keyword(&Keyword::Deathtouch),
+                "reach guard: an attacking creature has the Layer 6 grant"
+            );
+        }
+        assert_eq!(
+            state.objects[&blocker].has_keyword(&Keyword::Deathtouch),
+            expects_blocking_grant,
+            "reach guard: the attacking grant skips the blocker; only a blocking grant reaches it"
+        );
+        assert_eq!(state.objects[&borrowed].controller, P0);
+        assert_eq!(state.objects[&borrowed].owner, P1);
+
+        Board {
+            runner,
+            attacker,
+            blocker,
+            rival,
+            borrowed,
+            control_magic,
+        }
+    }
+
+    fn give_control(state: &mut GameState, target: ObjectId, to: PlayerId) {
+        state
+            .add_transient_continuous_effect(
+                target,
+                to,
+                Duration::Permanent,
+                TargetFilter::SpecificObject { id: target },
+                vec![ContinuousModification::ChangeController],
+                None,
+            )
+            .expect("a permanent control change begins");
+    }
+
+    fn commands_since(state: &GameState, start: usize) -> Vec<ResolvedRulesCommand> {
+        state
+            .resolved_rules_journal
+            .entries()
+            .iter()
+            .skip(start)
+            .filter_map(|entry| entry.command.clone())
+            .collect()
+    }
+
+    fn removals_since(state: &GameState, start: usize) -> Vec<ResolvedCombatMembershipCommand> {
+        commands_since(state, start)
+            .into_iter()
+            .filter_map(|command| match command {
+                ResolvedRulesCommand::CombatMembership(command) => Some(command),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn not_in_combat(state: &GameState, id: ObjectId) -> bool {
+        CombatParticipation::capture(state, id) == CombatParticipation::default()
+    }
+
+    /// CR 506.4 + CR 613.1b + CR 613.1f: an attacker whose controller changes
+    /// leaves combat in the same flush, the removal is journaled once with its
+    /// exact participation receipt, and its Layer 6 `Attacking` grant is
+    /// revoked. A second flush changes nothing.
+    #[test]
+    fn attacker_control_change_removes_it_and_revokes_attacking_grants() {
+        let Board {
+            mut runner,
+            attacker,
+            blocker,
+            ..
+        } = board();
+        let state = runner.state_mut();
+        let expected = CombatParticipation::capture(state, attacker);
+        assert!(
+            expected.attacking.is_some() && !expected.blocked_by.is_empty(),
+            "reach guard: the attacker is attacking and blocked"
+        );
+        let start = state.resolved_rules_journal.entries().len();
+
+        give_control(state, attacker, P1);
+        flush_layers(state);
+
+        assert_eq!(state.objects[&attacker].controller, P1);
+        assert!(
+            not_in_combat(state, attacker),
+            "CR 506.4: the creature whose controller changed is removed from combat"
+        );
+        assert!(
+            !state.objects[&attacker].has_keyword(&Keyword::Deathtouch),
+            "CR 613.1f: the removed creature is no longer attacking, so the grant is revoked"
+        );
+        assert_eq!(
+            state
+                .combat
+                .as_ref()
+                .unwrap()
+                .blocker_to_attacker
+                .get(&blocker),
+            Some(&vec![]),
+            "CR 509.1g: the blocker remains a blocking creature, now blocking no attacker"
+        );
+        assert_eq!(
+            CombatParticipation::capture(state, blocker).blocking,
+            Some(vec![]),
+            "the blocker's receipt reads 'blocking, no attacker assigned'"
+        );
+        assert!(
+            crate::game::restrictions::is_source_blocking(state, blocker),
+            "the blocking-role reader still sees a blocking creature"
+        );
+        assert_eq!(state.layers_dirty, LayersDirty::Clean);
+        let removals = removals_since(state, start);
+        assert_eq!(removals.len(), 1, "exactly one journaled removal");
+        assert_eq!(removals[0].object.object_id, attacker);
+        assert!(
+            removals
+                .iter()
+                .all(|command| command.object.object_id != blocker),
+            "the blocker is not removed, so nothing is journaled for it"
+        );
+        assert_eq!(
+            removals[0].edit,
+            ResolvedCombatMembershipEdit::Remove {
+                expected_participation: expected,
+            }
+        );
+
+        let settled = state.resolved_rules_journal.entries().len();
+        mark_layers_full(state);
+        flush_layers(state);
+        assert_eq!(
+            state.resolved_rules_journal.entries().len(),
+            settled,
+            "a later pass sees no controller change and journals nothing"
+        );
+    }
+
+    /// CR 506.4 + CR 611.2b: control returning mid-combat is a controller
+    /// change too. A creature attacking under a borrowed controller leaves
+    /// combat when the "for as long as" control effect ends.
+    #[test]
+    fn control_returning_mid_combat_removes_the_creature() {
+        let Board {
+            mut runner,
+            blocker,
+            ..
+        } = board();
+        let state = runner.state_mut();
+        // P1's tapped blocker anchors a "for as long as it stays tapped" loan of
+        // P0's fresh creature to P1.
+        let loaned = crate::game::zones::create_object(
+            state,
+            CardId(9100),
+            P0,
+            "Loaned".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&loaned).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.base_power = Some(2);
+            obj.base_toughness = Some(2);
+        }
+        state.objects.get_mut(&blocker).unwrap().tapped = true;
+        let subject = ObjectIncarnationRef::from_object(&state.objects[&blocker]);
+        let affected = ObjectIncarnationRef::from_object(&state.objects[&loaned]);
+        state
+            .add_transient_continuous_effect_with_bindings(
+                blocker,
+                P1,
+                Duration::ForAsLongAs {
+                    condition: StaticCondition::IsTapped {
+                        scope: crate::types::ability::ObjectScope::Recipient,
+                    },
+                },
+                TargetFilter::SpecificObject { id: loaned },
+                vec![ContinuousModification::ChangeController],
+                None,
+                TransientContinuousEffectBindings {
+                    affected_recipient: Some(affected),
+                    duration_subject: Some(subject),
+                    granting_object: None,
+                },
+            )
+            .expect("the loan begins while the anchor is tapped");
+        flush_layers(state);
+        assert_eq!(state.objects[&loaned].controller, P1);
+
+        // The creature attacks under its borrowed controller.
+        state
+            .combat
+            .as_mut()
+            .unwrap()
+            .attackers
+            .push(AttackerInfo::attacking_player(loaned, P0));
+        mark_layers_full(state);
+        flush_layers(state);
+        assert!(
+            !not_in_combat(state, loaned),
+            "reach guard: no control change, so the borrowed attacker stays in combat"
+        );
+        assert!(
+            state.objects[&loaned].has_keyword(&Keyword::Deathtouch),
+            "reach guard: the borrowed attacker has the attacking grant"
+        );
+        let expected = CombatParticipation::capture(state, loaned);
+        let start = state.resolved_rules_journal.entries().len();
+
+        state.objects.get_mut(&blocker).unwrap().tapped = false;
+        mark_layers_full(state);
+        flush_layers(state);
+
+        assert_eq!(
+            state.objects[&loaned].controller, P0,
+            "reach guard: the loan ended and control returned to the owner"
+        );
+        assert!(
+            not_in_combat(state, loaned),
+            "CR 506.4: returning control removes the creature from combat"
+        );
+        assert!(!state.objects[&loaned].has_keyword(&Keyword::Deathtouch));
+        let removals = removals_since(state, start);
+        assert_eq!(removals.len(), 1);
+        assert_eq!(
+            removals[0].edit,
+            ResolvedCombatMembershipEdit::Remove {
+                expected_participation: expected,
+            }
+        );
+    }
+
+    /// CR 506.4: removal happens only on a CHANGE. Repeated full passes over a
+    /// board with attackers, a blocker, and a creature controlled by a
+    /// non-owner since before combat prune and journal nothing.
+    #[test]
+    fn unchanged_control_prunes_and_journals_nothing() {
+        let Board {
+            mut runner,
+            attacker,
+            blocker,
+            rival,
+            borrowed,
+            ..
+        } = board();
+        let state = runner.state_mut();
+        let ids = [attacker, blocker, rival, borrowed];
+        let before: Vec<_> = ids
+            .iter()
+            .map(|&id| CombatParticipation::capture(state, id))
+            .collect();
+        assert!(
+            before.iter().all(|participation| !participation.is_empty()),
+            "reach guard: every fixture creature holds a combat role"
+        );
+        let start = state.resolved_rules_journal.entries().len();
+
+        for _ in 0..2 {
+            mark_layers_full(state);
+            flush_layers(state);
+        }
+
+        let after: Vec<_> = ids
+            .iter()
+            .map(|&id| CombatParticipation::capture(state, id))
+            .collect();
+        assert_eq!(after, before, "no combat role changed");
+        assert_eq!(state.objects[&borrowed].controller, P0);
+        assert!(removals_since(state, start).is_empty());
+    }
+
+    /// CR 506.4 + CR 509.1h: a blocker whose controller changes stops blocking;
+    /// the attacker it blocked stays in combat and remains blocked.
+    #[test]
+    fn blocker_control_change_removes_it_and_attacker_stays_blocked() {
+        let Board {
+            mut runner,
+            attacker,
+            blocker,
+            ..
+        } = board();
+        let state = runner.state_mut();
+        let start = state.resolved_rules_journal.entries().len();
+
+        give_control(state, blocker, P0);
+        flush_layers(state);
+
+        assert_eq!(state.objects[&blocker].controller, P0);
+        assert!(
+            not_in_combat(state, blocker),
+            "CR 506.4: the blocker whose controller changed is removed from combat"
+        );
+        let combat = state.combat.as_ref().unwrap();
+        let info = combat
+            .attackers
+            .iter()
+            .find(|info| info.object_id == attacker)
+            .expect("the blocked attacker is still attacking");
+        assert!(info.blocked, "CR 509.1h: the attacker remains blocked");
+        assert!(combat.blocker_assignments[&attacker].is_empty());
+        assert!(state.objects[&attacker].has_keyword(&Keyword::Deathtouch));
+        let removals = removals_since(state, start);
+        assert_eq!(removals.len(), 1);
+        assert_eq!(removals[0].object.object_id, blocker);
+    }
+
+    /// CR 506.4 + CR 701.12b: an exchange of control of two attacking creatures
+    /// of different controllers, settled in one pass, removes both.
+    #[test]
+    fn exchanged_attackers_are_both_removed() {
+        let Board {
+            mut runner,
+            attacker,
+            rival,
+            ..
+        } = board();
+        let state = runner.state_mut();
+        let start = state.resolved_rules_journal.entries().len();
+
+        give_control(state, attacker, P1);
+        give_control(state, rival, P0);
+        flush_layers(state);
+
+        assert_eq!(state.objects[&attacker].controller, P1);
+        assert_eq!(state.objects[&rival].controller, P0);
+        assert!(not_in_combat(state, attacker));
+        assert!(not_in_combat(state, rival));
+        for id in [attacker, rival] {
+            assert!(!state.objects[&id].has_keyword(&Keyword::Deathtouch));
+        }
+        let mut removed: Vec<_> = removals_since(state, start)
+            .iter()
+            .map(|command| command.object.object_id)
+            .collect();
+        removed.sort();
+        let mut expected = vec![attacker, rival];
+        expected.sort();
+        assert_eq!(removed, expected);
+    }
+
+    /// CR 506.4: a settlement-owned control change journals its removal, and
+    /// replaying the recorded commands onto the predecessor reproduces it.
+    #[test]
+    fn settlement_owned_removal_replays_from_the_journal() {
+        let Board {
+            mut runner,
+            attacker,
+            ..
+        } = board();
+        let before = runner.state().clone();
+        let start = before.resolved_rules_journal.entries().len();
+        let state = runner.state_mut();
+
+        give_control(state, attacker, P1);
+        flush_layers(state);
+        assert!(not_in_combat(state, attacker));
+
+        let commands = commands_since(state, start);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ResolvedRulesCommand::CombatMembership(_)))
+                .count(),
+            1,
+            "the settlement journals exactly one removal"
+        );
+        let mut replay = before.clone();
+        assert!(
+            !not_in_combat(&replay, attacker),
+            "reach guard: the predecessor has the creature in combat"
+        );
+        for command in &commands {
+            match command {
+                ResolvedRulesCommand::ContinuousEffect(edit) => replay
+                    .apply_resolved_continuous_effect_edit(edit)
+                    .expect("the control change replays"),
+                ResolvedRulesCommand::CombatMembership(command) => {
+                    apply_resolved_combat_membership(&mut replay, command)
+                        .expect("the removal replays against its predecessor")
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            not_in_combat(&replay, attacker),
+            "replay reproduces the prune"
+        );
+    }
+
+    /// CR 506.4 + CR 613.1b: a Control Magic-class Aura attached to an attacking
+    /// creature changes its controller inside an attachment-owned pass. The
+    /// pass prunes structurally and the attachment command is the only record;
+    /// replaying it re-derives the prune without recording a removal.
+    #[test]
+    fn attachment_owned_removal_is_rederived_on_replay() {
+        let Board {
+            mut runner,
+            attacker,
+            control_magic,
+            ..
+        } = board();
+        let before = runner.state().clone();
+        let start = before.resolved_rules_journal.entries().len();
+        let state = runner.state_mut();
+
+        attach_to(state, control_magic, attacker);
+
+        assert_eq!(
+            state.objects[&attacker].controller, P1,
+            "reach guard: Control Magic took control"
+        );
+        assert!(
+            not_in_combat(state, attacker),
+            "CR 506.4: the enchanted attacker is removed from combat"
+        );
+        assert!(!state.objects[&attacker].has_keyword(&Keyword::Deathtouch));
+        let commands = commands_since(state, start);
+        let attachments: Vec<ResolvedAttachmentCommand> = commands
+            .iter()
+            .filter_map(|command| match command {
+                ResolvedRulesCommand::Attachment(command) => Some(command.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attachments.len(), 1, "the attachment edit is recorded");
+        assert!(
+            removals_since(state, start).is_empty(),
+            "the attachment-owned pass records no separate removal"
+        );
+
+        let mut replay = before.clone();
+        assert!(!not_in_combat(&replay, attacker), "reach guard");
+        apply_resolved_attachment(&mut replay, &attachments[0])
+            .expect("the attachment replays against its predecessor");
+        assert_eq!(replay.objects[&attacker].controller, P1);
+        assert!(
+            not_in_combat(&replay, attacker),
+            "replaying the attachment re-derives the prune"
+        );
+        assert!(
+            removals_since(&replay, start).is_empty(),
+            "replay records no removal either"
+        );
+    }
+
+    /// Replays every continuous-effect and combat-membership command journaled
+    /// since `start` onto `before`, then asserts the replayed combat equals the
+    /// live one — including `damage_assignments`, which `CombatState`'s
+    /// `PartialEq` does not compare.
+    fn assert_replay_matches(before: &GameState, live: &GameState, start: usize) {
+        let mut replay = before.clone();
+        for command in commands_since(live, start) {
+            match &command {
+                ResolvedRulesCommand::ContinuousEffect(edit) => replay
+                    .apply_resolved_continuous_effect_edit(edit)
+                    .expect("the control change replays"),
+                ResolvedRulesCommand::CombatMembership(command) => {
+                    apply_resolved_combat_membership(&mut replay, command)
+                        .expect("the removal replays against its predecessor")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(replay.combat, live.combat, "replay reproduces the prune");
+        assert_eq!(
+            replay.combat.as_ref().map(|c| &c.damage_assignments),
+            live.combat.as_ref().map(|c| &c.damage_assignments),
+        );
+    }
+
+    /// CR 509.1g + CR 613.1f: stealing the attacker leaves its blocker a
+    /// blocking creature, so a Layer 6 `FilterProp::Blocking` grant stays on
+    /// it through the nested re-derivation. Fails on revert of the kept-empty
+    /// key (the old prune dropped the blocker's membership and the nested pass
+    /// revoked the grant).
+    #[test]
+    fn attacker_control_change_leaves_blocker_blocking_for_blocking_grants() {
+        let Board {
+            mut runner,
+            attacker,
+            blocker,
+            ..
+        } = board_with(Some(blocking_deathtouch()));
+        let state = runner.state_mut();
+        let before = state.clone();
+        let start = state.resolved_rules_journal.entries().len();
+
+        give_control(state, attacker, P1);
+        flush_layers(state);
+
+        assert!(
+            not_in_combat(state, attacker),
+            "reach guard: the stolen attacker left combat"
+        );
+        assert!(
+            !state.objects[&attacker].has_keyword(&Keyword::Deathtouch),
+            "the stolen creature is neither attacking nor blocking: no grant"
+        );
+        assert_eq!(
+            state
+                .combat
+                .as_ref()
+                .unwrap()
+                .blocker_to_attacker
+                .get(&blocker),
+            Some(&vec![])
+        );
+        assert!(
+            state.objects[&blocker].has_keyword(&Keyword::Deathtouch),
+            "CR 509.1g: the blocker is still a blocking creature and keeps the Blocking grant"
+        );
+        assert_eq!(state.layers_dirty, LayersDirty::Clean);
+        assert_replay_matches(&before, state, start);
+    }
+
+    /// CR 506.4 + CR 613.1f: a blocking creature with no attacker assigned
+    /// whose own controller changes leaves combat; its removal is journaled
+    /// once with the receipt `blocking == Some([])`, and its Blocking grant is
+    /// revoked in that same flush. Fails on revert of the receipt (`Some([])`
+    /// read as no role skips the removal) or of the any-edge layer gate (no
+    /// nested pass leaves the grant).
+    #[test]
+    fn orphaned_blocker_control_change_removes_it_and_revokes_blocking_grants() {
+        let Board {
+            mut runner,
+            attacker,
+            blocker,
+            ..
+        } = board_with(Some(blocking_deathtouch()));
+        let state = runner.state_mut();
+        give_control(state, attacker, P1);
+        flush_layers(state);
+        assert_eq!(
+            state
+                .combat
+                .as_ref()
+                .unwrap()
+                .blocker_to_attacker
+                .get(&blocker),
+            Some(&vec![]),
+            "reach guard: the blocker is orphaned"
+        );
+        assert!(
+            state.objects[&blocker].has_keyword(&Keyword::Deathtouch),
+            "reach guard: the orphan has the Blocking grant"
+        );
+        let before = state.clone();
+        let start = state.resolved_rules_journal.entries().len();
+
+        give_control(state, blocker, P0);
+        flush_layers(state);
+
+        assert_eq!(state.objects[&blocker].controller, P0);
+        assert!(
+            not_in_combat(state, blocker),
+            "CR 506.4: the orphan whose controller changed is removed from combat"
+        );
+        assert!(
+            !state.objects[&blocker].has_keyword(&Keyword::Deathtouch),
+            "CR 613.1f: the Blocking grant is revoked in the same flush"
+        );
+        assert_eq!(state.layers_dirty, LayersDirty::Clean);
+        let removals = removals_since(state, start);
+        assert_eq!(removals.len(), 1, "exactly one journaled removal");
+        assert_eq!(removals[0].object.object_id, blocker);
+        let ResolvedCombatMembershipEdit::Remove {
+            expected_participation,
+        } = &removals[0].edit
+        else {
+            panic!("the orphan's removal is a Remove edit");
+        };
+        assert_eq!(expected_participation.blocking, Some(vec![]));
+        assert_replay_matches(&before, state, start);
+    }
+
+    /// CR 506.4 + CR 613.1f: a plain blocker whose controller changes stops
+    /// blocking, and its Blocking grant is revoked in the same flush. No
+    /// attacker is removed, so this isolates the any-edge layer gate: fails on
+    /// revert to the attacker-only gate (no nested pass, stale grant).
+    #[test]
+    fn blocker_control_change_revokes_blocking_grant_in_same_flush() {
+        let Board {
+            mut runner,
+            attacker,
+            blocker,
+            ..
+        } = board_with(Some(blocking_deathtouch()));
+        let state = runner.state_mut();
+        let before = state.clone();
+        let start = state.resolved_rules_journal.entries().len();
+
+        give_control(state, blocker, P0);
+        flush_layers(state);
+
+        assert_eq!(
+            state.objects[&blocker].controller, P0,
+            "reach guard: the control change happened"
+        );
+        assert!(not_in_combat(state, blocker));
+        assert!(
+            !state.objects[&blocker].has_keyword(&Keyword::Deathtouch),
+            "CR 613.1f: the removed blocker loses the Blocking grant in the same flush"
+        );
+        assert!(
+            state.objects[&attacker].has_keyword(&Keyword::Deathtouch),
+            "the still-attacking attacker keeps the Attacking grant"
+        );
+        assert_eq!(state.layers_dirty, LayersDirty::Clean);
+        let removals = removals_since(state, start);
+        assert_eq!(removals.len(), 1);
+        assert_eq!(removals[0].object.object_id, blocker);
+        assert_replay_matches(&before, state, start);
+    }
+
+    /// CR 506.4: the attacker and its blocker both change controller in one
+    /// settled pass. Both leave combat, each journaled exactly once, and the
+    /// journal replays onto the predecessor.
+    #[test]
+    fn attacker_and_blocker_control_change_in_one_pass_removes_both() {
+        let Board {
+            mut runner,
+            attacker,
+            blocker,
+            ..
+        } = board_with(Some(blocking_deathtouch()));
+        let state = runner.state_mut();
+        let before = state.clone();
+        let start = state.resolved_rules_journal.entries().len();
+
+        give_control(state, attacker, P1);
+        give_control(state, blocker, P0);
+        flush_layers(state);
+
+        assert!(not_in_combat(state, attacker));
+        assert!(not_in_combat(state, blocker));
+        for id in [attacker, blocker] {
+            assert!(!state.objects[&id].has_keyword(&Keyword::Deathtouch));
+        }
+        let mut removed: Vec<_> = removals_since(state, start)
+            .iter()
+            .map(|command| command.object.object_id)
+            .collect();
+        removed.sort();
+        let mut expected = vec![attacker, blocker];
+        expected.sort();
+        assert_eq!(removed, expected, "each creature is journaled exactly once");
+        assert_replay_matches(&before, state, start);
+    }
+
+    /// CR 506.4 + CR 509.1g: an attachment-owned control change of the
+    /// attacker prunes structurally and leaves the blocker exactly as the
+    /// settlement-owned path does — a blocking creature with no attacker
+    /// assigned — journaling no combat removal.
+    #[test]
+    fn attachment_owned_attacker_steal_leaves_blocker_orphaned_like_settlement() {
+        let Board {
+            mut runner,
+            attacker,
+            blocker,
+            control_magic,
+            ..
+        } = board_with(Some(blocking_deathtouch()));
+        let mut settled = runner.state().clone();
+        give_control(&mut settled, attacker, P1);
+        flush_layers(&mut settled);
+
+        let state = runner.state_mut();
+        let start = state.resolved_rules_journal.entries().len();
+        attach_to(state, control_magic, attacker);
+
+        assert_eq!(
+            state.objects[&attacker].controller, P1,
+            "reach guard: Control Magic took control"
+        );
+        assert!(not_in_combat(state, attacker));
+        assert_eq!(
+            state
+                .combat
+                .as_ref()
+                .unwrap()
+                .blocker_to_attacker
+                .get(&blocker),
+            Some(&vec![]),
+            "CR 509.1g: the blocker remains a blocking creature"
+        );
+        assert_eq!(
+            state.combat.as_ref().unwrap().blocker_to_attacker,
+            settled.combat.as_ref().unwrap().blocker_to_attacker,
+            "both owner paths prune the same edges"
+        );
+        assert!(state.objects[&blocker].has_keyword(&Keyword::Deathtouch));
+        assert!(
+            removals_since(state, start).is_empty(),
+            "the attachment-owned pass records no separate removal"
+        );
+    }
+}
+
+/// Per-site tests for the guarded object sweeps in this file
+/// (`prune_casting_permissions_at`, `arm_grantee_next_turn_casting_permissions`,
+/// `prune_host_left_casting_permissions`,
+/// `prune_controller_controls_source_on_leave`, `retire_absent_trigger_grants`):
+/// a sharing witness, a targeted test and a reference-equality test against
+/// the BASE-shaped unguarded loop for each.
+#[cfg(test)]
+mod object_sweep_sharing_tests {
+    use super::*;
+    use crate::types::ability::{
+        occurrence_for_grant, ReplacementCondition, ReplacementDefinition, RestrictionExpiry,
+        TriggerDefinition, TriggerEntry, TriggerGrantProducerKey, TriggerProducerOrigin,
+    };
+    use crate::types::game_state::LayersDirty;
+    use crate::types::object_map::sweep_test_support::{
+        assert_sweep_keeps_store_shared, assert_sweep_matches_reference, object_mut,
+        run_sweep_targeting, state_with_objects,
+    };
+    use crate::types::replacements::ReplacementEvent;
+    use crate::types::triggers::TriggerMode;
+
+    const P0: PlayerId = PlayerId(0);
+    const P1: PlayerId = PlayerId(1);
+
+    /// Four exiled cards, two per player.
+    fn exiled_fixture() -> (GameState, Vec<ObjectId>) {
+        state_with_objects(&[
+            (P0, Zone::Exile),
+            (P1, Zone::Exile),
+            (P0, Zone::Exile),
+            (P1, Zone::Exile),
+        ])
+    }
+
+    /// An impulse "play from exile" permission with the given lifetime.
+    fn play_from_exile(
+        duration: Duration,
+        granted_to: PlayerId,
+        source_id: Option<ObjectId>,
+    ) -> CastingPermission {
+        CastingPermission::PlayFromExile {
+            provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+            mode: crate::types::ability::CardPlayMode::Play,
+            duration,
+            granted_to,
+            frequency: crate::types::statics::CastFrequency::Unlimited,
+            source_id,
+            invalidation: None,
+            exiled_by_ability_controller: None,
+            mana_spend_permission: None,
+            card_filter: None,
+            single_use_group: None,
+            single_use: false,
+            cast_cost_modifier: None,
+            alt_ability_cost: None,
+            without_paying_mana_cost: false,
+            land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+        }
+    }
+
+    /// Adds `permission` to the casting permissions of `id`.
+    fn grant(state: &mut GameState, id: ObjectId, permission: CastingPermission) {
+        object_mut(state, id).casting_permissions.push(permission);
+    }
+
+    // ---- S1: prune_casting_permissions_at ----
+
+    /// BASE-shaped unguarded `prune_casting_permissions_at`.
+    fn reference_prune_casting_permissions_at(
+        state: &mut GameState,
+        seam: PermissionSeam,
+        active: Option<PlayerId>,
+    ) {
+        for obj in state.objects.iter_mut().map(|(_, v)| v) {
+            obj.casting_permissions.retain(|p| {
+                let lifetime = p.lifetime();
+                match lifetime.duration {
+                    Some(d) => {
+                        !permission_duration_expires_at(seam, d, lifetime.keyed_player, active)
+                    }
+                    None => true,
+                }
+            });
+        }
+    }
+
+    /// The cleanup-step permission that expires (`UntilEndOfTurn`).
+    fn cleanup_expiring() -> CastingPermission {
+        play_from_exile(Duration::UntilEndOfTurn, P0, None)
+    }
+
+    /// The turn-start permission that expires when `P0`'s turn begins.
+    fn turn_start_expiring() -> CastingPermission {
+        play_from_exile(
+            Duration::UntilNextTurnOf {
+                player: PlayerScope::Controller,
+            },
+            P0,
+            None,
+        )
+    }
+
+    /// A turn-start permission keyed to `P1`, which `P0`'s turn start keeps.
+    fn turn_start_kept() -> CastingPermission {
+        play_from_exile(
+            Duration::UntilNextTurnOf {
+                player: PlayerScope::Controller,
+            },
+            P1,
+            None,
+        )
+    }
+
+    /// Sharing witness for the cleanup shape (`Cleanup`, `None`): no object
+    /// holds a casting permission.
+    #[test]
+    fn cleanup_permission_prune_without_permissions_keeps_store_shared() {
+        let (state, _) = exiled_fixture();
+        assert_sweep_keeps_store_shared(state, |state| {
+            prune_casting_permissions_at(state, PermissionSeam::Cleanup, None)
+        });
+    }
+
+    /// Targeted test for the cleanup shape: only the holder of the expiring
+    /// permission is copied.
+    #[test]
+    fn cleanup_permission_prune_copies_only_the_holder() {
+        let (mut state, ids) = exiled_fixture();
+        grant(&mut state, ids[1], cleanup_expiring());
+        let (before, after) = run_sweep_targeting(state, ids[1], |state| {
+            prune_casting_permissions_at(state, PermissionSeam::Cleanup, None)
+        });
+        assert_eq!(before.objects[&ids[1]].casting_permissions.len(), 1);
+        assert!(after.objects[&ids[1]].casting_permissions.is_empty());
+    }
+
+    /// Reference equality for the cleanup shape.
+    #[test]
+    fn cleanup_permission_prune_matches_unguarded_sweep() {
+        let (mut state, ids) = exiled_fixture();
+        grant(&mut state, ids[0], cleanup_expiring());
+        grant(&mut state, ids[1], cleanup_expiring());
+        grant(&mut state, ids[1], CastingPermission::AdventureCreature);
+        // Needs the sweep (holds a permission) but keeps it.
+        grant(&mut state, ids[2], CastingPermission::AdventureCreature);
+        assert_sweep_matches_reference(
+            &state,
+            &[ids[0], ids[1]],
+            |state| prune_casting_permissions_at(state, PermissionSeam::Cleanup, None),
+            |state| reference_prune_casting_permissions_at(state, PermissionSeam::Cleanup, None),
+        );
+    }
+
+    /// Sharing witness for the turn-start shape (`TurnStart`, `Some(player)`).
+    #[test]
+    fn turn_start_permission_prune_without_permissions_keeps_store_shared() {
+        let (state, _) = exiled_fixture();
+        assert_sweep_keeps_store_shared(state, |state| {
+            prune_casting_permissions_at(state, PermissionSeam::TurnStart, Some(P0))
+        });
+    }
+
+    /// Targeted test for the turn-start shape.
+    #[test]
+    fn turn_start_permission_prune_copies_only_the_holder() {
+        let (mut state, ids) = exiled_fixture();
+        grant(&mut state, ids[2], turn_start_expiring());
+        let (before, after) = run_sweep_targeting(state, ids[2], |state| {
+            prune_casting_permissions_at(state, PermissionSeam::TurnStart, Some(P0))
+        });
+        assert_eq!(before.objects[&ids[2]].casting_permissions.len(), 1);
+        assert!(after.objects[&ids[2]].casting_permissions.is_empty());
+    }
+
+    /// Reference equality for the turn-start shape.
+    #[test]
+    fn turn_start_permission_prune_matches_unguarded_sweep() {
+        let (mut state, ids) = exiled_fixture();
+        grant(&mut state, ids[0], turn_start_expiring());
+        grant(&mut state, ids[1], turn_start_expiring());
+        grant(&mut state, ids[1], turn_start_kept());
+        // Needs the sweep (holds a permission) but keeps it.
+        grant(&mut state, ids[2], turn_start_kept());
+        assert_sweep_matches_reference(
+            &state,
+            &[ids[0], ids[1]],
+            |state| prune_casting_permissions_at(state, PermissionSeam::TurnStart, Some(P0)),
+            |state| {
+                reference_prune_casting_permissions_at(state, PermissionSeam::TurnStart, Some(P0))
+            },
+        );
+    }
+
+    // ---- S2: arm_grantee_next_turn_casting_permissions ----
+
+    /// BASE-shaped unguarded `arm_grantee_next_turn_casting_permissions`.
+    fn reference_arm_grantee_next_turn_casting_permissions(
+        state: &mut GameState,
+        active_player: PlayerId,
+    ) {
+        for obj in state.objects.iter_mut().map(|(_, v)| v) {
+            for p in obj.casting_permissions.iter_mut() {
+                let (Some(duration), grantee) = p.lifetime_mut() else {
+                    continue;
+                };
+                if matches!(
+                    duration,
+                    Duration::UntilEndOfNextTurnOf {
+                        player: PlayerScope::Controller
+                    }
+                ) && grantee == Some(active_player)
+                {
+                    *duration = Duration::UntilEndOfTurn;
+                }
+            }
+        }
+    }
+
+    /// "Until the end of your next turn", granted to `granted_to`.
+    fn next_turn_grant(granted_to: PlayerId) -> CastingPermission {
+        play_from_exile(
+            Duration::UntilEndOfNextTurnOf {
+                player: PlayerScope::Controller,
+            },
+            granted_to,
+            None,
+        )
+    }
+
+    /// Sharing witness: no object holds a casting permission.
+    #[test]
+    fn arming_without_permissions_keeps_store_shared() {
+        let (state, _) = exiled_fixture();
+        assert_sweep_keeps_store_shared(state, |state| {
+            arm_grantee_next_turn_casting_permissions(state, P0)
+        });
+    }
+
+    /// Targeted test: only the holder of the grant being armed is copied.
+    #[test]
+    fn arming_copies_only_the_grantee_permission_holder() {
+        let (mut state, ids) = exiled_fixture();
+        grant(&mut state, ids[0], next_turn_grant(P0));
+        let (before, after) = run_sweep_targeting(state, ids[0], |state| {
+            arm_grantee_next_turn_casting_permissions(state, P0)
+        });
+        assert_ne!(
+            before.objects[&ids[0]].casting_permissions,
+            after.objects[&ids[0]].casting_permissions
+        );
+        assert!(matches!(
+            after.objects[&ids[0]].casting_permissions[0],
+            CastingPermission::PlayFromExile {
+                duration: Duration::UntilEndOfTurn,
+                ..
+            }
+        ));
+    }
+
+    /// Reference equality, including a holder whose grant belongs to the
+    /// other player and is therefore left alone.
+    #[test]
+    fn arming_matches_unguarded_sweep() {
+        let (mut state, ids) = exiled_fixture();
+        grant(&mut state, ids[0], next_turn_grant(P0));
+        grant(&mut state, ids[1], next_turn_grant(P1));
+        grant(&mut state, ids[1], next_turn_grant(P0));
+        // Needs the sweep (holds a permission) but nothing is armed.
+        grant(&mut state, ids[2], next_turn_grant(P1));
+        assert_sweep_matches_reference(
+            &state,
+            &[ids[0], ids[1]],
+            |state| arm_grantee_next_turn_casting_permissions(state, P0),
+            |state| reference_arm_grantee_next_turn_casting_permissions(state, P0),
+        );
+    }
+
+    // ---- S3: prune_host_left_casting_permissions ----
+
+    /// BASE-shaped unguarded `prune_host_left_casting_permissions`.
+    fn reference_prune_host_left_casting_permissions(state: &mut GameState, departed_id: ObjectId) {
+        for obj in state.objects.iter_mut().map(|(_, v)| v) {
+            obj.casting_permissions.retain(|p| {
+                let lifetime = p.lifetime();
+                let host_bound = lifetime
+                    .duration
+                    .is_some_and(Duration::ends_when_host_leaves_play);
+                !(host_bound && lifetime.source_id == Some(departed_id))
+            });
+        }
+    }
+
+    /// A permission bound to the presence of `host` on the battlefield.
+    fn host_bound(host: ObjectId) -> CastingPermission {
+        play_from_exile(Duration::UntilHostLeavesPlay, P0, Some(host))
+    }
+
+    /// Sharing witness: no object holds a casting permission.
+    #[test]
+    fn host_left_prune_without_permissions_keeps_store_shared() {
+        let (state, ids) = exiled_fixture();
+        let departed = ids[3];
+        assert_sweep_keeps_store_shared(state, |state| {
+            prune_host_left_casting_permissions(state, departed)
+        });
+    }
+
+    /// Targeted test: only the holder of the host-bound permission is copied.
+    #[test]
+    fn host_left_prune_copies_only_the_holder() {
+        let (mut state, ids) = exiled_fixture();
+        let departed = ids[3];
+        grant(&mut state, ids[1], host_bound(departed));
+        let (before, after) = run_sweep_targeting(state, ids[1], |state| {
+            prune_host_left_casting_permissions(state, departed)
+        });
+        assert_eq!(before.objects[&ids[1]].casting_permissions.len(), 1);
+        assert!(after.objects[&ids[1]].casting_permissions.is_empty());
+    }
+
+    /// Reference equality, including a permission bound to a different host.
+    #[test]
+    fn host_left_prune_matches_unguarded_sweep() {
+        let (mut state, ids) = exiled_fixture();
+        let departed = ids[3];
+        grant(&mut state, ids[0], host_bound(departed));
+        grant(&mut state, ids[1], host_bound(departed));
+        grant(&mut state, ids[1], host_bound(ids[0]));
+        // Needs the sweep (holds a permission) but its host is still here.
+        grant(&mut state, ids[2], host_bound(ids[0]));
+        assert_sweep_matches_reference(
+            &state,
+            &[ids[0], ids[1]],
+            |state| prune_host_left_casting_permissions(state, departed),
+            |state| reference_prune_host_left_casting_permissions(state, departed),
+        );
+    }
+
+    // ---- S5: prune_controller_controls_source_on_leave ----
+
+    /// BASE-shaped unguarded `prune_controller_controls_source_on_leave`,
+    /// including the `changed` flag and the `mark_full` it feeds.
+    fn reference_prune_controller_controls_source_on_leave(
+        state: &mut GameState,
+        departed_id: ObjectId,
+    ) {
+        let mut changed = false;
+        for (host_id, obj) in state.objects.iter_mut() {
+            let host_left = *host_id == departed_id;
+            let is_lapsed = |def: &ReplacementDefinition| {
+                host_left
+                    || matches!(
+                        def.condition,
+                        Some(ReplacementCondition::ControllerControlsSource { source, .. })
+                            if source == departed_id
+                    )
+            };
+            let drop = |def: &ReplacementDefinition| {
+                (matches!(
+                    def.condition,
+                    Some(ReplacementCondition::ControllerControlsSource { .. })
+                ) && is_lapsed(def))
+                    || (host_left && is_runtime_target_die_exile_replacement(def))
+                    || (host_left && is_runtime_host_lifetime_replacement(def))
+            };
+            let before_live = obj.replacement_definitions.len();
+            obj.replacement_definitions.retain(|d| !drop(d));
+            let before_base = obj.base_replacement_definitions.len();
+            if obj.base_replacement_definitions.iter().any(drop) {
+                Arc::make_mut(&mut obj.base_replacement_definitions).retain(|d| !drop(d));
+            }
+            if obj.replacement_definitions.len() != before_live
+                || obj.base_replacement_definitions.len() != before_base
+            {
+                changed = true;
+            }
+        }
+        if changed {
+            state.layers_dirty.mark_full();
+        }
+    }
+
+    /// A replacement gated on the controller still controlling `source`.
+    fn controls_source(source: ObjectId) -> ReplacementDefinition {
+        ReplacementDefinition::new(ReplacementEvent::Moved).condition(
+            ReplacementCondition::ControllerControlsSource {
+                source,
+                controller: P0,
+            },
+        )
+    }
+
+    /// Five battlefield permanents; the last one is the departing host.
+    fn controls_source_fixture() -> (GameState, Vec<ObjectId>) {
+        let (mut state, ids) = state_with_objects(&[
+            (P0, Zone::Battlefield),
+            (P0, Zone::Battlefield),
+            (P1, Zone::Battlefield),
+            (P1, Zone::Battlefield),
+            (P0, Zone::Battlefield),
+        ]);
+        state.layers_dirty = LayersDirty::Clean;
+        (state, ids)
+    }
+
+    /// Sharing witness: definitions exist, but none lapses with this
+    /// departure, so nothing is copied and `layers_dirty` stays clean.
+    #[test]
+    fn controls_source_prune_without_lapsed_definitions_keeps_store_shared() {
+        let (mut state, ids) = controls_source_fixture();
+        let departed = ids[4];
+        object_mut(&mut state, ids[0])
+            .replacement_definitions
+            .push(controls_source(ids[1]));
+        Arc::make_mut(&mut object_mut(&mut state, ids[2]).base_replacement_definitions)
+            .push(controls_source(ids[3]));
+        let after = assert_sweep_keeps_store_shared(state, |state| {
+            prune_controller_controls_source_on_leave(state, departed)
+        });
+        assert_eq!(after.layers_dirty, LayersDirty::Clean);
+    }
+
+    /// Targeted test: only the holder of the lapsed definition is copied.
+    #[test]
+    fn controls_source_prune_copies_only_the_holder() {
+        let (mut state, ids) = controls_source_fixture();
+        let departed = ids[4];
+        object_mut(&mut state, ids[1])
+            .replacement_definitions
+            .push(controls_source(departed));
+        let (before, after) = run_sweep_targeting(state, ids[1], |state| {
+            prune_controller_controls_source_on_leave(state, departed)
+        });
+        assert_eq!(before.objects[&ids[1]].replacement_definitions.len(), 1);
+        assert!(after.objects[&ids[1]].replacement_definitions.is_empty());
+        assert_eq!(after.layers_dirty, LayersDirty::Full);
+    }
+
+    /// Reference equality, with one object per disjunct of the guard (lapsed
+    /// definition only in the live list; only in the base list), the
+    /// departing host's own host-lifetime rider, and an unrelated holder.
+    /// `layers_dirty` is `serde(skip)`, so it is compared separately, for a
+    /// changed and a no-op fixture.
+    #[test]
+    fn controls_source_prune_matches_unguarded_sweep() {
+        let (mut state, ids) = controls_source_fixture();
+        let departed = ids[4];
+        object_mut(&mut state, ids[0])
+            .replacement_definitions
+            .push(controls_source(departed));
+        Arc::make_mut(&mut object_mut(&mut state, ids[1]).base_replacement_definitions)
+            .push(controls_source(departed));
+        object_mut(&mut state, ids[2])
+            .replacement_definitions
+            .push(controls_source(ids[3]));
+        let host_rider = ReplacementDefinition::new(ReplacementEvent::Moved)
+            .expiry(RestrictionExpiry::UntilHostLeavesPlay);
+        object_mut(&mut state, departed)
+            .replacement_definitions
+            .push(host_rider.clone());
+        Arc::make_mut(&mut object_mut(&mut state, departed).base_replacement_definitions)
+            .push(host_rider);
+        let (actual, reference) = assert_sweep_matches_reference(
+            &state,
+            &[ids[0], ids[1], departed],
+            |state| prune_controller_controls_source_on_leave(state, departed),
+            |state| reference_prune_controller_controls_source_on_leave(state, departed),
+        );
+        assert_eq!(reference.layers_dirty, LayersDirty::Full);
+        assert_eq!(actual.layers_dirty, reference.layers_dirty);
+
+        // No-op: only the unrelated holder remains.
+        let (mut state, ids) = controls_source_fixture();
+        let departed = ids[4];
+        object_mut(&mut state, ids[2])
+            .replacement_definitions
+            .push(controls_source(ids[3]));
+        let mut actual = state.clone();
+        let mut reference = state.clone();
+        prune_controller_controls_source_on_leave(&mut actual, departed);
+        reference_prune_controller_controls_source_on_leave(&mut reference, departed);
+        assert_eq!(reference.layers_dirty, LayersDirty::Clean);
+        assert_eq!(actual.layers_dirty, reference.layers_dirty);
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(&reference).unwrap()
+        );
+    }
+
+    // ---- S13: retire_absent_trigger_grants ----
+
+    /// BASE-shaped unguarded `retire_absent_trigger_grants`: every object is
+    /// written.
+    fn reference_retire_absent_trigger_grants(state: &mut GameState) {
+        let trigger_object_ids = state.objects.keys().copied().collect::<Vec<_>>();
+        for object_id in trigger_object_ids {
+            let Some(obj) = state.objects.get_mut(&object_id) else {
+                continue;
+            };
+            let live = live_trigger_grant_instances(obj);
+            obj.trigger_occurrence_state.retire_absent_grants(&live);
+        }
+    }
+
+    /// The producer key for output slot `output_index` of one static grantor.
+    fn producer(output_index: usize) -> TriggerGrantProducerKey {
+        TriggerGrantProducerKey::Granted {
+            origin: TriggerProducerOrigin::Static {
+                source: ObjectIncarnationRef::of(ObjectId(900), 1),
+                definition_index: 0,
+                modification_index: 0,
+            },
+            output_index,
+        }
+    }
+
+    /// Activates a grant from `producer(output_index)` on `id`; when `live`,
+    /// also materializes the matching trigger definition so the grant is in
+    /// the object's live set.
+    fn activate_grant(state: &mut GameState, id: ObjectId, output_index: usize, live: bool) {
+        let obj = object_mut(state, id);
+        let key = producer(output_index);
+        let instance = obj
+            .trigger_occurrence_state
+            .grant_instance_for(key.clone())
+            .expect("grant allocates");
+        if live {
+            obj.trigger_definitions.push(TriggerEntry::new(
+                occurrence_for_grant(&key, instance),
+                TriggerDefinition::new(TriggerMode::Attacks),
+            ));
+        }
+    }
+
+    /// Battlefield fixture for grant retirement.
+    fn grant_fixture() -> (GameState, Vec<ObjectId>) {
+        state_with_objects(&[
+            (P0, Zone::Battlefield),
+            (P0, Zone::Battlefield),
+            (P1, Zone::Battlefield),
+            (P1, Zone::Battlefield),
+        ])
+    }
+
+    /// Sharing witness: one object's active grants are all live (so the
+    /// second half of the guard is evaluated) and the others have none.
+    #[test]
+    fn grant_retirement_without_absent_grants_keeps_store_shared() {
+        let (mut state, ids) = grant_fixture();
+        activate_grant(&mut state, ids[0], 0, true);
+        activate_grant(&mut state, ids[0], 1, true);
+        assert_eq!(
+            state.objects[&ids[0]]
+                .trigger_occurrence_state
+                .active_grants()
+                .count(),
+            2
+        );
+        assert_sweep_keeps_store_shared(state, retire_absent_trigger_grants);
+    }
+
+    /// Targeted test: only the object holding an absent grant is copied.
+    #[test]
+    fn grant_retirement_copies_only_the_holder_of_an_absent_grant() {
+        let (mut state, ids) = grant_fixture();
+        activate_grant(&mut state, ids[0], 0, true);
+        activate_grant(&mut state, ids[2], 0, true);
+        activate_grant(&mut state, ids[2], 1, false);
+        let (before, after) = run_sweep_targeting(state, ids[2], retire_absent_trigger_grants);
+        let count = |state: &GameState| {
+            state.objects[&ids[2]]
+                .trigger_occurrence_state
+                .active_grants()
+                .count()
+        };
+        assert_eq!(count(&before), 2);
+        assert_eq!(count(&after), 1);
+    }
+
+    /// Reference equality: two objects lose a grant, one has only live
+    /// grants, one has none.
+    #[test]
+    fn grant_retirement_matches_unguarded_sweep() {
+        let (mut state, ids) = grant_fixture();
+        activate_grant(&mut state, ids[0], 0, false);
+        activate_grant(&mut state, ids[1], 0, true);
+        activate_grant(&mut state, ids[1], 1, false);
+        activate_grant(&mut state, ids[2], 0, true);
+        assert_sweep_matches_reference(
+            &state,
+            &[ids[0], ids[1]],
+            retire_absent_trigger_grants,
+            reference_retire_absent_trigger_grants,
+        );
+    }
+
+    // ---- Call-site pins ----
+
+    /// Call-site pin (S2): the untap-step seam still arms the active
+    /// player's "until the end of your next turn" grants.
+    #[test]
+    fn untap_step_prune_arms_grantee_next_turn_permissions() {
+        let (mut state, ids) = exiled_fixture();
+        grant(&mut state, ids[0], next_turn_grant(P0));
+        prune_untap_step_casting_permissions(&mut state, P0);
+        assert!(matches!(
+            state.objects[&ids[0]].casting_permissions.as_slice(),
+            [CastingPermission::PlayFromExile {
+                duration: Duration::UntilEndOfTurn,
+                ..
+            }]
+        ));
+    }
+
+    /// Call-site pin (S13): a full layer evaluation still retires an active
+    /// grant whose producer no longer materializes it.
+    #[test]
+    fn layer_evaluation_retires_absent_trigger_grants() {
+        let (mut state, ids) = grant_fixture();
+        activate_grant(&mut state, ids[0], 0, false);
+        let active = |state: &GameState| {
+            state.objects[&ids[0]]
+                .trigger_occurrence_state
+                .active_grants()
+                .count()
+        };
+        assert_eq!(active(&state), 1);
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+        assert_eq!(active(&state), 0);
     }
 }

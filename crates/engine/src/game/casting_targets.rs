@@ -151,6 +151,8 @@ pub(crate) fn handle_select_modes(
     // Build a chain of ResolvedAbility from chosen modes (in order)
     let mut resolved = build_chained_resolved(&abilities, &indices, pending.object_id, controller)?;
     resolved.set_context_recursive(pending.ability.context.clone());
+    // CR 601.2b + CR 601.2c: the chosen modes declare only the targets chosen for them.
+    resolved.start_target_record_recursive();
     resolved.selected_mode_labels = selected_mode_labels(&modal.mode_descriptions, &indices);
     // CR 700.2a + CR 700.2d + CR 601.2b: latch the chosen modal-mode indices onto
     // the spell's context so finalize can stamp them on the stack object (read by
@@ -224,6 +226,7 @@ pub(crate) fn handle_select_modes(
                 &super::ability_utils::declared_targets_in_chain(&resolved),
                 pending.object_id,
                 controller,
+                super::casting::pending_cast_targeter(state, &pending),
                 events,
             );
             return finish_pending_cast_cost_or_pay(
@@ -244,6 +247,7 @@ pub(crate) fn handle_select_modes(
                 &super::ability_utils::declared_targets_in_chain(&resolved),
                 pending.object_id,
                 controller,
+                super::casting::pending_cast_targeter(state, &pending),
                 events,
             );
             return finish_pending_cast_cost_or_pay(
@@ -302,13 +306,14 @@ pub(crate) fn handle_select_modes(
 /// CR 601.2d: After targets are committed on a pending cast, pause for
 /// `WaitingFor::DistributeAmong` when the spell divides a fixed pool among
 /// those targets. Shared by bulk `SelectTargets` and slot-by-slot
-/// `ChooseTarget` completion paths — the client drives the latter.
+/// `ChooseTarget` completion paths — the client drives the latter. The
+/// target-declaration events already emitted are staged at the end of the
+/// action by `announcement_triggers`.
 fn maybe_pause_for_cast_distribution(
     state: &mut GameState,
     player: PlayerId,
     pending: &PendingCast,
     ability: &ResolvedAbility,
-    events: &[GameEvent],
 ) -> Result<Option<WaitingFor>, EngineError> {
     let Some(unit) = &pending.distribute else {
         return Ok(None);
@@ -323,7 +328,6 @@ fn maybe_pause_for_cast_distribution(
     }
     let mut pending_dist = pending.clone();
     pending_dist.ability = Box::new(ability.clone());
-    stage_activation_target_events_before_distribution(state, &mut pending_dist, events);
     state.pending_cast = Some(Box::new(pending_dist));
     Ok(Some(WaitingFor::DistributeAmong {
         player,
@@ -331,19 +335,6 @@ fn maybe_pause_for_cast_distribution(
         targets: assigned_targets,
         unit: unit.clone(),
     }))
-}
-
-/// CR 602.2b + CR 603.3b: A target-bearing activation keeps target-declaration
-/// triggers local while an intervening distribution choice is pending. The later
-/// stack-commit boundary publishes this already-collected prefix with cost events.
-fn stage_activation_target_events_before_distribution(
-    state: &GameState,
-    pending: &mut PendingCast,
-    events: &[GameEvent],
-) {
-    if let Some(collection) = pending.activation_trigger_collection.as_mut() {
-        collection.collect(state, events);
-    }
 }
 
 /// Handle target selection for a pending cast.
@@ -400,11 +391,11 @@ pub(crate) fn handle_select_targets(
         &announced_targets,
         pending.object_id,
         pending.ability.controller,
+        super::casting::pending_cast_targeter(state, &pending),
         events,
     );
 
-    if let Some(waiting_for) =
-        maybe_pause_for_cast_distribution(state, player, &pending, &ability, events)?
+    if let Some(waiting_for) = maybe_pause_for_cast_distribution(state, player, &pending, &ability)?
     {
         return Ok(waiting_for);
     }
@@ -505,11 +496,12 @@ pub(crate) fn handle_choose_target(
                 &announced_targets,
                 pending.object_id,
                 controller,
+                super::casting::pending_cast_targeter(state, &pending),
                 events,
             );
 
             if let Some(waiting_for) =
-                maybe_pause_for_cast_distribution(state, controller, &pending, &ability, events)?
+                maybe_pause_for_cast_distribution(state, controller, &pending, &ability)?
             {
                 return Ok(waiting_for);
             }
@@ -693,11 +685,15 @@ pub(super) fn extract_distribution_total(
 /// carries its last known information, taken when it left. A source announced
 /// from another zone (embalm, cycling) never takes battlefield LKI, so a stale
 /// entry from an earlier departure can't answer for it.
+///
+/// `stack_entry` is the stack object a stack-using activation created (CR
+/// 602.2a); a mana-ability activation passes `None` (CR 605.3b).
 pub(crate) fn emit_ability_activated(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
     kind: crate::types::events::ActivatedAbilityKind,
+    stack_entry: Option<ObjectId>,
     announced_zone: crate::types::zones::Zone,
     events: &mut Vec<GameEvent>,
 ) -> usize {
@@ -715,6 +711,7 @@ pub(crate) fn emit_ability_activated(
         kind,
         departed_source_lki,
         trigger_state: crate::types::events::ActivationTriggerState::Pending,
+        stack_entry,
     });
     events.len() - 1
 }

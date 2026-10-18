@@ -586,9 +586,6 @@
     "pendingCheaper": "Le prochain sort coûte {{amount}} de moins",
     "companion": "Compagnon",
     "unboundedTooltip": "{{resource}} illimité (∞)",
-    "unboundedScheduledTooltip": "{{resource}} illimité (∞) — réduction en attente ; un nombre fini sera choisi",
-    "unboundedScheduledYouTooltip": "{{resource}} illimité (∞) — réduction en attente ; vous indiquerez le nombre",
-    "unboundedScheduledGlyph": "∞→N",
     "unboundedConditionalTooltip": "{{resource}} illimité (∞) — réduction en attente ; cela peut rester illimité",
     "unboundedConditionalYouTooltip": "{{resource}} illimité (∞) — réduction en attente ; cela peut rester illimité, et sinon vous indiquerez le nombre",
     "unboundedMixedTooltip": "{{resource}} illimité (∞) — une partie de ce groupe a une réduction en attente ; une partie reste illimitée",
@@ -671,6 +668,7 @@
     "libraryCount_one": "Bibliothèque ({{count}} carte)",
     "libraryCount_other": "Bibliothèque ({{count}} cartes)",
     "playFromTop": "Jouer {{name}} depuis le dessus de la bibliothèque",
+    "activateFromTop": "Activer {{name}} depuis le dessus de la bibliothèque",
     "topOfLibrary": "dessus de la bibliothèque",
     "indicatorOpponentPrefix": "Adv ",
     "graveyardLower": "cimetière",
@@ -678,6 +676,7 @@
     "zoneTitle": "{{zone}} ({{count}})",
     "noCardsIn": "Aucune carte dans {{zone}}",
     "castFromZone": "Lancer depuis {{zone}} : {{name}}",
+    "activateFromZone": "Activer depuis {{zone}} : {{name}}",
     "viewCount": "Voir {{count}}",
     "castableCount": "{{zone}} — {{count}} lançable(s)"
   },
@@ -809,7 +808,16 @@
     "defendingPlayerTrample": "Joueur défenseur (Piétinement)",
     "pwControllerTrample": "Contrôleur du PW (Piétinement sur PW)"
   },
+  "cardTextReference": {
+    "title": "Printed card text (reference)",
+    "hint": "Full printed card text. It may differ from current Oracle text or this ability.",
+    "originalAbility": "Original ability text"
+  },
   "stack": {
+    "activatedAbility": "Activated ability",
+    "activatedAbilityNumber": "Activated ability {{number}}",
+    "triggeredAbility": "Triggered ability",
+    "readAbility": "Read ability and printed card text",
     "title": "Pile",
     "collapsePanel": "Réduire le panneau de la pile",
     "expandPanel": "Développer le panneau de la pile",
@@ -864,6 +872,7 @@
     "chooseCreatureToEquip": "Choisissez une créature à équiper",
     "chooseCreatureTokenToPopulate": "Choisissez un jeton de créature à peupler",
     "chooseReturnAsAuraTarget": "Choisissez un permanent à enchanter",
+    "chooseTokenHost": "Choisissez un hôte pour le jeton",
     "tapUntappedCreatures_one": "Engagez {{count}} créature dégagée",
     "tapUntappedCreatures_other": "Engagez {{count}} créatures dégagées",
     "chooseTargetOf": "Choisissez la cible {{current}} sur {{total}}",
@@ -897,6 +906,7 @@
     },
     "confirmTap": "Confirmer l'engagement ({{selected}}/{{count}})",
     "keepCurrentTargets": "Conserver les cibles actuelles",
+    "keepCurrentTarget": "Conserver cette cible",
     "skip": "Ignorer",
     "opponentChoice": "(au choix de l'adversaire)",
     "chooseNewTarget": "Choisissez la nouvelle cible du sort",
@@ -2406,7 +2416,8 @@
     "confirm": "Confirmer",
     "badgeNewTarget": "Nouvelle cible",
     "slotLabel": "Cible {{index}} : {{current}} → {{chosen}}",
-    "unselected": "inchangée"
+    "unselected": "inchangée",
+    "keep": "Conserver"
   },
   "separatePiles": {
     "chooserName": "Joueur {{number}}",
@@ -2623,8 +2634,8 @@
     "close": "Fermer la fenêtre de décision de l’IA"
   },
   "status": {
-    "yourPriority": "Your priority",
-    "yourPriorityReason": "Your priority — {{reason}}",
+    "yourPriority": "Votre priorité",
+    "yourPriorityReason": "Votre priorité — {{reason}}",
     "waitingFor": "Waiting for <player>{{player}}</player>",
     "waitingForReason": "Waiting for <player>{{player}}</player> — {{reason}}",
     "reason": {
@@ -2668,5 +2679,34 @@
     "reveal_one": "Reveal {{count}} card",
     "reveal_other": "Reveal {{count}} cards",
     "decline": "Don't reveal"
+  },
+  "physicalContest": {
+    "title": {
+      "staring": "Concours de regard",
+      "breathHolding": "Concours d'apnée"
+    },
+    "versus": "{{first}} contre {{second}}",
+    "instructions": "Continuez à cliquer, à toucher l'écran ou à appuyer sur la barre d'espace aussi longtemps que possible. Le premier joueur qui s'arrête pendant {{seconds}} secondes perd.",
+    "status": {
+      "pending": "En attente du début du concours…",
+      "preparing": "Préparez-vous…",
+      "go": "PARTEZ ! Continuez à cliquer !",
+      "paused": "Concours en pause le temps qu'un joueur se reconnecte…",
+      "spectating": "Vous regardez le concours…",
+      "resolving": "Détermination du résultat…"
+    },
+    "button": {
+      "wait": "Attendez le signal…",
+      "active": "Continuez à cliquer !"
+    },
+    "you": "Vous",
+    "clicks": "{{name}} : {{count}}",
+    "result": {
+      "won": "Vous avez gagné le concours !",
+      "lost": "Vous avez perdu le concours.",
+      "winner": "{{name}} a gagné le concours.",
+      "tie": "Égalité : il ne se passe rien.",
+      "cancelled": "Le concours a été annulé : il ne se passe rien."
+    }
   }
 }

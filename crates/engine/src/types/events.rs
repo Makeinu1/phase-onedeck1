@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::counter::CounterType;
+use crate::types::ability::AttachmentReferent;
 
 use super::ability::{
     AbilityTag, AttachmentKind, CostPaidObjectSnapshot, EffectKind, FilterProp, TargetFilter,
@@ -30,6 +31,22 @@ fn default_nth_in_step() -> u32 {
 
 fn default_nth_in_turn() -> u32 {
     1
+}
+
+/// CR 115.1 + CR 113.8 + CR 601.2c: the stack object that announced a target,
+/// recorded when the target is chosen. "That spell or ability's controller"
+/// names that stack object, not the source permanent an ability's
+/// `BecomesTarget.source_id` points at (CR 113.7a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum Targeter {
+    /// A spell, by its announcement identity. Control of a spell can change
+    /// while it is on the stack (CR 109.4), so its controller is read live, or
+    /// as it last existed there once it has left (CR 608.2h).
+    Spell(super::game_state::SpellAnnouncement),
+    /// An activated or triggered ability. Its controller is fixed once it is on
+    /// the stack (CR 113.8): the event's `source_controller`.
+    Ability(super::ability::StackAbilityKind),
 }
 
 /// A passive, viewer-safe snapshot of one face seen during a hidden-zone search.
@@ -617,6 +634,7 @@ impl EventObjectSnapshot {
             | TargetFilter::TriggeringSource
             | TargetFilter::EventTarget
             | TargetFilter::ParentTargetSlot { .. }
+            | TargetFilter::DeclaredPlayer { .. }
             | TargetFilter::OriginalSource
             | TargetFilter::PostReplacementDamageTarget
             // CR 615.5 + CR 615: object/compound referents never reachable from
@@ -736,6 +754,9 @@ impl EventObjectSnapshot {
 
             // ---- embedded exact source relations ----
             FilterProp::SaddledSource | FilterProp::ConvokedSource => Supported,
+            // CR 702.122c: the crew ledger is keyed by the subject's own
+            // incarnation, which the snapshot carries (look-back arm in filter.rs).
+            FilterProp::CrewedThisTurn { .. } => Supported,
 
             // ---- embedded per-turn history ----
             FilterProp::WasDealtDamageThisTurn
@@ -772,7 +793,10 @@ impl EventObjectSnapshot {
             FilterProp::HasSingleTarget
             | FilterProp::Targets { .. }
             | FilterProp::TargetsOnly { .. }
-            | FilterProp::Modal => PermanentDomainFalse,
+            | FilterProp::Modal
+            // CR 722.3d: a prepare spell is a Stack-zone object by definition, so a
+            // permanent subject is a decided false, not a gap.
+            | FilterProp::PrepareSpell => PermanentDomainFalse,
 
             // ---- unsupported: needs a live candidate lookup or an unmodeled field ----
             // Not reachable from the subject grammar today. Reaching one fails the gate,
@@ -802,9 +826,10 @@ impl EventObjectSnapshot {
             // CR 607.2a: This compares against an object linked in the live
             // exile-link side table, which event snapshots deliberately omit.
             | FilterProp::SameNameAsExiledBySource
-            | FilterProp::AttachedToSource
-            | FilterProp::AttachedToRecipient
-            | FilterProp::AttachedToPlayer { .. }
+            | FilterProp::AttachedTo { to: AttachmentReferent::Source }
+            | FilterProp::AttachedTo { to: AttachmentReferent::Recipient }
+            | FilterProp::AttachedTo { to: AttachmentReferent::Player { .. } }
+            | FilterProp::AttachedTo { to: AttachmentReferent::DeclaredTarget { .. } }
             | FilterProp::Unpaired
             | FilterProp::OtherThanTriggerObject
             | FilterProp::MostPrevalentCreatureTypeIn { .. }
@@ -988,6 +1013,13 @@ pub enum GameEvent {
         /// Omitted on the wire when `Pending`.
         #[serde(default, skip_serializing_if = "ActivationTriggerState::is_pending")]
         trigger_state: ActivationTriggerState,
+        /// CR 602.2a + CR 113.7a: the stack object this activation created — the
+        /// ability "that ability" / "it" names for a trigger on this event, never
+        /// another object of the same source. `None` when the activation used no
+        /// stack (a mana-ability activation, CR 605.3b) and for an event decoded from
+        /// a state predating the field. Omitted on the wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stack_entry: Option<ObjectId>,
     },
     /// CR 603.6a: Enters-the-battlefield and zone-change triggers fire on this
     /// event. `from` is `None` when an object is created directly in a zone
@@ -1095,6 +1127,13 @@ pub enum GameEvent {
         /// `None` for self-initiated taps (mana abilities, attacking, crew, costs).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caused_by: Option<ObjectId>,
+        /// CR 400.7 + CR 608.2h: the incarnation of the permanent that became
+        /// tapped. If it leaves the battlefield and returns before a trigger
+        /// that reads "that permanent's controller" resolves (Royal Decree vs.
+        /// a blink), the returned permanent is a new object; this names the one
+        /// that was tapped. `None` on legacy events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<u64>,
     },
     /// CR 701.43a + CR 701.43d: A creature was exerted as it attacked. Fires the
     /// linked `TriggerMode::Exerted` "when you do" trigger (Combat Celebrant,
@@ -1246,6 +1285,14 @@ pub enum GameEvent {
         /// CR 120.10: Excess damage beyond lethal for creatures/planeswalkers/battles.
         #[serde(default)]
         excess: u32,
+        /// CR 400.7 + CR 608.2h: the incarnation of the object that dealt the
+        /// damage. If it leaves the battlefield and returns before a trigger
+        /// that reads "that creature's controller" resolves (a blink), the
+        /// returned permanent is a new object; this names the one that dealt
+        /// the damage. `None` on legacy events and for a source with no live
+        /// object.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_incarnation: Option<u64>,
     },
     /// CR 615: Damage was prevented (by a prevention shield or protection).
     /// Enables "when damage is prevented" triggers.
@@ -1448,6 +1495,12 @@ pub enum GameEvent {
         target: TargetRef,
         source_id: ObjectId,
         source_controller: PlayerId,
+        /// CR 115.1 + CR 113.8: which stack object announced the target.
+        /// `None` on events built before this was recorded (legacy saves, and
+        /// hand-built test events): readers fall back to the object authority
+        /// on `source_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        targeter: Option<Targeter>,
     },
     /// CR 702.122e: A Vehicle's crew ability resolved.
     /// Carries creature list for trigger conditions that reference "creatures that crewed it".
@@ -1555,6 +1608,11 @@ pub enum GameEvent {
         /// damage step — the sum of all `source_amounts` entries.
         #[serde(default)]
         total_damage: u32,
+        /// CR 400.7 + CR 608.2h: the incarnation of each `source_amounts`
+        /// source as it dealt the damage, carried into the per-source
+        /// `DamageDealt` a trigger records. Empty on legacy events.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        source_incarnations: Vec<crate::types::identifiers::ObjectIncarnationRef>,
     },
     PlayerEliminated {
         player_id: PlayerId,
@@ -1889,6 +1947,20 @@ pub enum GameEvent {
         amount_spent: u32,
         new_cumulative: u32,
     },
+    /// Eye to Eye / Mouth to Mouth: the real-time contest between `participants`
+    /// (controller first) has begun. See `types::contest`.
+    PhysicalContestStarted {
+        kind: crate::types::contest::ContestKind,
+        participants: [PlayerId; 2],
+    },
+    /// The contest reached a terminal state and its result was applied to the
+    /// game exactly once. `result` distinguishes a decided win, a tie, and a
+    /// technical cancellation.
+    PhysicalContestResolved {
+        kind: crate::types::contest::ContestKind,
+        participants: [PlayerId; 2],
+        result: crate::types::contest::ContestResult,
+    },
     /// CR 701.30: A clash occurred between two players.
     Clash {
         controller: PlayerId,
@@ -1949,6 +2021,24 @@ pub enum GameEvent {
         host: PlayerId,
         player_id: PlayerId,
     },
+}
+
+impl GameEvent {
+    /// CR 400.7 + CR 608.2h: a `PermanentTapped` event for `object_id`, stamped
+    /// with the incarnation of the permanent that is tapped now, so a later
+    /// "that permanent's controller" names this object even if it has left and
+    /// returned as a new one.
+    pub(crate) fn permanent_tapped(
+        state: &super::game_state::GameState,
+        object_id: ObjectId,
+        caused_by: Option<ObjectId>,
+    ) -> Self {
+        GameEvent::PermanentTapped {
+            object_id,
+            caused_by,
+            incarnation: state.objects.get(&object_id).map(|obj| obj.incarnation),
+        }
+    }
 }
 
 /// CR 603.2 + CR 702.59a: True when an off-zone trigger source was already
@@ -2027,6 +2117,7 @@ mod tests {
                 kind,
                 departed_source_lki,
                 trigger_state,
+                stack_entry,
                 ..
             } => {
                 assert_eq!(kind, ActivatedAbilityKind::Normal);
@@ -2038,6 +2129,10 @@ mod tests {
                     trigger_state,
                     ActivationTriggerState::Pending,
                     "a legacy event is observed by ordinary collection"
+                );
+                assert_eq!(
+                    stack_entry, None,
+                    "a legacy event predating the field names no stack entry"
                 );
             }
             other => panic!("expected AbilityActivated, got {other:?}"),
@@ -2058,6 +2153,7 @@ mod tests {
                 kind,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             };
             let json = serde_json::to_value(&event).unwrap();
             let back: GameEvent = serde_json::from_value(json).unwrap();
@@ -2066,6 +2162,31 @@ mod tests {
                 other => panic!("expected AbilityActivated, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn ability_activated_stack_entry_round_trips_and_defaults_to_none() {
+        // CR 602.2a: the stack object a stack-using activation created survives
+        // serialization, and a mana activation's absent entry is omitted.
+        let event = |stack_entry| GameEvent::AbilityActivated {
+            player_id: PlayerId(1),
+            source_id: ObjectId(9),
+            kind: ActivatedAbilityKind::Normal,
+            departed_source_lki: None,
+            trigger_state: ActivationTriggerState::Pending,
+            stack_entry,
+        };
+        let named = event(Some(ObjectId(42)));
+        let json = serde_json::to_value(&named).unwrap();
+        assert_eq!(json["data"]["stack_entry"], 42);
+        let back: GameEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back, named);
+
+        let json = serde_json::to_value(event(None)).unwrap();
+        assert!(
+            json["data"].get("stack_entry").is_none(),
+            "an activation that used no stack omits the key"
+        );
     }
 
     #[test]
@@ -2113,6 +2234,7 @@ mod tests {
             amount: 3,
             is_combat: false,
             excess: 0,
+            source_incarnation: None,
         };
         let serialized = serde_json::to_string(&event).unwrap();
         let deserialized: GameEvent = serde_json::from_str(&serialized).unwrap();
@@ -2137,6 +2259,7 @@ mod tests {
             player_id: PlayerId(1),
             source_amounts: vec![(ObjectId(10), 3), (ObjectId(11), 4)],
             total_damage: 7,
+            source_incarnations: vec![],
         };
         let serialized = serde_json::to_string(&event).unwrap();
         let deserialized: GameEvent = serde_json::from_str(&serialized).unwrap();
@@ -2238,6 +2361,14 @@ mod tests {
             properties: vec![FilterProp::HasSingleTarget],
         });
         assert_eq!(classify(&stack_prop), PermanentDomainFalse);
+
+        // CR 722.3d: a prepare spell is only ever a Stack-zone object.
+        let prepare_spell = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Creature],
+            controller: None,
+            properties: vec![FilterProp::PrepareSpell],
+        });
+        assert_eq!(classify(&prepare_spell), PermanentDomainFalse);
     }
 
     /// A shape that needs a live candidate lookup is `Unsupported` — the signal that the

@@ -586,9 +586,6 @@
     "pendingCheaper": "A próxima mágica custa {{amount}} a menos",
     "companion": "Companheiro",
     "unboundedTooltip": "{{resource}} ilimitado (∞)",
-    "unboundedScheduledTooltip": "{{resource}} ilimitado (∞) — colapso pendente; será escolhida uma quantidade finita",
-    "unboundedScheduledYouTooltip": "{{resource}} ilimitado (∞) — colapso pendente; você indicará a quantidade",
-    "unboundedScheduledGlyph": "∞→N",
     "unboundedConditionalTooltip": "{{resource}} ilimitado (∞) — colapso pendente; isto pode continuar ilimitado",
     "unboundedConditionalYouTooltip": "{{resource}} ilimitado (∞) — colapso pendente; isto pode continuar ilimitado e, caso contrário, você indicará a quantidade",
     "unboundedMixedTooltip": "{{resource}} ilimitado (∞) — parte deste grupo tem um colapso pendente; parte continua ilimitada",
@@ -671,6 +668,7 @@
     "libraryCount_one": "Grimório ({{count}} carta)",
     "libraryCount_other": "Grimório ({{count}} cartas)",
     "playFromTop": "Jogue {{name}} do topo do grimório",
+    "activateFromTop": "Ative {{name}} do topo do grimório",
     "topOfLibrary": "topo do grimório",
     "indicatorOpponentPrefix": "Op ",
     "graveyardLower": "cemitério",
@@ -678,6 +676,7 @@
     "zoneTitle": "{{zone}} ({{count}})",
     "noCardsIn": "Nenhuma carta em {{zone}}",
     "castFromZone": "Conjurar de {{zone}}: {{name}}",
+    "activateFromZone": "Ativar de {{zone}}: {{name}}",
     "viewCount": "Ver {{count}}",
     "castableCount": "{{zone}} — {{count}} conjuráveis"
   },
@@ -809,7 +808,16 @@
     "defendingPlayerTrample": "Jogador Defensor (Atropelar)",
     "pwControllerTrample": "Controlador do PW (Atropelar Sobre PW)"
   },
+  "cardTextReference": {
+    "title": "Printed card text (reference)",
+    "hint": "Full printed card text. It may differ from current Oracle text or this ability.",
+    "originalAbility": "Original ability text"
+  },
   "stack": {
+    "activatedAbility": "Activated ability",
+    "activatedAbilityNumber": "Activated ability {{number}}",
+    "triggeredAbility": "Triggered ability",
+    "readAbility": "Read ability and printed card text",
     "title": "Pilha",
     "collapsePanel": "Recolher o painel da pilha",
     "expandPanel": "Expandir o painel da pilha",
@@ -864,6 +872,7 @@
     "chooseCreatureToEquip": "Escolha uma criatura para equipar",
     "chooseCreatureTokenToPopulate": "Escolha uma ficha de criatura para popular",
     "chooseReturnAsAuraTarget": "Escolha um permanente para encantar",
+    "chooseTokenHost": "Escolha um hospedeiro para a ficha",
     "tapUntappedCreatures_one": "Vire {{count}} criatura desvirada",
     "tapUntappedCreatures_other": "Vire {{count}} criaturas desviradas",
     "chooseTargetOf": "Escolha o alvo {{current}} de {{total}}",
@@ -897,6 +906,7 @@
     },
     "confirmTap": "Confirmar Virar ({{selected}}/{{count}})",
     "keepCurrentTargets": "Manter Alvos Atuais",
+    "keepCurrentTarget": "Manter Este Alvo",
     "skip": "Pular",
     "opponentChoice": "(à escolha do oponente)",
     "chooseNewTarget": "Escolha o novo alvo da mágica",
@@ -2406,7 +2416,8 @@
     "confirm": "Confirmar",
     "badgeNewTarget": "Novo alvo",
     "slotLabel": "Alvo {{index}}: {{current}} → {{chosen}}",
-    "unselected": "inalterado"
+    "unselected": "inalterado",
+    "keep": "Manter"
   },
   "separatePiles": {
     "chooserName": "Jogador {{number}}",
@@ -2623,8 +2634,8 @@
     "close": "Fechar sobreposição da decisão da IA"
   },
   "status": {
-    "yourPriority": "Your priority",
-    "yourPriorityReason": "Your priority — {{reason}}",
+    "yourPriority": "Sua prioridade",
+    "yourPriorityReason": "Sua prioridade — {{reason}}",
     "waitingFor": "Waiting for <player>{{player}}</player>",
     "waitingForReason": "Waiting for <player>{{player}}</player> — {{reason}}",
     "reason": {
@@ -2668,5 +2679,34 @@
     "reveal_one": "Reveal {{count}} card",
     "reveal_other": "Reveal {{count}} cards",
     "decline": "Don't reveal"
+  },
+  "physicalContest": {
+    "title": {
+      "staring": "Competição de encarar",
+      "breathHolding": "Competição de prender a respiração"
+    },
+    "versus": "{{first}} contra {{second}}",
+    "instructions": "Continue clicando, tocando ou pressionando a barra de espaço pelo máximo de tempo que conseguir. O primeiro jogador que parar por {{seconds}} segundos perde.",
+    "status": {
+      "pending": "Aguardando o início da competição…",
+      "preparing": "Prepare-se…",
+      "go": "JÁ! Continue clicando!",
+      "paused": "Competição pausada enquanto um jogador reconecta…",
+      "spectating": "Assistindo à competição…",
+      "resolving": "Decidindo o resultado…"
+    },
+    "button": {
+      "wait": "Espere o JÁ…",
+      "active": "Continue clicando!"
+    },
+    "you": "Você",
+    "clicks": "{{name}}: {{count}}",
+    "result": {
+      "won": "Você venceu a competição!",
+      "lost": "Você perdeu a competição.",
+      "winner": "{{name}} venceu a competição.",
+      "tie": "Empate: nada acontece.",
+      "cancelled": "A competição foi cancelada: nada acontece."
+    }
   }
 }

@@ -71,13 +71,25 @@ pub struct PreparedState;
 
 /// CR 702.103b: Bestow form marker — `Some(_)` while this object has the
 /// type-changing effect that turns it into an Aura with "enchant creature".
-/// Parallels `PreparedState` — empty struct in `Option` instead of bare `bool`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct BestowFormState;
+/// Parallels `PreparedState` — a typed struct in `Option` instead of bare `bool`.
+///
+/// CR 205.1a: a bestowed Aura is not a creature, so the creature types of its
+/// printed face are removed while it is bestowed. The form rewrites
+/// `base_card_types` directly (the stack is not layered), so the removed
+/// subtypes are recorded here and restored by `revert_bestow_aura_form` when
+/// the object ceases to be bestowed (CR 702.103e-g). Like `CleaveFormState`,
+/// the payload captures what the revert must restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BestowFormState {
+    /// The creature-set subtypes removed from `base_card_types` by the form,
+    /// in printed order. Empty for a legacy marker and for a face with none.
+    #[serde(default)]
+    pub removed_creature_subtypes: Vec<String>,
+}
 
 /// CR 702.140a-c: Mutate form marker — `Some(_)` while this object is a
 /// mutating creature spell on the stack (cast for its mutate cost). Parallels
-/// `BestowFormState`: an empty typed marker (not a bool) set when the mutate
+/// `PreparedState`: an empty typed marker (not a bool) set when the mutate
 /// cost is paid (`apply_mutate_form`) and cleared by `revert_mutate_form` when
 /// the spell's target is illegal at resolution (CR 702.140b) so the spell
 /// resolves as a plain creature spell. It does NOT persist onto the merged
@@ -94,7 +106,7 @@ pub struct MutateFormState;
 ///
 /// This adapter must not be used for markers that carry payload. Adding payload
 /// requires a deliberately versioned wire representation rather than silently
-/// discarding it behind this presence bit.
+/// discarding it behind this presence bit (see `bestow_form_serde`).
 mod unit_marker_option_serde {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -114,6 +126,59 @@ mod unit_marker_option_serde {
             Some(true) | None => Ok(Some(T::default())),
             Some(false) => Ok(None),
         }
+    }
+}
+
+/// Serde adapter for `GameObject::bestow_form`, the one marker with payload.
+///
+/// Wire shapes: `Some` with an empty payload is the legacy-canonical bool `true`
+/// (so states saved before the payload existed, and payload-free forms, are
+/// unchanged); `Some` with a non-empty payload is the struct object. On read,
+/// `null` / `true` restore an empty payload (a legacy marker: the old engine
+/// never removed creature subtypes, so there is nothing to restore), `false`
+/// restores `None`, and an object restores its payload.
+mod bestow_form_serde {
+    use super::BestowFormState;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    #[serde(untagged)]
+    enum WireOut<'a> {
+        Flag(bool),
+        Payload(&'a BestowFormState),
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum WireIn {
+        Flag(Option<bool>),
+        Payload(BestowFormState),
+    }
+
+    pub(super) fn serialize<S>(
+        value: &Option<BestowFormState>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(form) if !form.removed_creature_subtypes.is_empty() => {
+                WireOut::Payload(form).serialize(serializer)
+            }
+            other => WireOut::Flag(other.is_some()).serialize(serializer),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<BestowFormState>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match WireIn::deserialize(deserializer)? {
+            WireIn::Flag(Some(false)) => None,
+            WireIn::Flag(Some(true) | None) => Some(BestowFormState::default()),
+            WireIn::Payload(form) => Some(form),
+        })
     }
 }
 
@@ -154,14 +219,12 @@ pub struct SignatureSpellState {}
 /// cleave text-changing effect is live (the spell was cast for its cleave cost
 /// and the bracket-removed ability set is currently installed on the object).
 ///
-/// Unlike `BestowFormState` (an empty marker whose revert is formulaic — re-add
-/// Creature, drop the synthesized Aura subtype/keyword), a cleave revert cannot
-/// be recomputed: the text-changing effect swaps in a separately parsed ability
-/// set, so restoring the printed form requires the captured snapshot of the four
-/// ability classes as they were before the swap. This struct carries that
-/// snapshot so `apply_zone_exit_cleanup` can restore it when the spell leaves
-/// the stack (CR 702.148a: the abilities function only while the spell is on the
-/// stack). Parallels `BestowFormState` — a typed `Option` marker, never a bool.
+/// A cleave revert restores the captured snapshot of the four ability classes
+/// as they were before the text-changing effect installed a separately parsed
+/// ability set. This struct carries that snapshot so `apply_zone_exit_cleanup`
+/// can restore it when the spell leaves the stack (CR 702.148a: the abilities
+/// function only while the spell is on the stack). Like `BestowFormState`, it
+/// stores the restoration payload in a typed `Option`, never a bool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleaveFormState {
     pub abilities: Arc<Vec<AbilityDefinition>>,
@@ -216,7 +279,7 @@ pub enum PhaseOutCause {
 
 /// Stored back-face data for double-faced cards (DFCs).
 /// Populated when a Transform-layout card enters the game.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackFaceData {
     pub name: String,
     pub power: Option<i32>,
@@ -1151,7 +1214,7 @@ pub struct GameObject {
     /// CR 702.103e–g (illegal target, unattach, zone exit).
     #[serde(
         default,
-        with = "unit_marker_option_serde",
+        with = "bestow_form_serde",
         skip_serializing_if = "Option::is_none"
     )]
     pub bestow_form: Option<BestowFormState>,
@@ -1436,6 +1499,10 @@ pub struct GameObject {
     /// CR 722.3c: Back-link carried only by the prepare-spell copy created in
     /// exile when a permanent becomes prepared. This lets the Prepare authority
     /// retain, cast, and clean up that exact copy without name/card-id guesses.
+    /// CR 722.3d: the marker also survives the cast onto the stack and is
+    /// inherited by spell copies, so on a Stack-zone object it marks a spell
+    /// cast as a prepare spell (or a copy of one); `FilterProp::PrepareSpell`
+    /// reads it there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_copy_source: Option<ObjectId>,
 
@@ -1482,6 +1549,15 @@ pub struct GameObject {
     /// prefers it over the object's own printed halves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copied_room_halves: Option<crate::types::ability::RoomCopiableHalves>,
+
+    /// CR 722.2b + CR 707.2 + CR 613.1a: the prepare spell the winning Layer-1a
+    /// copy effect carried (`CopiableValues::prepare_face`). Layer-derived: set
+    /// by `apply_copiable_values`, cleared by the Step-1 seed so it expires with
+    /// the copy effect. Read only through
+    /// `printed_cards::effective_prepare_face`, which prefers it over the
+    /// object's own stored `back_face` while a copy effect applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_prepare_face: Option<Arc<BackFaceData>>,
 
     /// CR 707.9b: where the LAST Layer-1 copy naming of this object came
     /// from this pass — `None` when no copy effect named it. An `Exception`
@@ -1531,6 +1607,13 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_occurrence: Option<CastOccurrence>,
 
+    /// CR 601.2a + CR 400.7: this spell's identity while it is announced and on
+    /// the stack (`GameState::mint_spell_announcement`). Survives the
+    /// origin→stack move at finalization; cleared on stack exit and on a
+    /// cancelled cast (CR 733.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spell_announcement: Option<crate::types::game_state::SpellAnnouncement>,
+
     /// CR 601.2a + CR 603.4: Transient field tracking the player who cast the
     /// spell that became this permanent. Paired with `cast_from_zone` for
     /// intervening-if clauses such as "if you cast it from your graveyard".
@@ -1551,12 +1634,13 @@ pub struct GameObject {
 
     /// CR 614.1a + CR 608.2n + CR 607.2b + CR 406.6: While present, this spell
     /// is exiled instead of being put into its owner's graveyard as it resolves,
-    /// and the resulting exile is recorded as "exiled with" the stored source.
+    /// and the resulting exile is recorded as "exiled with" the stored source
+    /// incarnation, the object whose ability stamped the rider (CR 400.7).
     /// Set by `Effect::ExileResolvingSpellInsteadOfGraveyard` (Rod of
     /// Absorption's "exile it instead of putting it into a graveyard as it
     /// resolves" rider); consumed by the stack-resolution router.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exile_from_stack_linked_source: Option<ObjectId>,
+    pub exile_from_stack_linked_source: Option<ObjectIncarnationRef>,
 
     /// CR 603.7a + CR 614.1a + CR 702.170c: While set alongside the
     /// exile-instead rider, the stack-resolution router applies the "If you do,
@@ -1663,7 +1747,7 @@ pub struct GameObject {
 }
 
 /// CR 104.4b compile-time totality guard for `objects_content_eq`/`object_content_eq`
-/// (types/game_state.rs) — the §5.2c 137-field partition. `GameObject` deliberately
+/// (types/game_state.rs). `GameObject` deliberately
 /// does NOT derive `PartialEq` (constant-depth loop detection must omit `timestamp`
 /// / `incarnation`), so the row comparator is hand-rolled and needs this no-`..`
 /// destructure: adding a field breaks the build until it is classified into a
@@ -1830,6 +1914,7 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         case_state: _,
         room_unlocks: _,
         copied_room_halves: _,
+        copied_prepare_face: _,
         layer1_name_origin: _,
         granted_abilities_from: _,
         layer1_copy_effect: _,
@@ -1839,6 +1924,8 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         // COMPARED: finalized-cast provenance can affect resolution semantics while
         // this object remains a spell on the stack (types/game_state.rs).
         cast_occurrence: _,
+        // COMPARED: which spell on the stack this object is (CR 601.2a).
+        spell_announcement: _,
         cast_controller: _,
         cast_spell_keywords: _,
         exile_from_stack_linked_source: _,
@@ -2179,7 +2266,9 @@ impl GameObject {
         modification: &crate::types::ability::PerpetualModification,
         all_creature_types: &[String],
     ) {
-        use crate::types::ability::{PerpetualGrantModification, PerpetualModification};
+        use crate::types::ability::{
+            PerpetualGrantModification, PerpetualModification, QuantityExpr,
+        };
         use crate::types::card_type::CoreType;
         match modification {
             PerpetualModification::SetBasePowerToughness { power, toughness } => {
@@ -2192,9 +2281,31 @@ impl GameObject {
                 self.layer_base_toughness = Some(*toughness);
             }
             PerpetualModification::ModifyPowerToughness {
-                power_delta,
-                toughness_delta,
+                power,
+                toughness,
+                keywords,
             } => {
+                // Digital-only Alchemy (no CR entry): live (non-`Fixed`)
+                // exprs cannot be installed — this installer has no game
+                // state to evaluate against. `effects/perpetual.rs` (the
+                // single caller) freezes exprs to `Fixed` first. A live
+                // expr reaching here is a bug: refuse to install AND refuse
+                // to record (the post-match `perpetual_mods` push must never
+                // persist an uninstalled mod — cf. the `GrantAbility`
+                // wildcard note below).
+                let (
+                    QuantityExpr::Fixed { value: power_delta },
+                    QuantityExpr::Fixed {
+                        value: toughness_delta,
+                    },
+                ) = (power, toughness)
+                else {
+                    debug_assert!(
+                        false,
+                        "live P/T exprs must be frozen by effects/perpetual.rs"
+                    );
+                    return;
+                };
                 let base_power = self
                     .base_power
                     .or(self.power)
@@ -2209,6 +2320,16 @@ impl GameObject {
                 self.base_toughness = Some(base_toughness);
                 self.layer_base_power = Some(base_power);
                 self.layer_base_toughness = Some(base_toughness);
+                // Mixed "perpetually gets +N/+M and gains [keywords]" (Jaheira):
+                // same live+base grant as the standalone GrantKeywords arm.
+                for keyword in keywords {
+                    if !self.keywords.contains(keyword) {
+                        self.keywords.push(keyword.clone());
+                    }
+                    if !self.base_keywords.contains(keyword) {
+                        self.base_keywords.push(keyword.clone());
+                    }
+                }
             }
             PerpetualModification::GrantKeywords { keywords } => {
                 for keyword in keywords {
@@ -2777,6 +2898,10 @@ impl GameObject {
             mana_value: self.effective_mana_value(),
             controller: self.controller,
             owner: self.owner,
+            arrival: crate::types::game_state::ArrivalIdentity {
+                owner: self.owner,
+                controller: self.controller,
+            },
             from_zone: from,
             cast_from_zone: self.cast_from_zone,
             played_from_zone: self.played_from_zone,
@@ -3051,6 +3176,7 @@ impl GameObject {
             case_state: None,
             room_unlocks: None,
             copied_room_halves: None,
+            copied_prepare_face: None,
             layer1_name_origin: None,
             granted_abilities_from: None,
             layer1_copy_effect: None,
@@ -3058,6 +3184,7 @@ impl GameObject {
             class_level: None,
             cast_from_zone: None,
             cast_occurrence: None,
+            spell_announcement: None,
             cast_controller: None,
             cast_spell_keywords: Vec::new(),
             exile_from_stack_linked_source: None,
@@ -3130,6 +3257,7 @@ impl GameObject {
     pub fn snapshot_for_attack_declaration(&self, object_id: ObjectId) -> AttackDeclarationRecord {
         AttackDeclarationRecord {
             object_id,
+            incarnation: Some(self.incarnation),
             lki: self.snapshot_public_characteristics(),
             is_token: self.is_token,
             is_commander: self.is_commander,
@@ -3386,6 +3514,7 @@ impl GameObject {
         self.abilities = Arc::clone(&self.base_abilities);
         self.granted_abilities_from = None;
         self.layer1_copy_effect = None;
+        self.copied_prepare_face = None;
         self.materialize_base_trigger_definitions();
         self.replacement_definitions = Arc::clone(&self.base_replacement_definitions).into();
         self.static_definitions = Arc::clone(&self.base_static_definitions).into();
@@ -3565,6 +3694,18 @@ impl GameObject {
         self.mana_spent_to_cast_amount = 0;
         self.phyrexian_life_paid = 0;
         self.mana_spent_source_snapshots.clear();
+    }
+
+    /// True when at least one cast-payment stamp holds a non-default value,
+    /// i.e. exactly when [`Self::clear_cast_payment_stamps`] would change this
+    /// object. Sweeps use it to skip objects the clear would not touch; the
+    /// two functions must name the same fields.
+    pub fn has_cast_payment_stamps(&self) -> bool {
+        self.mana_spent_to_cast
+            || self.colors_spent_to_cast != ColoredManaCount::default()
+            || self.mana_spent_to_cast_amount != 0
+            || self.phyrexian_life_paid != 0
+            || !self.mana_spent_source_snapshots.is_empty()
     }
 
     /// Check if this object has a specific keyword, using discriminant-based matching.
@@ -3907,9 +4048,46 @@ impl GameObject {
         !self.is_token && !self.is_copy
     }
 
-    /// CR 702.66a: Delve may exile only a card from its owner's graveyard.
-    pub fn is_delve_eligible(&self, player: PlayerId) -> bool {
-        self.owner == player && self.zone == Zone::Graveyard && self.is_represented_by_a_card()
+    /// CR 108.2 + CR 109.1: Whether this object belongs to the population of
+    /// "cards" in its current zone — the population that queries such as "the
+    /// number of cards in exile" or "instant cards you own in exile" range
+    /// over. A copy of a card is a different kind of object from a card
+    /// (CR 109.1), and a token is not a card (CR 108.2b).
+    ///
+    /// Zone-aware so mixed-zone enumerations stay correct with one call:
+    /// - `Exile`: only objects represented by a card. CR 722.3c keeps a
+    ///   prepared permanent's copy in exile as an explicit exception to
+    ///   CR 704.5e; that copy is not a card and must not be counted, chosen or
+    ///   moved as one.
+    /// - `Library`, `Hand`, `Graveyard`: every object. CR 704.5d and CR 704.5e
+    ///   make a token or a copy of a card in these zones cease to exist at the
+    ///   next state-based-action check; only exile holds a non-card across SBA
+    ///   checks (the CR 722.3c exception), so only exile is gated here, and a
+    ///   transient non-card in another zone stays in the population.
+    /// - `Battlefield`, `Stack`, `Command`: every object. These zones
+    ///   legitimately hold non-card objects that their populations include —
+    ///   tokens are permanents (CR 110.1, CR 111.1), copies of spells are
+    ///   spells (CR 707.10), and emblems live in the command zone (CR 114.1).
+    ///
+    /// Object-level enumeration (casting the CR 722.3c copy, layers, the
+    /// CR 800.4a leave-the-game sweep) reads every object in the zone and must
+    /// not use this predicate. Exhaustive so a new `Zone` forces a decision.
+    pub fn is_card_population_member(&self) -> bool {
+        match self.zone {
+            Zone::Exile => self.is_represented_by_a_card(),
+            Zone::Library
+            | Zone::Hand
+            | Zone::Graveyard
+            | Zone::Battlefield
+            | Zone::Stack
+            | Zone::Command => true,
+        }
+    }
+
+    /// CR 702.66a: Delve may exile only a card from the graveyard the caster reads.
+    pub fn is_delve_eligible(&self, state: &GameState, player: PlayerId) -> bool {
+        state.object_in_players_zone(self, Zone::Graveyard, player)
+            && self.is_represented_by_a_card()
     }
 
     /// CR 714.2: Every chapter number this Saga's chapter abilities are keyed
@@ -4195,6 +4373,65 @@ mod tests {
             });
     }
 
+    /// `has_cast_payment_stamps` is the exact "would change something"
+    /// predicate of `clear_cast_payment_stamps`: true for each stamp field set
+    /// alone, false on a fresh object and after the clear.
+    #[test]
+    fn has_cast_payment_stamps_tracks_every_field_the_clear_resets() {
+        let fresh = || {
+            GameObject::new(
+                ObjectId(1),
+                CardId(1),
+                PlayerId(0),
+                "Stamped".to_string(),
+                Zone::Stack,
+            )
+        };
+        assert!(!fresh().has_cast_payment_stamps());
+
+        /// Sets one payment stamp on an object.
+        type Stamper = fn(&mut GameObject);
+        let stampers: Vec<(&str, Stamper)> = vec![
+            ("mana_spent_to_cast", |obj| obj.mana_spent_to_cast = true),
+            ("colors_spent_to_cast", |obj| {
+                obj.colors_spent_to_cast
+                    .add(crate::types::mana::ManaColor::Green, 1)
+            }),
+            ("mana_spent_to_cast_amount", |obj| {
+                obj.mana_spent_to_cast_amount = 3
+            }),
+            ("phyrexian_life_paid", |obj| obj.phyrexian_life_paid = 2),
+            ("mana_spent_source_snapshots", |obj| {
+                let lki = obj.snapshot_for_mana_spent();
+                obj.mana_spent_source_snapshots.push(
+                    crate::types::game_state::ManaSpentSourceSnapshot {
+                        source_id: obj.id,
+                        lki,
+                    },
+                );
+            }),
+        ];
+        assert_eq!(stampers.len(), 5);
+        for (field, stamp) in stampers {
+            let mut obj = fresh();
+            stamp(&mut obj);
+            assert!(obj.has_cast_payment_stamps(), "{field} alone must count");
+            obj.clear_cast_payment_stamps();
+            assert!(
+                !obj.has_cast_payment_stamps(),
+                "{field} must be reset by the clear"
+            );
+            assert_cast_payment_stamps_default(&obj, field);
+        }
+
+        let mut all = fresh();
+        stamp_cast_payment(&mut all);
+        assert!(all.has_cast_payment_stamps());
+        all.clear_cast_payment_stamps();
+        assert!(!all.has_cast_payment_stamps());
+    }
+
+    /// Asserts every cast-payment stamp of `obj` holds its default value.
     fn assert_cast_payment_stamps_default(obj: &GameObject, context: &str) {
         assert!(!obj.mana_spent_to_cast, "{context}: bool must be default");
         assert!(
@@ -4228,6 +4465,65 @@ mod tests {
         stamp_cast_payment(&mut obj);
         obj.clear_cast_payment_stamps();
         assert_cast_payment_stamps_default(&obj, "after clear_cast_payment_stamps");
+    }
+
+    /// CR 108.2 + CR 109.1 + CR 722.3c: `is_card_population_member` excludes
+    /// non-card objects (tokens, copies of cards) from the exile card
+    /// population only; every other zone keeps its full population (library,
+    /// hand and graveyard non-cards cease under CR 704.5d/704.5e; battlefield,
+    /// stack and command legitimately hold tokens, spell copies and emblems).
+    #[test]
+    fn exile_card_population_member_truth_table() {
+        let kinds: [(&str, bool, bool); 4] = [
+            ("card", false, false),
+            ("token", true, false),
+            ("copy", false, true),
+            ("token+copy", true, true),
+        ];
+        let zones = [
+            Zone::Library,
+            Zone::Hand,
+            Zone::Battlefield,
+            Zone::Graveyard,
+            Zone::Stack,
+            Zone::Exile,
+            Zone::Command,
+        ];
+        for zone in zones {
+            for (label, is_token, is_copy) in kinds {
+                let mut obj = GameObject::new(
+                    ObjectId(1),
+                    CardId(1),
+                    PlayerId(0),
+                    format!("Population {label}"),
+                    zone,
+                );
+                obj.is_token = is_token;
+                obj.is_copy = is_copy;
+                let is_card = label == "card";
+                // Reach guard: the fixture realizes the intended object kind
+                // through the existing card authority.
+                assert_eq!(
+                    obj.is_represented_by_a_card(),
+                    is_card,
+                    "{label}: fixture must be the intended object kind"
+                );
+                let expected = match zone {
+                    Zone::Exile => is_card,
+                    Zone::Library
+                    | Zone::Hand
+                    | Zone::Graveyard
+                    | Zone::Battlefield
+                    | Zone::Stack
+                    | Zone::Command => true,
+                };
+                assert_eq!(
+                    obj.is_card_population_member(),
+                    expected,
+                    "{label} in {zone:?}"
+                );
+            }
+        }
     }
 
     /// CR 400.7 (issue #5943): `reset_for_battlefield_exit` clears the five

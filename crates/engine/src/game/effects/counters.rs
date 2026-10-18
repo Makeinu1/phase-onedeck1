@@ -3,9 +3,9 @@ use std::collections::HashSet;
 use crate::game::game_object::GameObject;
 use crate::game::replacement::{self, ReplacementResult};
 use crate::types::ability::{
-    AbilityTag, CounterMoveSelection, CounterTransferMode, DelayedTriggerCondition, Duration,
-    Effect, EffectError, EffectKind, EventCounterReproductionCount, QuantityExpr, ResolvedAbility,
-    TargetChoiceTiming, TargetFilter, TargetRef,
+    AbilityTag, CounterMoveSelection, CounterTransferMode, DelayedTriggerCondition,
+    DelayedTriggerKind, Duration, Effect, EffectError, EffectKind, EventCounterReproductionCount,
+    QuantityExpr, ResolvedAbility, TargetChoiceTiming, TargetFilter, TargetRef,
 };
 #[cfg(test)]
 use crate::types::counter::parse_counter_type;
@@ -29,8 +29,16 @@ use crate::types::zones::Zone;
 
 /// CR 306.5c + CR 310.4c: After mutating the counter map, re-derive the
 /// `obj.loyalty` / `obj.defense` field so the counter count and the cached
-/// characteristic stay in lockstep. This is the single site outside
-/// `evaluate_layers` that writes those fields.
+/// characteristic stay in lockstep. Either field is re-derived from the counter
+/// map alone: this function consults no zone, while CR 306.5a / CR 310.4a give
+/// the printed value off the battlefield — the half the `c` subrules do not
+/// speak to.
+///
+/// Regenerate the sites deriving these fields from the counter map with
+/// `grep -rnP '\.(loyalty|defense)\s*=\s*Some\((\s*$|\w*counters)' crates/engine/src`.
+/// They include `apply_card_face_to_object`, which derives both on the
+/// rehydration path and does consult the zone, battlefield-guarding its
+/// re-derivation on the printed-value ground its own annotation gives.
 ///
 /// Other counter types (P1P1, M1M1, Stun, Lore, Generic) don't project into
 /// a dedicated field — their effects flow through layer 7c (P/T) or are
@@ -770,6 +778,7 @@ fn apply_pending_counter_post_action(
                     controller,
                     source_id,
                     one_shot: true,
+                    kind: DelayedTriggerKind::Ordinary,
                     provenance: crate::types::identifiers::DelayedInstallIdentity::LegacyDelayed,
                 };
                 crate::game::triggers::install_delayed_trigger(state, sacrifice_token, events);
@@ -1308,7 +1317,7 @@ pub fn apply_resolved_counter_edit(
         state.layers_dirty.mark_full();
     }
     if let Some(record) = added_record {
-        state.counter_added_this_turn.push(record);
+        state.counter_added_this_turn.push_back(record);
     }
     Ok(())
 }
@@ -2021,12 +2030,8 @@ pub fn resolve_add_all(
         .into_iter()
         .map(|obj_id| {
             let counter_num = if count_uses_recipient {
-                crate::game::quantity::resolve_quantity_with_recipient(
-                    state,
-                    &count,
-                    ability.controller,
-                    ability.source_id,
-                    obj_id,
+                crate::game::quantity::resolve_quantity_with_targets_and_recipient(
+                    state, &count, ability, obj_id,
                 )
                 .max(0) as u32
             } else {
@@ -2342,8 +2347,10 @@ pub(super) fn resolve_defined_or_targets(
     // short-circuit in `targeting::resolved_targets`. Without this, a chained
     // `PutCounter { target: SelfRef }` sub-ability would inherit the parent's
     // targets via chain propagation in `effects::mod.rs::resolve_ability_chain`.
+    // CR 400.7: `self_ref_binding` is empty when the source left and returned
+    // before resolution.
     if let Some(TargetFilter::SelfRef) = target_spec {
-        return vec![ability.source_id];
+        return ability.self_ref_binding(state).into_iter().collect();
     }
 
     // CR 201.5a + CR 400.7: a granter named by a granted body is its stamped incarnation.
@@ -2357,7 +2364,7 @@ pub(super) fn resolve_defined_or_targets(
     // populates the slot for legitimately targeted sub-abilities, which never
     // reach this arm.
     if matches!(target_spec, Some(TargetFilter::None)) && ability.targets.is_empty() {
-        return vec![ability.source_id];
+        return ability.self_ref_binding(state).into_iter().collect();
     }
 
     // CR 608.2c: A `ParentTarget` with no object target slot resolves to the
@@ -2379,7 +2386,7 @@ pub(super) fn resolve_defined_or_targets(
         && !has_object_target
         && has_choice_bookkeeping_player
     {
-        return vec![ability.source_id];
+        return ability.self_ref_binding(state).into_iter().collect();
     }
 
     // CR 508.1 + CR 603.2c + CR 608.2c (issue #5949): A batched attack trigger's
@@ -2892,7 +2899,7 @@ fn resolve_counter_transfer_sources(
     source_filter: &TargetFilter,
 ) -> Vec<ObjectId> {
     if matches!(source_filter, TargetFilter::SelfRef | TargetFilter::None) {
-        return vec![ability.source_id];
+        return ability.self_ref_binding(state).into_iter().collect();
     }
 
     if let Some(TargetRef::Object(id)) = crate::game::targeting::resolve_event_context_target(
@@ -2921,7 +2928,7 @@ fn resolve_counter_transfer_destinations(
     target_filter: &TargetFilter,
 ) -> Vec<ObjectId> {
     if matches!(target_filter, TargetFilter::SelfRef | TargetFilter::None) {
-        return vec![ability.source_id];
+        return ability.self_ref_binding(state).into_iter().collect();
     }
 
     if matches!(target_filter, TargetFilter::LastCreated) {
