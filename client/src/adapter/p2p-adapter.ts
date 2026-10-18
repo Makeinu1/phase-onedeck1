@@ -4846,7 +4846,11 @@ export class P2PHostAdapter implements EngineAdapter {
     if (this.eliminatedSeats.has(pid)) return "inactive";
     const retryingUncertain = this.uncertainConcedeSeats.has(pid);
     if (this.concedingSeats.has(pid) && !retryingUncertain) return "in_progress";
-    if (!this.concedingSeats.has(pid)) this.concedingSeats.add(pid);
+    // Consume the single retry permit before the first await, so an overlapping
+    // departure request sees the fence as in progress. Only an outcome that
+    // stays unknown restores it.
+    this.uncertainConcedeSeats.delete(pid);
+    this.concedingSeats.add(pid);
     const retire = () => {
       // Cancel any active grace timer for this seat. `timer` may be null if the
       // host already called `holdForReconnect`.
@@ -4966,7 +4970,6 @@ export class P2PHostAdapter implements EngineAdapter {
         // This invocation is a later explicit host/player departure request.
         // The fresh Full barrier proved the earlier Action did not commit, so
         // it is now safe to submit this new Concede once.
-        this.uncertainConcedeSeats.delete(pid);
       }
       const concedeAction = {
         type: "Concede",

@@ -1576,6 +1576,68 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     adapter.dispose();
   });
 
+  describe("overlapping departure requests after an unknown WASM Concede", () => {
+    async function hostWithUncertainConcede() {
+      const { adapter } = makeHost(2);
+      const events: P2PAdapterEvent[] = [];
+      adapter.onEvent((event) => events.push(event));
+      await adapter.initialize();
+      events.length = 0;
+      mockSubmitAction.mockRejectedValueOnce(new Error("response lost after send"));
+      mockGetState.mockRejectedValueOnce(new Error("snapshot unavailable"));
+      const host = adapter as unknown as {
+        uncertainConcedeSeats: Set<number>;
+        concedingSeats: Set<number>;
+        eliminatedSeats: Set<number>;
+      };
+      await adapter.concedeDisconnected(1);
+      expect(host.uncertainConcedeSeats.has(1)).toBe(true);
+      expect(mockSubmitAction).toHaveBeenCalledOnce();
+      return { adapter, events, host };
+    }
+
+    it("retires once when both reconciliations would prove the Concede committed", async () => {
+      const { adapter, events, host } = await hostWithUncertainConcede();
+      const committed = { ...remoteState("WASM Concede committed"), eliminated_players: [1] } as GameState;
+      const snapshot = deferred<GameState>();
+      mockGetState.mockResolvedValue(committed);
+      mockGetState.mockResolvedValueOnce(snapshot.promise);
+
+      const first = adapter.concedeDisconnected(1);
+      const second = adapter.concedeDisconnected(1);
+      await flushPromises();
+      expect(host.uncertainConcedeSeats.has(1)).toBe(false);
+      snapshot.resolve(committed);
+      await Promise.all([first, second]);
+
+      expect(mockSubmitAction).toHaveBeenCalledOnce();
+      expect(host.eliminatedSeats.has(1)).toBe(true);
+      expect(host.concedingSeats.has(1)).toBe(false);
+      expect(events.filter((event) => event.type === "playerConceded" && event.playerId === 1)).toHaveLength(1);
+      adapter.dispose();
+    });
+
+    it("submits one new Concede when both reconciliations would prove non-commit", async () => {
+      const { adapter, events, host } = await hostWithUncertainConcede();
+      const live = remoteState("WASM Concede did not commit");
+      const snapshot = deferred<GameState>();
+      mockGetState.mockResolvedValue(live);
+      mockGetState.mockResolvedValueOnce(snapshot.promise);
+
+      const first = adapter.concedeDisconnected(1);
+      const second = adapter.concedeDisconnected(1);
+      await flushPromises();
+      snapshot.resolve(live);
+      await Promise.all([first, second]);
+
+      expect(mockSubmitAction).toHaveBeenCalledTimes(2);
+      expect(host.eliminatedSeats.has(1)).toBe(true);
+      expect(host.uncertainConcedeSeats.has(1)).toBe(false);
+      expect(events.filter((event) => event.type === "playerConceded" && event.playerId === 1)).toHaveLength(1);
+      adapter.dispose();
+    });
+  });
+
   it("waits for recipient terminal authority before consuming a reconnect GameOver snapshot", async () => {
     nativeWebSocketMocks.waitForPlayerSlots.mockResolvedValue([]);
     nativeWebSocketMocks.initializePregame
