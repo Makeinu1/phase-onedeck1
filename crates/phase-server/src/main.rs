@@ -19231,7 +19231,7 @@ mod game_submission_tests {
         let result = tokio::time::timeout(Duration::from_secs(10), async {
             let mut socket_a = connect_and_hello(url.clone()).await;
             let (game_code, player_token, full_key) =
-                create_started_ai_game(&mut socket_a, None).await;
+                create_started_ai_game(&mut socket_a, None, DeckData::default(), None).await;
             let before_revision = app_state
                 .sessions
                 .lock()
