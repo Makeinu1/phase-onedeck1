@@ -41,6 +41,7 @@ use super::lower::{
     attach_cast_cost_modifier_to_prior_cast_from_zone,
     attach_graveyard_redirect_rider_to_prior_cast_from_zone,
     attach_graveyard_redirect_rider_to_prior_free_cast_from_zones,
+    attach_graveyard_redirect_rider_to_prior_graveyard_cast_grant,
     attach_land_enters_tapped_to_previous_play_from_exile, cast_cost_modifier_rider,
     chain_references_chosen_card, clone_would_transplant_gated_referent,
     consolidate_die_and_coin_defs, definition_targets_self_source,
@@ -59,13 +60,13 @@ use super::lower::{
     parse_same_zone_owner_target_constraint, parse_total_mana_value_target_constraint,
     patch_choose_from_zone_counter_continuation_target, patch_population_head_tap_anaphor,
     patch_self_ref_head_tap_anaphor, rebind_zone_changed_this_way_pronoun_to_moved_object,
-    relink_gated_token_referent_consumers, resolve_populated_token_anaphors,
-    resolve_populated_unsuspect_anaphors, resolve_those_tokens_anaphors,
-    rewire_result_anchored_subchain, rewrite_counter_instead_target_from_antecedent,
-    rewrite_else_event_context_to_stable, rewrite_else_parent_target_to_self_ref,
-    rewrite_player_anaphor_targets_in_definition, rewrite_those_tokens_from_antecedent,
-    rewrite_two_target_counter_chain, target_choice_timing_for_clause,
-    thread_chosen_damage_source_into_oneshot_effects,
+    relink_gated_token_referent_consumers, relink_gated_tracked_set_consumers,
+    resolve_populated_token_anaphors, resolve_populated_unsuspect_anaphors,
+    resolve_those_tokens_anaphors, rewire_result_anchored_subchain,
+    rewrite_counter_instead_target_from_antecedent, rewrite_else_event_context_to_stable,
+    rewrite_else_parent_target_to_self_ref, rewrite_player_anaphor_targets_in_definition,
+    rewrite_those_tokens_from_antecedent, rewrite_two_target_counter_chain,
+    target_choice_timing_for_clause, thread_chosen_damage_source_into_oneshot_effects,
 };
 use super::sequence::{apply_clause_continuation, def_bears_retargetable_copy};
 use super::{
@@ -79,8 +80,8 @@ use super::{
     def_is_keyword_counter_placement, def_is_perpetual_keyword_grant,
     demote_unbindable_batch_aggregate, draw_object_count_filter, fold_cast_copy_of_card_defs,
     has_explicit_player_target, inject_chosen_color_choice_grant,
-    inject_printed_color_choice_filter, mark_uses_tracked_set, nearest_publisher_is_self_move,
-    parse_spell_graveyard_replacement_rider,
+    inject_printed_color_choice_filter, intrinsic_continuation_effect, mark_uses_tracked_set,
+    nearest_publisher_is_self_move, parse_spell_graveyard_replacement_rider,
     parse_spells_cast_this_way_graveyard_replacement_rider, plural_library_shuffle_recall,
     publishes_aggregate_set_from_resolution, publishes_exiled_cause_at_resolution,
     publishes_tracked_set_from_resolution, rebind_tracked_aggregate_to_chain_set,
@@ -364,10 +365,11 @@ impl Arena {
         self.order.get(index).copied()
     }
 
-    /// Every top-level id EXCEPT the first. `Instead` nests defs `1..N` into the root
-    /// (`defs[0]`) and must name it as their parent, so it needs exactly this set.
-    fn tail_ids(&self) -> Vec<NodeId> {
-        self.order.iter().skip(1).copied().collect()
+    /// Every top-level id AFTER position `index`. `Instead` nests the defs that follow
+    /// its base (`defs[index]`) into that base and must name it as their parent, so
+    /// it needs exactly this set.
+    fn ids_after(&self, index: usize) -> Vec<NodeId> {
+        self.order.iter().skip(index + 1).copied().collect()
     }
 
     /// Provenance of the node currently at top-level `index` — the SINGLE store.
@@ -1757,7 +1759,7 @@ fn subject_anchored_optional_actor(
             | TargetFilter::ControllerAndControlledPermanents { .. }
             | TargetFilter::Opponent
             | TargetFilter::SelfRef
-            | TargetFilter::GrantingObject
+            | TargetFilter::GrantingObject { .. }
             | TargetFilter::SourceOrPaired
             | TargetFilter::Typed(_)
             | TargetFilter::Not { .. }
@@ -1892,7 +1894,7 @@ fn subject_anchored_optional_actor(
             TargetFilter::None
             | TargetFilter::Any
             | TargetFilter::SelfRef
-            | TargetFilter::GrantingObject
+            | TargetFilter::GrantingObject { .. }
             | TargetFilter::SourceOrPaired
             | TargetFilter::Typed(_)
             | TargetFilter::StackAbility { .. }
@@ -2474,20 +2476,33 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                             OnMiss::Ignore,
                         );
                         if bound.is_some() {
-                            // Identity: the root is MOVED out of `defs` and back in —
+                            // CR 614.15 + CR 608.2c: an override whose body restates the
+                            // preceding damage ("deals double that damage instead") replaces
+                            // THAT damage instruction, not the chain's first one — the
+                            // instructions before it (Goblin Charbelcher's reveal) are
+                            // performed regardless and supply the quantity it reads.
+                            let base_index =
+                                instead_damage_antecedent_index(&env, &defs, instead_def);
+                            // Identity: the base is MOVED out of `defs` and back in —
                             // it keeps its NodeId (U6-C2 ruling). Capture before the take.
-                            // The TAIL defs (1..N) are nested into the root below, so
-                            // capture their ids too and name the root as their parent —
+                            // The TAIL defs (after the base) are nested into it below, so
+                            // capture their ids too and name the base as their parent —
                             // `settle` no longer infers one.
-                            let root_id = env.arena.id_at(0);
-                            let tail_ids = env.arena.tail_ids();
-                            let mut chain_defs = std::mem::take(&mut defs);
+                            let root_id = env.arena.id_at(base_index);
+                            let tail_ids = env.arena.ids_after(base_index);
+                            let mut chain_defs = defs.split_off(base_index);
                             env.observe(&defs, None, NodeRole::Unknown);
                             let mut root = chain_defs.remove(0);
                             for next in chain_defs {
                                 append_to_deepest_sub_ability(&mut root, Some(Box::new(next)));
                             }
                             let mut instead = *instead_def.clone();
+                            if base_index > 0 {
+                                rebind_damage_anaphor_to_antecedent(
+                                    &mut instead.effect,
+                                    intrinsic_continuation_effect(&root),
+                                );
+                            }
                             if instead_replaces_optional_payment_continuation(&root) {
                                 // CR 608.2c: after "you may pay ... If you do, X",
                                 // a later "Y instead" modifies X, not the preceding
@@ -2689,6 +2704,10 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 .unwrap_or_default()
                 .to_lowercase(),
         ) {
+            if attach_graveyard_redirect_rider_to_prior_graveyard_cast_grant(&mut defs, &dest) {
+                prev_boundary = clause_ir.boundary;
+                continue;
+            }
             if attach_graveyard_redirect_rider_to_prior_free_cast_from_zones(
                 &mut defs,
                 dest.clone(),
@@ -2788,6 +2807,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
             .declares_chosen_clause
             .map(|id| ChosenGroupId(id.0));
         def.reads_chosen_group = clause_ir.reads_chosen_clause.map(|id| ChosenGroupId(id.0));
+        def.target_reads = clause_ir.target_reads;
         if ir.clauses.iter().any(|reader| {
             reader
                 .reads_return_result
@@ -3983,6 +4003,10 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // referent it looks for.
     relink_gated_token_referent_consumers(&mut defs);
 
+    // CR 608.2c + CR 609.3: the same rule for a gated zone choice's tracked set
+    // ("If …, for each opponent, choose …. Destroy the chosen permanents.").
+    relink_gated_tracked_set_consumers(&mut defs);
+
     // CR 707.12: "Copy [a card]. You may cast the copy ..." is not a stack
     // copy (CR 707.10). It creates a card copy in the source zone, then casts
     // that copy during resolution. Fold the two parsed imperative clauses into
@@ -4558,6 +4582,70 @@ fn rebind_condition_instead_damage_anaphor(
 /// CR 608.2c: identify the structural "you may pay ... If you do, X" form
 /// whose immediate paid continuation, rather than the payment itself, can be
 /// modified by a following "Y instead" clause.
+/// The `defs` index an "instead" override binds to as the instruction it replaces.
+///
+/// Default is the first emitted def (`FirstEmitted` — CR 608.2c: the override
+/// replaces the first printed instruction). An override whose body is the
+/// "that damage" anaphor — `DealDamage` over a multiple of the event-context
+/// amount ("deals double that damage instead") — names the DAMAGE instruction
+/// it restates, so it binds to the nearest preceding `DamageDealer` instead.
+/// Falls back to the first def when no later damage instruction exists.
+fn instead_damage_antecedent_index(
+    env: &AssemblyEnv,
+    defs: &[AbilityDefinition],
+    instead_def: &AbilityDefinition,
+) -> usize {
+    let restates_damage = matches!(
+        instead_def.effect.as_ref(),
+        Effect::DealDamage {
+            amount: QuantityExpr::Multiply { inner, .. },
+            ..
+        } if matches!(
+            inner.as_ref(),
+            QuantityExpr::Ref { qty: QuantityRef::EventContextAmount }
+        )
+    );
+    if !restates_damage {
+        return 0;
+    }
+    env.resolve(
+        defs,
+        AntecedentSelector::LastWithRole(AntecedentRole::DamageDealer),
+        None,
+        OnMiss::Ignore,
+    )
+    .unwrap_or(0)
+}
+
+/// CR 608.2c + CR 614.6: resolve the "that damage" anaphor of an "instead"
+/// override against the damage instruction it replaces. The replaced
+/// instruction never runs when the override applies, so the event-context
+/// amount has no value to read; the override's multiple is taken over the
+/// replaced instruction's own amount expression instead.
+fn rebind_damage_anaphor_to_antecedent(instead: &mut Effect, antecedent: &Effect) {
+    let (
+        Effect::DealDamage {
+            amount: QuantityExpr::Multiply { inner, .. },
+            ..
+        },
+        Effect::DealDamage {
+            amount: antecedent_amount,
+            ..
+        },
+    ) = (instead, antecedent)
+    else {
+        return;
+    };
+    if matches!(
+        inner.as_ref(),
+        QuantityExpr::Ref {
+            qty: QuantityRef::EventContextAmount
+        }
+    ) {
+        **inner = antecedent_amount.clone();
+    }
+}
+
 fn instead_replaces_optional_payment_continuation(root: &AbilityDefinition) -> bool {
     matches!(root.effect.as_ref(), Effect::PayCost { .. })
         && root.sub_ability.as_ref().is_some_and(|continuation| {

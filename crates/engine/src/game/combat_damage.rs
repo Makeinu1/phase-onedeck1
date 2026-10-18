@@ -2484,6 +2484,7 @@ mod tests {
                 condition: None,
                 duration_subject: None,
                 end_permission: None,
+                granting_object: None,
                 duration_event_source: None,
                 source_name: String::new(),
             });
@@ -4475,6 +4476,7 @@ mod tests {
                 amount: PreventionAmount::All,
                 amount_dynamic: None,
                 target: TargetFilter::Controller,
+                recipient_scope: crate::types::ability::EffectScope::Single,
                 scope: PreventionScope::CombatDamage,
                 damage_source_filter: None,
                 prevention_duration: None,

@@ -8,8 +8,9 @@ use crate::types::mana::ManaCost;
 use crate::types::player::PlayerId;
 
 use super::ability_utils::{
-    assign_targets_in_chain, auto_select_targets_for_ability, begin_target_selection_for_ability,
-    build_target_slots, declared_targets_in_chain, random_select_targets_for_ability,
+    assign_selected_slots_in_chain, auto_select_targets_for_ability,
+    begin_target_selection_for_ability, build_target_slots, declared_targets_in_chain,
+    random_select_targets_for_ability,
 };
 use super::casting::emit_targeting_events;
 use super::engine::EngineError;
@@ -17,29 +18,6 @@ use super::priority;
 use super::stack;
 
 use crate::types::ability::ResolvedAbility;
-use crate::types::events::ActivatedAbilityKind;
-
-/// CR 602.2 + CR 606.2: Classify an activated ability as `Loyalty` or `Normal`
-/// by inspecting the source object's ability definition at `ability_index`. A
-/// loyalty ability (CR 606.1) is one whose cost adds or removes loyalty counters.
-/// Used to populate `GameEvent::AbilityActivated { kind, .. }` at the activation
-/// sites that know the source object and ability index. Returns `Normal` when the
-/// object or ability cannot be found, or when the cost is not a loyalty cost.
-pub(crate) fn activated_ability_kind(
-    state: &GameState,
-    source_id: ObjectId,
-    ability_index: usize,
-) -> ActivatedAbilityKind {
-    state
-        .objects
-        .get(&source_id)
-        .and_then(|o| o.abilities.get(ability_index))
-        .and_then(|a| a.cost.as_ref())
-        .filter(|c| crate::types::ability::is_loyalty_ability_cost(c))
-        .map_or(ActivatedAbilityKind::Normal, |_| {
-            ActivatedAbilityKind::Loyalty
-        })
-}
 
 /// CR 306.5d + CR 606.3: Loyalty abilities may only be activated once per turn.
 /// CR 606.1: Loyalty abilities are activated abilities with a loyalty symbol in their cost.
@@ -289,7 +267,7 @@ pub fn handle_activate_loyalty(
 
         if let Some(targets) = resolved_targets {
             let mut resolved = resolved;
-            assign_targets_in_chain(state, &mut resolved, &targets)?;
+            assign_selected_slots_in_chain(state, &mut resolved, &targets)?;
             // CR 601.2c: the automatically chosen targets, captured before the
             // loyalty cost is paid.
             let captured = super::casting::capture_activation_record(
@@ -921,7 +899,7 @@ mod tests {
     /// `RemoveCounter { X loyalty counters }`, which `is_loyalty_ability_cost`
     /// recognizes. The X-cost path clears `pending.activation_cost` before the
     /// targeted finalize (casting_costs.rs), so the kind MUST be derived from the
-    /// stable printed cost via `activated_ability_kind` — reading the cleared
+    /// stable printed cost via `ActivatedAbilityKind::of_definition` — reading the cleared
     /// `pending.activation_cost` would mis-classify it `Normal` and the
     /// "whenever you activate a loyalty ability" trigger would miss this subclass.
     #[test]
@@ -938,7 +916,9 @@ mod tests {
             })],
         );
         assert_eq!(
-            activated_ability_kind(&state, pw, 0),
+            crate::types::events::ActivatedAbilityKind::of_definition(
+                &state.objects[&pw].abilities[0]
+            ),
             crate::types::events::ActivatedAbilityKind::Loyalty,
             "a [-X] loyalty ability's printed cost must classify as Loyalty"
         );
@@ -958,7 +938,9 @@ mod tests {
             )],
         );
         assert_eq!(
-            activated_ability_kind(&state, normal_pw, 0),
+            crate::types::events::ActivatedAbilityKind::of_definition(
+                &state.objects[&normal_pw].abilities[0]
+            ),
             crate::types::events::ActivatedAbilityKind::Normal,
         );
     }

@@ -68,6 +68,8 @@ const {
     displayName: "Host",
     setActivePlayerId: vi.fn(),
     takeActiveP2PHost,
+    openBroker: vi.fn(),
+    closeBroker: vi.fn(),
   };
 
   return {
@@ -78,6 +80,7 @@ const {
       peer: { id: "fresh-peer", destroy: vi.fn() },
       roomCode: "ABCDE",
       onGuestConnected: vi.fn(() => () => {}),
+      destroy: vi.fn(),
     })),
     loadGame: vi.fn(),
     loadP2PHostSession: vi.fn(),
@@ -558,6 +561,57 @@ describe("GameProvider P2P host lifecycle", () => {
     expect(adapters).toHaveLength(0);
     expect(hostRoom).not.toHaveBeenCalled();
     expect(ensureNativeEngine).not.toHaveBeenCalled();
+  });
+
+  describe("broker bring-up abort", () => {
+    function fakeBroker() {
+      return { unregister: vi.fn(async () => undefined), close: vi.fn() };
+    }
+    const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+
+    beforeEach(() => {
+      takeActiveP2PHost.mockReturnValue(null);
+      loadGame.mockResolvedValue(null);
+      loadP2PHostSession.mockResolvedValue(null);
+    });
+
+    it("hands openBroker the mount's signal, aborted by unmount", async () => {
+      let release!: (v: unknown) => void;
+      multiplayerStore.openBroker.mockImplementationOnce(() => new Promise((r) => { release = r; }));
+      const m = render(<GameProvider gameId="g" mode="p2p-host" useBroker><div /></GameProvider>);
+      await waitFor(() => expect(multiplayerStore.openBroker).toHaveBeenCalledOnce());
+      m.unmount();
+      const signal = multiplayerStore.openBroker.mock.calls[0][1] as AbortSignal | undefined;
+      release(null);
+      await flush();
+      expect(signal?.aborted).toBe(true);
+    });
+
+    it("releases a broker openBroker hands back after the unmount", async () => {
+      const broker = fakeBroker();
+      let release!: (v: unknown) => void;
+      multiplayerStore.openBroker.mockImplementationOnce(() => new Promise((r) => { release = r; }));
+      const m = render(<GameProvider gameId="g" mode="p2p-host" useBroker><div /></GameProvider>);
+      await waitFor(() => expect(multiplayerStore.openBroker).toHaveBeenCalledOnce());
+      m.unmount();
+      release({ broker, gameCode: "ROOM1" });
+      await flush();
+      expect(multiplayerStore.closeBroker).toHaveBeenCalledWith(broker);
+    });
+
+    it("unregisters and closes a broker assigned before the unmount", async () => {
+      const broker = fakeBroker();
+      multiplayerStore.openBroker.mockResolvedValueOnce({ broker, gameCode: "ROOM1" });
+      let releaseInit!: () => void;
+      gameStore.initGame.mockImplementationOnce(() => new Promise<void>((r) => { releaseInit = r; }));
+      const m = render(<GameProvider gameId="g" mode="p2p-host" useBroker><div /></GameProvider>);
+      await waitFor(() => expect(gameStore.initGame).toHaveBeenCalledOnce());
+      m.unmount();
+      releaseInit();
+      await flush();
+      expect(broker.unregister).toHaveBeenCalledWith("ROOM1");
+      expect(multiplayerStore.closeBroker).toHaveBeenCalledWith(broker);
+    });
   });
 });
 
