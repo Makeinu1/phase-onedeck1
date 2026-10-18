@@ -53,6 +53,7 @@ import { consumeRecentAutoUpdateMarker } from "../pwa/updateMarker";
 import { inspectActiveQuickDraftLifecycle, loadDraftRun } from "../services/quickDraftPersistence";
 import {
   clearFullTerminalCleanupStrict,
+  clearGameStrict,
   loadFullTerminalCleanupStrict,
   loadGameStrict,
 } from "../services/gamePersistence";
@@ -872,6 +873,10 @@ export function GameProvider({
               // snapshot. Show its saved result before retrying idempotent ACKs.
               onP2PEventRef.current?.({ type: "terminalResult", result: cleanup.p2pResult });
               try {
+                // The owner is written before the resume records are deleted,
+                // so a restart can land between the two. Finish that deletion
+                // before any ACK; if it fails, the owner stays for the next try.
+                await clearGameStrict(gameId);
                 if (!nativeEngineKey) {
                   throw new Error("The local native engine is unavailable for terminal cleanup.");
                 }

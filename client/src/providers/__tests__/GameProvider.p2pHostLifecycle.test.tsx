@@ -18,6 +18,7 @@ const {
   loadP2PTerminalResult,
   loadFullTerminalCleanup,
   clearFullTerminalCleanup,
+  clearGameStrict,
   readFullTerminalResult,
   acknowledgeTerminalDelivery,
   nativeEngineKeyForCurrentOrigin,
@@ -87,6 +88,7 @@ const {
     loadP2PTerminalResult: vi.fn<() => Promise<unknown>>(async () => null),
     loadFullTerminalCleanup: vi.fn<() => Promise<unknown>>(async () => null),
     clearFullTerminalCleanup: vi.fn(async () => undefined),
+    clearGameStrict: vi.fn(async () => undefined),
     readFullTerminalResult: vi.fn<() => Promise<unknown>>(async () => null),
     acknowledgeTerminalDelivery: vi.fn(async () => true),
     nativeEngineKeyForCurrentOrigin: vi.fn<() => { release: { version: string } } | null>(() => null),
@@ -121,6 +123,7 @@ vi.mock("../../adapter/ws-adapter", () => ({
 
 vi.mock("../../services/gamePersistence", () => ({
   clearFullTerminalCleanupStrict: clearFullTerminalCleanup,
+  clearGameStrict,
   loadFullTerminalCleanupStrict: loadFullTerminalCleanup,
   loadGameStrict: vi.fn(async () => null),
 }));
@@ -282,6 +285,7 @@ describe("GameProvider P2P host lifecycle", () => {
     loadP2PTerminalResult.mockResolvedValue(null);
     loadFullTerminalCleanup.mockResolvedValue(null);
     clearFullTerminalCleanup.mockResolvedValue(undefined);
+    clearGameStrict.mockResolvedValue(undefined);
     readFullTerminalResult.mockResolvedValue(null);
     acknowledgeTerminalDelivery.mockResolvedValue(true);
     nativeEngineKeyForCurrentOrigin.mockReturnValue(null);
@@ -505,6 +509,45 @@ describe("GameProvider P2P host lifecycle", () => {
     expect(ensureNativeEngine.mock.invocationCallOrder[0]).toBeLessThan(
       readFullTerminalResult.mock.invocationCallOrder[0],
     );
+    // Each restart first finishes the resume-record deletion the owner was
+    // written ahead of, then sends ACKs.
+    expect(clearGameStrict).toHaveBeenCalledTimes(2);
+    expect(clearGameStrict).toHaveBeenCalledWith("p2p-game");
+    expect(clearGameStrict.mock.invocationCallOrder[0]).toBeLessThan(
+      acknowledgeTerminalDelivery.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("keeps cleanup authority when finishing the resume-record deletion fails", async () => {
+    const terminal = retainedTerminal();
+    loadFullTerminalCleanup.mockResolvedValue({
+      gameId: "p2p-game",
+      p2pSessionKey: terminal.key,
+      p2pTerminalId: terminal.terminalId,
+      p2pResult: terminal,
+      fullKey: { game_code: "native-game", generation: 1 },
+      terminalRevision: terminal.revision,
+      deliveries: [{ recipient: 0, deliveryId: "host-delivery", credential: "host-credential" }],
+    });
+    nativeEngineKeyForCurrentOrigin.mockReturnValue({ release: { version: "test-release" } });
+    clearGameStrict.mockRejectedValueOnce(new Error("resume record deletion failed"));
+    const onP2PEvent = vi.fn();
+    render(
+      <GameProvider gameId="p2p-game" mode="p2p-host" onP2PEvent={onP2PEvent}>
+        <div />
+      </GameProvider>,
+    );
+    await waitFor(() => expect(onP2PEvent).toHaveBeenCalledWith({
+      type: "terminalUnavailable",
+      message: "resume record deletion failed",
+    }));
+    expect(onP2PEvent).toHaveBeenCalledWith({ type: "terminalResult", result: terminal });
+    expect(clearGameStrict).toHaveBeenCalledWith("p2p-game");
+    expect(readFullTerminalResult).not.toHaveBeenCalled();
+    expect(acknowledgeTerminalDelivery).not.toHaveBeenCalled();
+    expect(clearFullTerminalCleanup).not.toHaveBeenCalled();
+    expect(adapters).toHaveLength(0);
+    expect(hostRoom).not.toHaveBeenCalled();
   });
 
   it.each(["missing key", "startup failure"] as const)(

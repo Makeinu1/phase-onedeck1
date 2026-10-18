@@ -35,7 +35,7 @@ import {
 // engine/network boundaries and unrelated expensive rendering are stubbed.
 vi.mock("idb-keyval", async (original) => {
   const actual = await original<typeof import("idb-keyval")>();
-  return { ...actual, set: vi.fn(actual.set) };
+  return { ...actual, set: vi.fn(actual.set), del: vi.fn(actual.del) };
 });
 const boundary = vi.hoisted(() => ({
   key: vi.fn<() => { release: { version: string } } | null>(() => null),
@@ -97,6 +97,9 @@ beforeEach(async () => {
   vi.clearAllMocks();
   vi.mocked((await import("idb-keyval")).set).mockImplementation(
     (await vi.importActual<typeof import("idb-keyval")>("idb-keyval")).set,
+  );
+  vi.mocked((await import("idb-keyval")).del).mockImplementation(
+    (await vi.importActual<typeof import("idb-keyval")>("idb-keyval")).del,
   );
   boundary.key.mockReturnValue(null);
   boundary.start.mockResolvedValue({ port: 9374 });
@@ -309,6 +312,49 @@ describe("native terminal production consumer before cleanup ownership", () => {
         expect(boundary.hostRoom).not.toHaveBeenCalled();
         expect(boundary.start).not.toHaveBeenCalled();
       }
+    },
+  );
+
+  it.each(["immediately after the owner write", "after a partial resume deletion"])(
+    "a cleanup-only restart %s finishes deleting the resume records and keeps the owner",
+    async (interruption) => {
+      const owner: FullTerminalCleanupObligation = {
+        gameId, p2pSessionKey: terminal.key, p2pTerminalId: terminal.terminalId,
+        p2pResult: terminal, fullKey: session.nativeSession!.fullKey,
+        terminalRevision: terminal.revision,
+        deliveries: [{ recipient: 0, deliveryId: "host-delivery", credential: "host-credential" }],
+      };
+      await saveFullTerminalCleanupStrict(owner);
+      if (interruption === "after a partial resume deletion") {
+        // The game-record delete fails after the checkpoint and host-session
+        // deletes have landed, as a crash mid-`clearGameStrict` would leave it.
+        const idb = await import("idb-keyval");
+        const actualDel = (await vi.importActual<typeof import("idb-keyval")>("idb-keyval")).del;
+        vi.mocked(idb.del).mockImplementation(async (key, store) => {
+          if (key === `phase-game:${gameId}`) throw new Error("interrupted");
+          await actualDel(key, store);
+        });
+        await expect(clearGameStrict(gameId)).rejects.toThrow("interrupted");
+        vi.mocked(idb.del).mockImplementation(actualDel);
+        expect(await loadCheckpoints(gameId)).toEqual([]);
+        expect(await loadP2PHostSession(gameId)).toBeNull();
+        expect(await loadGameStrict(gameId)).toEqual(snapshot);
+      } else {
+        // Reach control: the resume records are still on disk at restart.
+        expect(await loadGameStrict(gameId)).toEqual(snapshot);
+        expect(await loadP2PHostSession(gameId)).toEqual(session);
+      }
+
+      mountPage();
+      await waitFor(() => expect(useGameStore.getState().waitingFor?.type).toBe("GameOver"));
+      expect(screen.getByRole("heading", { name: "VICTORY" })).toBeInTheDocument();
+      await waitFor(async () => expect(await loadGameStrict(gameId)).toBeNull());
+      expect(await loadCheckpoints(gameId)).toEqual([]);
+      expect(await loadP2PHostSession(gameId)).toBeNull();
+      // The native engine key is unavailable in this process, so no ACK ran
+      // and the owner stays for the next attempt.
+      expect(await loadFullTerminalCleanupStrict(gameId)).toEqual(owner);
+      expect(boundary.hostRoom).not.toHaveBeenCalled();
     },
   );
 
