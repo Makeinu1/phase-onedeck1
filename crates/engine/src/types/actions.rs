@@ -1315,8 +1315,10 @@ pub enum DebugAction {
     /// Set a player's life total directly.
     SetLife { player_id: PlayerId, life: i32 },
     /// Gain life through the real CR 119.3 life-gain event (replacements, can't-gain statics, life-gain triggers apply).
+    /// Requires a Priority window, so an open prompt (e.g. a CR 616.1 replacement choice) keeps its owner.
     GainLife { player_id: PlayerId, amount: u32 },
     /// Lose life through the real CR 119.3 life-loss event.
+    /// Requires a Priority window, like `GainLife`.
     LoseLife { player_id: PlayerId, amount: u32 },
     /// Modify a non-energy player counter. Positive delta adds, negative removes.
     ModifyPlayerCounters {

@@ -3309,6 +3309,75 @@ mod tests {
             assert_eq!(p1p1(&runner, mate), 1);
         }
 
+        /// CR 616.1: while the first gain's replacement-order choice is open, a
+        /// second debug life change is rejected before any state change, so the
+        /// outstanding proposal stays resumable and completes exactly once.
+        #[test]
+        fn debug_life_change_rejected_while_replacement_choice_pending() {
+            let mut scenario = scenario();
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            add_card(&mut scenario, P0, "Boon Reflection");
+            add_card(&mut scenario, P0, "Leyline of Hope");
+            let mut runner = debug_runner(scenario);
+
+            act_ok(&mut runner, gain(P0, 3));
+            assert!(
+                matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::ReplacementChoice { .. }
+                ),
+                "reach guard: the first gain must park a replacement-order choice, got {:?}",
+                runner.state().waiting_for
+            );
+            let pending_before = runner.state().pending_replacement.clone();
+            assert!(
+                pending_before.is_some(),
+                "reach guard: the first gain's proposal must be pending"
+            );
+            let waiting_before = runner.state().waiting_for.clone();
+
+            for second in [gain(P0, 5), lose(P0, 2)] {
+                let error = runner
+                    .act(second.clone())
+                    .expect_err("a debug life change must not be admitted under an open prompt");
+                assert!(
+                    matches!(
+                        &error,
+                        EngineError::InvalidAction(message) if message.contains("Priority window")
+                    ),
+                    "{second:?} must be rejected by the Priority-boundary preflight, got {error:?}"
+                );
+                assert_eq!(runner.state().pending_replacement, pending_before);
+                assert_eq!(runner.state().waiting_for, waiting_before);
+                assert_eq!(life(&runner, P0), 20);
+                assert!(runner.state().stack.is_empty());
+                assert_eq!(p1p1(&runner, mate), 0);
+            }
+
+            for _ in 0..4 {
+                if !matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::ReplacementChoice { .. }
+                ) {
+                    break;
+                }
+                runner
+                    .act(GameAction::ChooseReplacement { index: 0 })
+                    .expect("the first gain's replacement order choice must stay resumable");
+            }
+            runner.advance_until_stack_empty();
+            let final_life = life(&runner, P0);
+            assert!(
+                final_life == 27 || final_life == 28,
+                "only the first gain applies: Boon first 3→6→7 (27), Leyline first 3→4→8 (28); got {final_life}"
+            );
+            assert_eq!(
+                p1p1(&runner, mate),
+                1,
+                "the first gain must complete exactly once"
+            );
+        }
+
         /// CR 614.6: a substitute that pauses on its own prompt leaves the debug
         /// action applied with the substitute's prompt pending and nothing
         /// dispatched.
