@@ -1971,10 +1971,13 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       nativeBridge: {
         clients: Map<number, unknown>;
         terminalFinalViews: (revision: number) => Promise<Map<number, GameState>>;
+        resumeGuest: (playerId: number) => Promise<unknown>;
       };
       terminalResult: { display: { winner: number | null; reason: string }; finalStateCommitment: string } | null;
       disconnectedSeats: Map<number, unknown>;
     };
+    // The retired Full session has no engine authority left to reattach to.
+    const resumeGuest = vi.spyOn(host.nativeBridge, "resumeGuest");
     const finalViews = await host.nativeBridge.terminalFinalViews(12);
     expect(nativeTerminalMocks.bootstrap).toHaveBeenCalledTimes(2);
     expect(finalViews.get(0)).toEqual(hostFinal);
@@ -2009,6 +2012,8 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     const reconnectAck = reconnectFrames[reconnectAckIndex] as Extract<P2PMessage, { type: "reconnect_ack" }>;
     const terminal = reconnectFrames[terminalIndex] as Extract<P2PMessage, { type: "terminal_result" }>;
     expect(reconnectAck.state).toEqual(guestFinal);
+    expect(resumeGuest).not.toHaveBeenCalled();
+    expect(host.nativeBridge.clients.size).toBe(0);
     expect(terminal.result.finalStateCommitment).toBe(await p2pFinalStateCommitment(guestFinal));
     expect(terminal.result.lease).toEqual(reconnectAck.authority);
     expect(terminal.result.lease.hostIncarnation).not.toBe(retainedTerminal.lease.hostIncarnation);
@@ -2034,6 +2039,97 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     }).nativeTerminalStateAcked.has(1)).toBe(true);
     expect((adapter as unknown as { terminalDelivered: Set<number> }).terminalDelivered.has(1)).toBe(true);
     expect((adapter as unknown as { disconnectedSeats: Map<number, unknown> }).disconnectedSeats.has(1)).toBe(false);
+    adapter.dispose();
+  });
+
+  it("reattaches a seat suspended before its live native game ended to receive its final view", async () => {
+    const { adapter, emitConnection } = makeNativeHost(2);
+    nativeWebSocketMocks.waitForPlayerSlots.mockResolvedValue([]);
+    nativeWebSocketMocks.initializePregame
+      .mockResolvedValueOnce(NATIVE_HOST_ATTACHMENT)
+      .mockResolvedValueOnce(NATIVE_GUEST_ATTACHMENT);
+
+    await adapter.initialize();
+    const guest = await joinGuest(emitConnection, {
+      type: "guest_deck",
+      deckData: { player: { main_deck: ["Plains"], sideboard: [] } },
+    });
+    const start = adapter.initializeGame();
+    await vi.waitFor(() => expect(nativeWebSocketMocks.sendSeatMutation).toHaveBeenCalledWith({ type: "Start" }));
+    const liveSnapshot: EngineSnapshot = {
+      state: remoteState("native P2P game started"),
+      legalResult: { actions: [], autoPassRecommended: false },
+      seq: 1,
+    };
+    for (const [listener] of nativeWebSocketMocks.onEvent.mock.calls) {
+      (listener as (event: WsAdapterEvent) => void)({
+        type: "stateChanged",
+        snapshot: liveSnapshot,
+        events: [],
+        serverRevision: 1,
+      });
+    }
+    await start;
+    await flushPromises(20);
+    const setup = (await guest.getSentMessages()).find(
+      (message): message is { type: "game_setup"; playerToken: string } =>
+        typeof message === "object"
+        && message !== null
+        && (message as { type?: string }).type === "game_setup",
+    );
+
+    guest.simulateClose();
+    await vi.waitFor(() => expect(nativeWebSocketMocks.openSockets.has(1)).toBe(false));
+
+    // The game ends while the seat is away. Its Full terminal delivery can be
+    // recorded, but its own view is still the live revision it last received.
+    const guestFinal = {
+      ...remoteState("Full final view for 1"),
+      waiting_for: { type: "GameOver", data: { winner: 0 } },
+      filteredFor: 1,
+    } as unknown as GameState;
+    const bridge = (adapter as unknown as {
+      nativeBridge: {
+        terminalDeliveries: Map<number, FullTerminalDelivery>;
+        resumeGuest: (playerId: number) => Promise<unknown>;
+      };
+    }).nativeBridge;
+    bridge.terminalDeliveries.set(1, {
+      key: { game_code: "native-game", generation: 1 },
+      terminalRevision: 2,
+      deliveryId: "guest-delivery",
+      credential: "guest-credential",
+      display: { winner: 0, reason: "Full terminal reason" },
+      finalView: guestFinal,
+    });
+    const resumeGuest = vi.spyOn(bridge, "resumeGuest");
+
+    nativeWebSocketMocks.initializePregame.mockResolvedValueOnce(NATIVE_GUEST_ATTACHMENT);
+    const attachCalls = nativeWebSocketMocks.initializePregame.mock.calls.length;
+    const reconnecting = joinGuest(emitConnection, {
+      type: "reconnect",
+      playerToken: setup!.playerToken,
+    });
+    await vi.waitFor(() =>
+      expect(nativeWebSocketMocks.initializePregame.mock.calls.length).toBe(attachCalls + 1),
+    );
+    await flushPromises(5);
+    const listeners = nativeWebSocketMocks.onEvent.mock.calls;
+    (listeners[listeners.length - 1][0] as (event: WsAdapterEvent) => void)({
+      type: "stateChanged",
+      snapshot: { state: guestFinal, legalResult: { actions: [], autoPassRecommended: false }, seq: 2 },
+      events: [],
+      serverRevision: 2,
+    });
+    const reconnect = await reconnecting;
+    await flushPromises(20);
+
+    expect(resumeGuest).toHaveBeenCalledWith(1);
+    expect(nativeWebSocketMocks.openSockets.has(1)).toBe(true);
+    const ack = (await reconnect.getSentMessages()).find(
+      (message) => (message as { type?: string }).type === "reconnect_ack",
+    );
+    expect(ack).toMatchObject({ assignedPlayerId: 1, revision: 2, state: guestFinal });
     adapter.dispose();
   });
 

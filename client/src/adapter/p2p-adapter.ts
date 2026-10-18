@@ -512,6 +512,25 @@ class NativeP2PBridge {
   }
 
   /**
+   * The seat's view when it is already its recipient-bound Full terminal
+   * delivery at that delivery's terminal revision, as `restoreTerminalViews`
+   * leaves it once the Full session has been retired. Such a seat has no
+   * engine authority to reattach to. A seat suspended while the game was live
+   * stopped receiving views, so its view is older and this returns `null`.
+   */
+  retainedTerminalView(playerId: PlayerId): NativeResumedView | null {
+    const delivery = this.terminalDeliveries.get(playerId);
+    const view = this.latestViews.get(playerId);
+    if (
+      !delivery?.finalView
+      || !view
+      || view.revision !== delivery.terminalRevision
+      || view.snapshot.state.waiting_for.type !== "GameOver"
+    ) return null;
+    return { revision: view.revision, snapshot: view.snapshot };
+  }
+
+  /**
    * Reattach a suspended seat to the engine authority on its own token, without waiting
    * for the view it is sent. A no-op for a seat that is attached or unknown.
    */
@@ -4767,8 +4786,13 @@ export class P2PHostAdapter implements EngineAdapter {
     if (this.nativeBridge) {
       // A returning seat reattaches to the engine authority first (it was suspended when
       // its channel dropped), and its handoff is the view that reattachment returned.
+      // A retired Full session has no authority left to reattach to; its seat's
+      // handoff is the recipient-bound terminal view the bridge already holds.
       if (!this.nativeBridge.isGuestAttached(pid)) {
-        this.nativeDeliveredViews.set(pid, await this.nativeBridge.resumeGuest(pid));
+        this.nativeDeliveredViews.set(
+          pid,
+          this.nativeBridge.retainedTerminalView(pid) ?? await this.nativeBridge.resumeGuest(pid),
+        );
       }
       const delivered = this.nativeDeliveredViews.get(pid);
       if (!delivered) throw new AdapterError("P2P_ERROR", `No delivered native snapshot for seat ${pid}`, true);
