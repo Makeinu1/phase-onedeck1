@@ -2736,6 +2736,69 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     adapter.dispose();
   });
 
+  it("re-sends a terminal reconnect handoff whose state ACK was lost until the ACK arrives", async () => {
+    const terminalState = {
+      players: [],
+      objects: {},
+      waiting_for: { type: "GameOver", data: { winner: 0 } },
+    } as unknown as GameState;
+    mocks.resumeMultiplayerHostState.mockResolvedValueOnce({
+      snapshot: {
+        state: terminalState,
+        legalResult: { actions: [], autoPassRecommended: false },
+        seq: 1,
+      },
+      presentation: {
+        outcome: "noop",
+        automatedResolutionCount: 0,
+        omittedEventCount: 0,
+        logEntries: [],
+      },
+    });
+    (mockGetViewerSnapshot as unknown as { mockResolvedValue: (value: unknown) => void }).mockResolvedValue({
+      state: terminalState,
+      actions: [],
+      autoPassRecommended: false,
+    });
+    const { adapter, emitConnection } = makeResumedHost();
+    await adapter.initialize();
+    const host = adapter as unknown as { queueLaggingRedeliveries: () => void };
+    const reconnect = new FakeOpenableConnection();
+    const sentTypes = async () =>
+      (await reconnect.getSentMessages()).map((message) => (message as { type: string }).type);
+
+    reconnect.stopAcking();
+    emitConnection(reconnect as unknown as DataConnection);
+    reconnect.fireOpen();
+    await reconnect.simulateData({
+      type: "reconnect",
+      playerToken: "guest-token",
+      wireProtocolVersion: WIRE_PROTOCOL_VERSION,
+    });
+    await vi.waitFor(async () => expect(await sentTypes()).toEqual(["reconnect_ack"]));
+
+    // The guest's ACK of the handoff never reached the host. A sweep while it
+    // is still silent re-sends the handoff state and nothing else.
+    host.queueLaggingRedeliveries();
+    await vi.waitFor(async () => expect(await sentTypes()).toEqual(["reconnect_ack", "state_update"]));
+
+    reconnect.resumeAcking();
+    host.queueLaggingRedeliveries();
+    await vi.waitFor(async () => {
+      expect(await sentTypes()).toEqual(["reconnect_ack", "state_update", "state_update", "terminal_result"]);
+    });
+    const resent = (await reconnect.getSentMessages())[2] as { revision?: number; state?: GameState };
+    const handoff = (await reconnect.getSentMessages())[0] as { revision?: number };
+    expect(resent.revision).toBe(handoff.revision);
+    expect(resent.state?.waiting_for.type).toBe("GameOver");
+
+    // Once the terminal result is delivered, the sweep has nothing left to re-send.
+    host.queueLaggingRedeliveries();
+    await flushPromises();
+    expect(await sentTypes()).toHaveLength(4);
+    adapter.dispose();
+  });
+
   it("consumes a resumed automation result exactly once", async () => {
     const restored: RestoredGameStateResult = {
       snapshot: {

@@ -3728,6 +3728,41 @@ export class P2PHostAdapter implements EngineAdapter {
         }
       });
     }
+    // A terminal reconnect channel is not in `guestSessions` until its handoff
+    // ACK arrives, so the loop above never reaches it. A lost or undecodable
+    // ACK would otherwise strand the seat: the host never sends its terminal
+    // result, and a fresh reconnect is refused while this one is pending.
+    for (const [pid, pending] of this.pendingTerminalReconnectAcks) {
+      if (!pending.ready || pending.stateAckReceived || this.pendingRedeliveries.has(pid)) continue;
+      this.pendingRedeliveries.add(pid);
+      void this.enqueueDelivery(async () => {
+        try {
+          await this.redeliverPendingTerminalHandoff(pid, pending.session);
+        } finally {
+          this.pendingRedeliveries.delete(pid);
+        }
+      });
+    }
+  }
+
+  /**
+   * Re-sends a terminal reconnect's handoff state as a `state_update` at the
+   * handoff revision. The guest installed this channel on `reconnect_ack`, and
+   * its strict `<` stale guard lets an equal-revision frame through to a fresh
+   * `state_ack`, which `handlePendingTerminalReconnectFrame` then consumes. A
+   * refused send leaves the seat for the next sweep.
+   */
+  private async redeliverPendingTerminalHandoff(pid: PlayerId, session: PeerSession): Promise<void> {
+    if (this.disposed || !this.ownsAuthority()) return;
+    const pending = this.pendingTerminalReconnectAcks.get(pid);
+    if (!pending || pending.session !== session || !pending.ready || pending.stateAckReceived) return;
+    await this.send(session, {
+      type: "state_update",
+      revision: pending.revision,
+      state: pending.snapshot.state,
+      events: [],
+      ...legalActionsToWire(pending.snapshot.legalResult),
+    });
   }
 
   /**
