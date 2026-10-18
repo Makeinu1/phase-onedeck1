@@ -878,6 +878,10 @@ export function GameProvider({
           if (event.type === "guestConnected") {
             notifyOpponentJoined(tRef.current);
           }
+          if (event.type === "terminalResult"
+            && !(adapter instanceof P2PHostAdapter && adapter.usesNativeEngine())) {
+            void clearGame(gameId);
+          }
           onP2PEventRef.current?.(event);
         });
       };
@@ -988,6 +992,7 @@ export function GameProvider({
               signal.throwIfAborted();
               if (terminal) {
                 if (!isNativeResume) {
+                  void clearGame(gameId);
                   onP2PEventRef.current?.({ type: "terminalResult", result: terminal });
                   return;
                 }
@@ -1170,6 +1175,7 @@ export function GameProvider({
               const terminal = await loadP2PTerminalResult(existing.authority.sessionKey);
               signal.throwIfAborted();
               if (terminal) {
+                void clearGame(gameId);
                 onP2PEventRef.current?.({ type: "terminalResult", result: terminal });
                 return;
               }
@@ -1323,11 +1329,24 @@ export function GameProvider({
         if (reconnectSession) {
           const terminalDelivery = await loadFullTerminalDelivery(reconnectSession.fullKey);
           if (cancelled) return;
+          if (reconnectSession.terminalOnly && !terminalDelivery) {
+            onWsEventRef.current?.({
+              type: "terminalUnavailable",
+              message: "Retained terminal delivery could not be read",
+            });
+            return;
+          }
 
           if (terminalDelivery) {
             // A retained terminal capability is read only through the small raw
             // socket helper. This branch intentionally returns before any
             // playable adapter, controller, deck, or reconnect setup exists.
+            saveWsSession({ ...reconnectSession, terminalOnly: true }, reconnectSession);
+            // Show the cached result summary immediately. A refreshed delivery
+            // must establish matching authority before reusing a private view.
+            onWsEventRef.current?.({
+              type: "terminalDelivery", delivery: { ...terminalDelivery, finalView: undefined },
+            });
             try {
               const refreshed = await readFullTerminalResult(
                 reconnectSession.serverUrl,
@@ -1352,8 +1371,9 @@ export function GameProvider({
                 reconnectSession.serverUrl,
                 display.deliveryId,
                 display.credential,
-              ).catch(() => {});
-              clearWsSession();
+              ).then((acknowledged) => {
+                if (acknowledged && !cancelled) clearWsSession(reconnectSession);
+              }).catch(() => {});
               onWsEventRef.current?.({
                 type: "terminalDelivery",
                 delivery: display,
@@ -1398,12 +1418,14 @@ export function GameProvider({
               });
               return;
             }
+            saveWsSession({ ...reconnectSession, terminalOnly: true }, reconnectSession);
             void acknowledgeFullTerminalDelivery(
               reconnectSession.serverUrl,
               bootstrap.deliveryId,
               bootstrap.credential,
-            ).catch(() => {});
-            clearWsSession();
+            ).then((acknowledged) => {
+              if (acknowledged && !cancelled) clearWsSession(reconnectSession);
+            }).catch(() => {});
             onWsEventRef.current?.({ type: "terminalDelivery", delivery: bootstrap });
             return;
           }
@@ -1429,6 +1451,7 @@ export function GameProvider({
           useMultiplayerStore.getState().displayName || "Player",
         );
 
+        let adapterSession: ReturnType<typeof loadWsSession> = null;
         wsUnsubscribe = wsAdapter.onEvent((event) => {
           if (event.type === "playerIdentity") {
             useMultiplayerStore.getState().setActivePlayerId(event.playerId);
@@ -1450,9 +1473,13 @@ export function GameProvider({
           }
           if (event.type === "sessionChanged") {
             if (event.session) {
-              saveWsSession(event.session);
-            } else {
-              clearWsSession();
+              const previousSession = adapterSession;
+              adapterSession = event.session;
+              saveWsSession(event.session, event.session.terminalOnly
+                ? previousSession ?? event.session : undefined);
+            } else if (adapterSession) {
+              clearWsSession(adapterSession);
+              adapterSession = null;
             }
           }
           if (event.type === "stateChanged") {
