@@ -2169,7 +2169,7 @@ export interface TriggerContextDisplay {
  * template behind `kind_label`, so the display layer localizes the ability
  * label without parsing English text. */
 export type StackAbilityKindView =
-  | { type: "Activated"; data: { number?: number } }
+  | { type: "Activated"; data: { number?: number | null } } // older engines send null; current omits the key
   | { type: "Triggered" };
 
 export interface StackEntryDisplay {
