@@ -7993,7 +7993,11 @@ pub struct FinalizePrePaymentChecks {
     pub cascade_cast_transformed: bool,
     pub resolution_success_waiting_for: Option<WaitingFor>,
     pub cast_this_way_etb_counter: Option<CounterType>,
-    pub cast_this_way_enters_mods: Vec<ContinuousModification>,
+    #[serde(
+        default,
+        deserialize_with = "crate::types::ability::deserialize_enters_with_modifications_compat"
+    )]
+    pub cast_this_way_enters_mods: crate::types::ability::PendingEntersModifications,
 }
 
 /// CR 605.3b: Selects whether completing a mana-ability cost payment may ask
@@ -8163,7 +8167,9 @@ pub enum WardSacrificePaymentResume {
 /// activation and unpaid payment cursor until the move has settled.
 /// `SacrificeForCost` owns a full selected sacrifice component across one or
 /// more replacement-choice action boundaries, including its event span and
-/// LKI record identities. `CollectEvidencePayment` and `UnlessBouncePayment`
+/// LKI record identities; `Cast` carries the same pair for a multi-object
+/// battlefield move (a counted return to hand or exile).
+/// `CollectEvidencePayment` and `UnlessBouncePayment`
 /// retain their selected-object program counters and exact completion tails.
 /// `WardSacrificePayment` retains either the ordered aggregate suffix or the
 /// sequential re-prompt basis until the current sacrifice's replacement choice
@@ -8179,6 +8185,16 @@ pub enum PendingCostMoveResume {
         paused_at_index: usize,
         destination: Zone,
         completion: PendingCostMoveCompletion,
+        /// CR 603.2 + CR 603.10a: Cost events emitted in earlier actions of
+        /// this one logical multi-object cost move (a counted return to hand or
+        /// exile). They are stamped and settled only when every selected object
+        /// has moved, so a group split by a replacement choice stays one group.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deferred_cost_events: Vec<GameEvent>,
+        /// CR 603.10a: Per-turn LKI record identities emitted by completed
+        /// moves before a replacement-choice boundary.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        departure_record_indices: Vec<usize>,
     },
     SacrificeForCost {
         player: PlayerId,
@@ -8815,20 +8831,8 @@ impl GameState {
             .or_else(|| owners.first().copied())
     }
 
-    /// Temporarily removes the announcement-local trigger transaction from the
-    /// pending cast that currently owns it (any [`PendingCastOwner`]).
-    pub(crate) fn take_pending_activation_trigger_collection(
-        &mut self,
-    ) -> Option<Box<crate::game::triggers::PendingActivationTriggerCollection>> {
-        let owner = self.pending_trigger_carrier_owner()?;
-        self.pending_cast_at_mut(owner)?
-            .activation_trigger_collection
-            .take()
-    }
-
-    /// Restores the transaction removed by
-    /// [`Self::take_pending_activation_trigger_collection`] to the same active
-    /// casting continuation.
+    /// Restores a transaction taken from the announcement's `PendingCast` to
+    /// the same active casting continuation.
     pub(crate) fn restore_pending_activation_trigger_collection(
         &mut self,
         collection: Box<crate::game::triggers::PendingActivationTriggerCollection>,
@@ -9238,7 +9242,11 @@ fn visit_cost_move_resume_events(
     f: &mut impl FnMut(&mut GameEvent),
 ) {
     match resume {
-        PendingCostMoveResume::SacrificeForCost {
+        PendingCostMoveResume::Cast {
+            deferred_cost_events,
+            ..
+        }
+        | PendingCostMoveResume::SacrificeForCost {
             deferred_cost_events,
             ..
         } => deferred_cost_events.iter_mut().for_each(&mut *f),
@@ -9262,8 +9270,7 @@ fn visit_cost_move_resume_events(
                 f(event);
             }
         }
-        PendingCostMoveResume::Cast { .. }
-        | PendingCostMoveResume::WardSacrificePayment { .. }
+        PendingCostMoveResume::WardSacrificePayment { .. }
         | PendingCostMoveResume::ReplacementMayCost { .. }
         | PendingCostMoveResume::Foretell { .. }
         | PendingCostMoveResume::UnlessBouncePayment { .. }
@@ -11110,6 +11117,21 @@ pub enum CastOfferKind {
         /// the unrestricted behavior.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         member_pool: Vec<ObjectId>,
+        /// CR 608.2c + CR 611.2a: the cast-permission gains-modifications rider
+        /// ("If you cast a [quality] spell this way, it gains …", Strago and
+        /// Relm) snapshotted from the converting `CastFromZone` ability. Every
+        /// cast of the window receives it through its `ResolutionCastRequest`
+        /// (the elected-permission application point; CR 611.2f: such an effect
+        /// "do[es] not begin immediately" but applies when the player next puts
+        /// the appropriate spell on the stack), and the re-offers carry it
+        /// through `FreeCastOfferRemaining`. Empty for windows without a rider
+        /// and for saved states predating the field.
+        #[serde(
+            default,
+            deserialize_with = "crate::types::ability::deserialize_enters_with_modifications_compat",
+            skip_serializing_if = "crate::types::ability::PendingEntersModifications::is_empty"
+        )]
+        enters_with_modifications: crate::types::ability::PendingEntersModifications,
     },
     /// CR 608.2g + CR 609.4b: A during-resolution PAID cast of a single card
     /// from a graveyard — "you may cast target X card from a graveyard", with
@@ -11130,6 +11152,19 @@ pub enum CastOfferKind {
         /// (e.g. "if that spell would be put into a graveyard, exile it instead").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         graveyard_replacement: Option<crate::types::ability::SpellStackToGraveyardReplacement>,
+        /// CR 608.2c + CR 611.2a: the cast-permission gains-modifications rider
+        /// ("If you cast a [quality] spell this way, it gains …", Strago and
+        /// Relm) snapshotted from the offering `CastFromZone` ability; the
+        /// accept threads it into the elected permission (CR 611.2f: the
+        /// granted rider applies when the player next puts the appropriate
+        /// spell on the stack). Empty for every other paid offer and for saved
+        /// states predating the field.
+        #[serde(
+            default,
+            deserialize_with = "crate::types::ability::deserialize_enters_with_modifications_compat",
+            skip_serializing_if = "crate::types::ability::PendingEntersModifications::is_empty"
+        )]
+        enters_with_modifications: crate::types::ability::PendingEntersModifications,
         /// CR 712.14a: Whether the spell is cast transformed. Rare for this
         /// class; carried for parity with the free during-resolution casts.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -33649,6 +33684,7 @@ mod forced_cascade_window_tests {
                         per_cycle: None,
                         shortened_by: None,
                         published_declaration: None,
+                        leading_aims: Vec::new(),
                         road: crate::analysis::loop_check::OfferRoad::Ring,
                         period: Default::default(),
                     },
@@ -34379,6 +34415,7 @@ mod tests {
                 hit_card,
                 mana_spend_permission: None,
                 graveyard_replacement: None,
+                enters_with_modifications: Default::default(),
                 cast_transformed: false,
                 additional_cost: None,
                 cleanup: crate::types::ability::ResolutionCastCleanup {
@@ -34531,6 +34568,163 @@ mod tests {
                 "{label}: {error}"
             );
         }
+    }
+
+    /// CR 608.2c + CR 611.2a (row 6.8): the two `CastOfferKind` carriers of the
+    /// gains-modifications rider deserialize a pre-fix payload without the
+    /// field to the default rider with the rest of the payload intact, omit
+    /// the field when the rider is empty, and round-trip a carried rider
+    /// (including its typed cast-quality predicate) exactly.
+    #[test]
+    fn cast_offer_rider_field_back_compat_and_skip_when_empty() {
+        use crate::types::ability::{
+            ContinuousModification, PendingEntersModifications, ResolutionCastFacePolicy,
+            ResolutionCastSuccessAction, ResolutionMvRejectAction,
+        };
+        use crate::types::keywords::Keyword;
+
+        let rider = PendingEntersModifications {
+            modifications: vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Haste,
+            }],
+            cast_filter: Some(TargetFilter::Typed(
+                crate::types::ability::TypedFilter::default()
+                    .with_type(crate::types::ability::TypeFilter::Creature),
+            )),
+        };
+        let policy =
+            ResolutionCastFacePolicy::new(TargetFilter::Any, ObjectId(7), PlayerId(0), None);
+        let cleanup = crate::types::ability::ResolutionCastCleanup {
+            source_id: ObjectId(7),
+            offer_id: None,
+            face_policy: policy.clone(),
+            exiled_misses: Vec::new(),
+            reject_action: ResolutionMvRejectAction::RemainExiled,
+            success_action: ResolutionCastSuccessAction::BottomMisses,
+            delayed_trigger_receipts: Vec::new(),
+        };
+
+        // GraveyardPaidCast — an empty rider is skipped and a carried rider
+        // round-trips exactly.
+        let paid = CastOfferKind::GraveyardPaidCast {
+            hit_card: ObjectId(8),
+            mana_spend_permission: None,
+            graveyard_replacement: None,
+            enters_with_modifications: Default::default(),
+            cast_transformed: false,
+            additional_cost: None,
+            cleanup: cleanup.clone(),
+        };
+        let paid_value = serde_json::to_value(&paid).unwrap();
+        assert!(
+            paid_value
+                .as_object()
+                .is_some_and(|object| !object.contains_key("enters_with_modifications")),
+            "an empty paid rider must be skipped on the wire"
+        );
+        assert_eq!(
+            serde_json::from_value::<CastOfferKind>(paid_value).unwrap(),
+            paid
+        );
+        let ridden_paid = CastOfferKind::GraveyardPaidCast {
+            hit_card: ObjectId(8),
+            mana_spend_permission: None,
+            graveyard_replacement: None,
+            enters_with_modifications: rider.clone(),
+            cast_transformed: false,
+            additional_cost: None,
+            cleanup: cleanup.clone(),
+        };
+        let ridden_value = serde_json::to_value(&ridden_paid).unwrap();
+        assert_eq!(
+            ridden_value["enters_with_modifications"],
+            serde_json::to_value(&rider).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_value::<CastOfferKind>(ridden_value).unwrap(),
+            ridden_paid
+        );
+
+        // FreeCastWindow — the same properties.
+        let window = CastOfferKind::FreeCastWindow {
+            candidates: vec![ObjectId(8)],
+            remaining_casts: Some(1),
+            remaining_mv_budget: None,
+            face_policy: policy.clone(),
+            zones: vec![Zone::Exile],
+            graveyard_replacement: None,
+            enters_with_modifications: Default::default(),
+            member_pool: Vec::new(),
+        };
+        let window_value = serde_json::to_value(&window).unwrap();
+        assert!(
+            window_value
+                .as_object()
+                .is_some_and(|object| !object.contains_key("enters_with_modifications")),
+            "an empty window rider must be skipped on the wire"
+        );
+        assert_eq!(
+            serde_json::from_value::<CastOfferKind>(window_value).unwrap(),
+            window
+        );
+        let ridden_window = CastOfferKind::FreeCastWindow {
+            candidates: vec![ObjectId(8)],
+            remaining_casts: Some(1),
+            remaining_mv_budget: None,
+            face_policy: policy,
+            zones: vec![Zone::Exile],
+            graveyard_replacement: None,
+            enters_with_modifications: rider.clone(),
+            member_pool: Vec::new(),
+        };
+        let ridden_window_value = serde_json::to_value(&ridden_window).unwrap();
+        assert_eq!(
+            ridden_window_value["enters_with_modifications"],
+            serde_json::to_value(&rider).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_value::<CastOfferKind>(ridden_window_value).unwrap(),
+            ridden_window
+        );
+
+        // A pre-fix payload that never had the key at all is the same shape.
+        let mut pre_fix = serde_json::to_value(&ridden_paid).unwrap();
+        pre_fix
+            .as_object_mut()
+            .unwrap()
+            .remove("enters_with_modifications");
+        assert_eq!(
+            serde_json::from_value::<CastOfferKind>(pre_fix).unwrap(),
+            paid,
+            "a field-less pre-fix payload must read as an empty rider with the rest intact"
+        );
+
+        // A retained intermediate-build payload carries the bare array under
+        // the same key; the dual-shape deserializer restores it as the
+        // unconditional rider (no printed quality was recorded then).
+        let mut legacy_array = serde_json::to_value(&ridden_paid).unwrap();
+        legacy_array.as_object_mut().unwrap().insert(
+            "enters_with_modifications".to_string(),
+            serde_json::json!([{ "type": "AddKeyword", "keyword": "Haste" }]),
+        );
+        let legacy_paid: CastOfferKind = serde_json::from_value(legacy_array).unwrap();
+        let CastOfferKind::GraveyardPaidCast {
+            enters_with_modifications,
+            ..
+        } = legacy_paid
+        else {
+            panic!("the legacy paid offer must restore as GraveyardPaidCast");
+        };
+        assert_eq!(
+            enters_with_modifications,
+            crate::types::ability::PendingEntersModifications {
+                modifications: vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Haste,
+                }],
+                cast_filter: None,
+            },
+            "a populated legacy offer array must restore as the unconditional rider"
+        );
     }
 
     #[test]
@@ -41146,6 +41340,157 @@ mod tests {
             !loop_states_equal(&normalized_a, &changed_reference.normalize_for_loop()),
             "different LKI for a still-referenced incarnation remains meaningful"
         );
+    }
+
+    /// CR 104.4b: a replacement-paused counted cost move keeps its earlier
+    /// action fragments' events in `PendingCostMoveResume::Cast`. Those events
+    /// can name an LKI incarnation, so the loop-state normalization must visit
+    /// them (`visit_cost_move_resume_events`): the incarnation they name
+    /// survives pruning and the canonical renumbering follows it.
+    #[test]
+    fn normalize_for_loop_visits_the_cast_cost_move_ledger_events() {
+        fn snapshot(power: i32) -> LKISnapshot {
+            LKISnapshot {
+                name: "Loop Entrant".to_string(),
+                token_image_ref: None,
+                power: Some(power),
+                toughness: Some(2),
+                base_power: Some(2),
+                base_toughness: Some(2),
+                mana_value: 2,
+                controller: PlayerId(0),
+                owner: PlayerId(0),
+                card_types: vec![CoreType::Creature],
+                subtypes: Vec::new(),
+                supertypes: Vec::new(),
+                keywords: Vec::new(),
+                colors: Vec::new(),
+                chosen_attributes: Vec::new(),
+                counters: HashMap::new(),
+                tapped: false,
+                is_suspected: false,
+                attachments: Vec::new(),
+            }
+        }
+
+        let entrant = ObjectId(50);
+        let referenced_incarnation = 7;
+        let mut record =
+            ZoneChangeRecord::test_minimal(entrant, Some(Zone::Battlefield), Zone::Hand);
+        record.entered_incarnation = Some(referenced_incarnation);
+        let deferred_event = GameEvent::ZoneChanged {
+            object_id: entrant,
+            from: Some(Zone::Battlefield),
+            to: Zone::Hand,
+            record: Box::new(record),
+        };
+
+        let mut state = GameState::new_two_player(7);
+        state.pending_cost_move_resume = Some(PendingCostMoveResume::Cast {
+            player: PlayerId(0),
+            pending: None,
+            chosen: vec![],
+            paused_at_index: 0,
+            destination: Zone::Hand,
+            completion: PendingCostMoveCompletion::FinishPending,
+            deferred_cost_events: vec![deferred_event],
+            departure_record_indices: vec![],
+        });
+        // No stack entry or other carrier names either incarnation.
+        state
+            .lki_by_incarnation
+            .entry(entrant)
+            .or_default()
+            .insert(referenced_incarnation, snapshot(5));
+        state
+            .lki_by_incarnation
+            .entry(entrant)
+            .or_default()
+            .insert(8, snapshot(2));
+
+        let normalized = state.normalize_for_loop();
+        let retained: Vec<u64> = normalized
+            .lki_by_incarnation
+            .get(&entrant)
+            .map(|incarnations| incarnations.keys().copied().collect())
+            .unwrap_or_default();
+        // Positive control: the unreferenced incarnation is pruned in the same call.
+        assert_eq!(
+            retained.len(),
+            1,
+            "only the incarnation the Cast ledger event names survives, got {retained:?}"
+        );
+        let named = match &normalized.pending_cost_move_resume {
+            Some(PendingCostMoveResume::Cast {
+                deferred_cost_events,
+                ..
+            }) => match deferred_cost_events.as_slice() {
+                [GameEvent::ZoneChanged { record, .. }] => record.entered_incarnation,
+                other => panic!("unexpected ledger events {other:?}"),
+            },
+            other => panic!("unexpected cost-move root {other:?}"),
+        };
+        assert_eq!(
+            named,
+            retained.first().copied(),
+            "the ledger event's incarnation follows the canonical renumbering"
+        );
+    }
+
+    /// Wire compatibility of `PendingCostMoveResume::Cast`'s ledger: an empty
+    /// ledger is not written, and a root serialized before the fields existed
+    /// deserializes with both empty.
+    #[test]
+    fn cast_cost_move_root_ledger_is_additive_on_the_wire() {
+        let root = PendingCostMoveResume::Cast {
+            player: PlayerId(0),
+            pending: None,
+            chosen: vec![ObjectId(3)],
+            paused_at_index: 0,
+            destination: Zone::Hand,
+            completion: PendingCostMoveCompletion::FinishPending,
+            deferred_cost_events: vec![],
+            departure_record_indices: vec![],
+        };
+        let json = serde_json::to_string(&root).expect("serialize the root");
+        assert!(
+            !json.contains("deferred_cost_events") && !json.contains("departure_record_indices"),
+            "an empty ledger is not written: {json}"
+        );
+        // Reach guard: a non-empty ledger is written, and survives a round trip.
+        let populated = PendingCostMoveResume::Cast {
+            player: PlayerId(0),
+            pending: None,
+            chosen: vec![ObjectId(3)],
+            paused_at_index: 0,
+            destination: Zone::Hand,
+            completion: PendingCostMoveCompletion::FinishPending,
+            deferred_cost_events: vec![],
+            departure_record_indices: vec![4, 5],
+        };
+        let populated_json = serde_json::to_string(&populated).expect("serialize");
+        assert!(populated_json.contains("departure_record_indices"));
+        let restored: PendingCostMoveResume =
+            serde_json::from_str(&populated_json).expect("deserialize");
+        assert!(matches!(
+            restored,
+            PendingCostMoveResume::Cast {
+                departure_record_indices,
+                ..
+            } if departure_record_indices == vec![4, 5]
+        ));
+
+        // The pre-ledger shape (no ledger keys) still deserializes.
+        let legacy: PendingCostMoveResume =
+            serde_json::from_str(&json).expect("deserialize a root without ledger keys");
+        assert!(matches!(
+            legacy,
+            PendingCostMoveResume::Cast {
+                deferred_cost_events,
+                departure_record_indices,
+                ..
+            } if deferred_cost_events.is_empty() && departure_record_indices.is_empty()
+        ));
     }
 
     /// N1 (P5b-1, C5b1.4): CR 104.4b + CR 608.2h: `normalize_for_loop` keeps

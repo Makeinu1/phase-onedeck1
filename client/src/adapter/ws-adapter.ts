@@ -215,11 +215,25 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 150 — DebugAction gains GainLife / LoseLife (Sandbox life changes through the
+ * 153 — DebugAction gains GainLife / LoseLife (Sandbox life changes through the
  *      CR 119.3 events), carried in GameAction.Debug — see PROTOCOL_VERSION's
- *      own `/// 150` entry in crates/lobby-broker/src/protocol.rs. A v149 peer
+ *      own `/// 153` entry in crates/lobby-broker/src/protocol.rs. A v152 peer
  *      cannot parse the tags; the exact-match version check at connect refuses
- *      the pairing. Wire 132 moves with it.
+ *      the pairing. Wire 135 moves with it.
+ * 152 — ShortcutDecisionSchema gains suggested_declaration and leading_aims, and
+ *      ShortcutProposal gains leading_aims; a v151 peer drops them. Wire 134 moves
+ *      with it.
+ * 151: Populated GameObject.bestow_form carries the removed creature subtypes
+ *      as an object instead of a boolean. Old native readers cannot decode it.
+ *      Wire 133 moves with it.
+ * 150 — The cast-this-way gains rider's serialized payload is reshaped: the
+ *      ExileWithAltCost permission's enters_with_modifications becomes a
+ *      PendingEntersModifications object (was a ContinuousModification array) and
+ *      Effect.AddPendingEntersModifications carries its rider object in place of
+ *      the required modifications array — a v149 server or client cannot parse
+ *      either new shape. Full-game peers and P2P move in lockstep (wire 132); see
+ *      PROTOCOL_VERSION's own `/// 150` entry in
+ *      crates/lobby-broker/src/protocol.rs.
  * 149 — The CR 608.2n final part of a spell's resolution is owed on the
  *      resolution carrier: `GameState::deferred_spell_delivery` (v110) is removed
  *      and `GameState::resolving_spell_final_part` (`{ spell }`) marks an instant
@@ -913,7 +927,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 150;
+export const PROTOCOL_VERSION = 153;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

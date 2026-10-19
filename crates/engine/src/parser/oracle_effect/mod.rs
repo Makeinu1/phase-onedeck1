@@ -193,10 +193,10 @@ pub(crate) use crate::parser::oracle_ir::context::{
     PriorZoneChoicePartition, TokenPtFollowup, TriggerConditionScope,
 };
 use crate::parser::oracle_ir::effect_chain::{
-    AbilityIr, AbilityRootTransform, AbilityShellIr, AbsorbKind, ClauseDisposition, ClauseIr,
-    ClauseIrBuilder, ClausePlacement, DieResultBranchIr, EffectChainIr, InjectedColorChoice,
-    OtherwiseKind, PlayerScopeRewrite, PriorModifier, ReplaceMeaningKind, ReplicateKind,
-    ResidualConditionPolicy, ShellStage,
+    AbilityIr, AbilityRootTransform, AbilityShellIr, AbsorbKind, ClauseDisposition, ClauseId,
+    ClauseIr, ClauseIrBuilder, ClausePlacement, DieResultBranchIr, EffectChainIr,
+    InjectedColorChoice, OtherwiseKind, PlayerScopeRewrite, PriorModifier, ReplaceMeaningKind,
+    ReplicateKind, ResidualConditionPolicy, ShellStage,
 };
 use crate::types::ability::TargetChoiceTiming;
 use crate::types::mana::ManaExpiry;
@@ -4322,12 +4322,16 @@ pub(crate) fn parse_cast_this_way_enters_with_counter(lower: &str) -> Option<(Co
 /// `grant_lingering_permissions` is the only runtime consumer of the rider.
 fn try_parse_cast_this_way_enters_rider(lower: &str) -> Option<ParsedEffectClause> {
     let (counter_type, rest) = parse_cast_this_way_enters_with_counter(lower)?;
+    // The counter grammar ends at " counter on it"; consume the sentence's own
+    // terminal period here so the shared completeness witness below can require
+    // an otherwise-exhausted remainder (a leftover "." or ".." must decline).
+    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(rest).ok()?;
     let counter_effect = Effect::AddPendingETBCounters {
         counter_type,
         count: QuantityExpr::Fixed { value: 1 },
     };
     // Counter-only rider (Osteomancer Adept, no tail) — unchanged behavior.
-    if rest.trim_end_matches('.').trim().is_empty() {
+    if rider_remainder_is_complete(rest) {
         return Some(parsed_clause(counter_effect));
     }
     // CR 205.1b: optional " and is a <descriptor>" additive type grant, where
@@ -4350,7 +4354,12 @@ fn try_parse_cast_this_way_enters_rider(lower: &str) -> Option<ParsedEffectClaus
     clause.sub_ability = Some(Box::new(AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::AddPendingEntersModifications {
-            modifications: mods,
+            rider: crate::types::ability::PendingEntersModifications {
+                modifications: mods,
+                // The counter rider's type tail is an unconditional grant; the
+                // printed quality gate exists only on the gains-rider prefix.
+                cast_filter: None,
+            },
         },
     )));
     Some(clause)
@@ -4413,6 +4422,318 @@ fn entry_counter_rider_clause(
         }
         _ => None,
     }
+}
+
+/// The shared terminal-remainder witness for the cast-this-way rider family: a
+/// rider is a COMPLETE sentence only when the body grammar's remainder is
+/// exhausted modulo trailing whitespace (`terminated(space0, eof)`), so a
+/// period or any other leftover text cannot dispatch as a complete rider. The
+/// body grammars consume their own sentence period; a remainder that still
+/// carries punctuation is a partial parse and declines.
+fn rider_remainder_is_complete(remainder: &str) -> bool {
+    use nom::character::complete::space0;
+    use nom::combinator::{all_consuming, eof};
+    use nom::sequence::terminated;
+    all_consuming(terminated(
+        space0::<_, OracleError<'_>>,
+        eof::<_, OracleError<'_>>,
+    ))
+    .parse(remainder)
+    .is_ok()
+}
+
+/// CR 608.2c + CR 611.2a + CR 611.2c: the cast-permission gains-modifications
+/// rider — "If you cast a [quality] spell this way, it gains <continuous
+/// modifications>" (Strago and Relm; The Mysterious Sphere). Lowers to
+/// `Effect::AddPendingEntersModifications`, attached as the `CastFromZone` /
+/// `CastCopyOfCard` sub-ability and consumed as cast-permission metadata
+/// (recorded on the granted `ExileWithAltCost`, applied once at cast
+/// finalization scoped to the cast object).
+///
+/// The `"if you do, it gains …"` gate form is recognized at the chain seam
+/// (`parse_effect_chain_ir`), where the preceding clause is visible and the
+/// parent context can require a cast grant.
+///
+/// Invoked at the top of `parse_effect_clause`, BEFORE the clause shell peels a
+/// trailing duration: the carrier has no duration channel, so the recognizer
+/// must see (and refuse) a stated duration itself rather than let the peel hide
+/// it and the shell re-apply it to a mis-claimed permanent grant.
+///
+/// Declines, each for a stated reason:
+///   * a stated duration (`strip_trailing_duration` in the body helper) — the
+///     metadata carrier has no duration channel, so a duration-bound body must
+///     not be misrepresented as permanent (CR 611.2a);
+///   * the no-quality wording ("if you cast a spell this way, ") — owned by the
+///     chain-level `strip_cast_this_way_gate`, whose reading is a CR 603.7
+///     delayed trigger for the classes it serves; accepting the same text here
+///     with different semantics would be coverage dishonesty;
+///   * a partially-consumed or unclassifiable body — falls through to the
+///     existing lowering, never a silent drop.
+fn try_parse_cast_this_way_gains_rider(lower: &str) -> Option<ParsedEffectClause> {
+    let text = lower.trim_start();
+    let (rest, cast_filter) = parse_cast_this_way_gains_rider_prefix(text)?;
+    let (remainder, modifications) = try_parse_cast_this_way_gains_rider_body(rest)?;
+    if rider_remainder_is_complete(remainder) {
+        Some(parsed_clause(Effect::AddPendingEntersModifications {
+            rider: crate::types::ability::PendingEntersModifications {
+                modifications,
+                cast_filter,
+            },
+        }))
+    } else {
+        None
+    }
+}
+
+/// The shared prefix core of the gains-modifications rider: "if you cast
+/// <quality> spell this way, " (the quality noun phrase, parsed as a typed
+/// spell predicate) or the anaphoric "if you cast it this way, " (no quality →
+/// unconditional). Deliberately rejects the no-quality wording "if you cast a
+/// spell this way, " — that form is owned by the chain-level
+/// `strip_cast_this_way_gate` and must not be duplicated here with different
+/// semantics. A quality phrase that is not a recognized type phrase declines
+/// the whole rider rather than dropping the printed condition.
+fn parse_cast_this_way_gains_rider_prefix(text: &str) -> Option<(&str, Option<TargetFilter>)> {
+    let (rest, cast_filter) = preceded(
+        tag::<_, _, OracleError<'_>>("if you cast "),
+        alt((
+            value(None, tag::<_, _, OracleError<'_>>("it this way, ")),
+            nom::combinator::map(
+                terminated(
+                    map_opt(
+                        verify(
+                            take_until::<_, _, OracleError<'_>>(" spell this way, "),
+                            |quality: &&str| !matches!(quality.trim(), "a" | "an"),
+                        ),
+                        parse_spell_quality_filter,
+                    ),
+                    tag::<_, _, OracleError<'_>>(" spell this way, "),
+                ),
+                Some,
+            ),
+        )),
+    )
+    .parse(text)
+    .ok()?;
+    Some((rest, cast_filter))
+}
+
+/// CR 608.2c + CR 601.2a: parse the printed spell-quality noun phrase of a
+/// cast-this-way rider ("a creature", "an instant or sorcery") into the typed
+/// predicate evaluated against the elected spell at finalization. Returns
+/// `None` when the phrase is not a recognized type phrase — the rider then
+/// declines to parse rather than silently dropping its printed condition.
+fn parse_spell_quality_filter(quality: &str) -> Option<TargetFilter> {
+    let (filter, remainder) =
+        crate::parser::oracle_target::parse_type_phrase_folding(quality.trim());
+    remainder.trim().is_empty().then_some(filter)
+}
+
+/// The printed spell-quality predicate of a matched cast-this-way gains-rider
+/// sentence, for the swallow detector's quality-matched exemption. Returns
+/// `None` when the text is not a gains-rider sentence at all; `Some(None)` for
+/// the unconditional anaphoric form ("if you cast it this way"); `Some(Some(p))`
+/// for the quality form ("if you cast a creature spell this way" → the typed
+/// creature predicate). The caller matches the exact predicate against the
+/// delivered carrier's `cast_filter`, so a carrier missing the very condition
+/// its sentence names can never clear the warning.
+pub(crate) fn cast_this_way_gains_rider_sentence_quality(
+    text: &str,
+) -> Option<Option<TargetFilter>> {
+    let text = text.trim_start();
+    let (_, cast_filter) = parse_cast_this_way_gains_rider_prefix(text)?;
+    Some(cast_filter)
+}
+
+/// The shared body core of the gains-modifications rider: the anaphoric subject
+/// ("it gains …") plus the modification-body grammar. Returns the unconsumed
+/// remainder AND the typed modifications from the same pass, so the detector's
+/// consumed span and the lowering's accepted span cannot drift apart.
+///
+/// CR 611.2a: a stated duration declines — `AddPendingEntersModifications`
+/// carries no duration and is applied as `Duration::Permanent`, so a
+/// duration-bound body (Alaundo the Seer's "gains haste until end of turn")
+/// must stay on its existing lowering rather than be claimed as permanent.
+///
+/// Values come from the shared `parse_continuous_modifications` authority (the
+/// same classifier the existing counter/type rider family and the static route
+/// use), so a rider body and an identical static body cannot classify
+/// differently. The keyword/quoted grammar is the full-consumption witness:
+/// an empty quoted segment or an unknown keyword fails the match; an unknown
+/// non-empty quoted body is represented by the shared inner classifier as a
+/// GrantAbility carrying Unimplemented, never silently dropped.
+pub(crate) fn try_parse_cast_this_way_gains_rider_body(
+    text: &str,
+) -> Option<(&str, Vec<ContinuousModification>)> {
+    let text = text.trim_start();
+    // Anaphoric subject for the spell/permanent cast under the granted
+    // permission. `~` is the normalized self-reference form; the literal
+    // "this creature" form reaches this recognizer from the detector's raw
+    // unit text (mirroring `parse_cast_this_way_enters_with_counter`).
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("it gains "),
+        tag("that creature gains "),
+        tag("this creature gains "),
+        tag("~ gains "),
+        tag("this permanent gains "),
+    ))
+    .parse(text)
+    .ok()?;
+    // `strip_trailing_duration` TRIMS both ends before parsing (its no-duration
+    // return is `rest.trim()`), and the body grammar's remainder is relative to
+    // that trimmed slice. Assemble the consumed span from the slice's own offset
+    // inside `text` plus the portion consumed from `body`, and re-slice the
+    // returned remainder from `text`: otherwise every caller's
+    // `text.len() - remainder.len()` span arithmetic is off by the trimmed
+    // bytes (and a populated `parse_continuous_modifications` window can reach
+    // into the unconsumed tail).
+    let rest_offset = text.len() - rest.len();
+    let (body, duration) = strip_trailing_duration(rest);
+    if duration.is_some() {
+        return None;
+    }
+    let body_offset = rest_offset + (rest.len() - rest.trim_start().len());
+    let (remainder, ()) = parse_cast_this_way_gains_rider_body_grammar(body).ok()?;
+    let consumed_len = body_offset + (body.len() - remainder.len());
+    let modifications =
+        crate::parser::oracle_static::parse_continuous_modifications(&text[..consumed_len]);
+    if modifications.is_empty() {
+        return None;
+    }
+    Some((&text[consumed_len..], modifications))
+}
+
+/// The gains-rider body grammar: one or more modification segments (an
+/// evergreen-keyword grant list or a quoted granted ability) separated by the
+/// printed separators, with an optional terminal period. The segments are the
+/// full-consumption witness; the values are classified by the shared
+/// `parse_continuous_modifications` authority, so the two can disagree only
+/// about whether a body is fully consumable, never about what it means.
+fn parse_cast_this_way_gains_rider_body_grammar(input: &str) -> OracleResult<'_, ()> {
+    let (rest, ()) = parse_cast_this_way_gains_rider_segment(input)?;
+    let (rest, _) = many0(preceded(
+        alt((tag(", and "), tag(", "), tag(" and "))),
+        parse_cast_this_way_gains_rider_segment,
+    ))
+    .parse(rest)?;
+    let (rest, _) = opt(tag(".")).parse(rest)?;
+    Ok((rest, ()))
+}
+
+/// One body segment: a quoted granted ability (required to classify non-empty
+/// through the shared inner classifier — only an empty quoted body fails the
+/// segment match, while an unknown non-empty quoted ability is represented as
+/// a GrantAbility carrying Unimplemented, never silently dropped) or an
+/// evergreen-keyword grant list.
+fn parse_cast_this_way_gains_rider_segment(input: &str) -> OracleResult<'_, ()> {
+    alt((
+        parse_cast_this_way_gains_rider_quoted_segment,
+        parse_cast_this_way_gains_rider_keyword_segment,
+    ))
+    .parse(input)
+}
+
+fn parse_cast_this_way_gains_rider_quoted_segment(input: &str) -> OracleResult<'_, ()> {
+    use nom::character::complete::char;
+    use nom::sequence::delimited;
+    let (rest, inner) = delimited(char('"'), take_until("\""), char('"')).parse(input)?;
+    if crate::parser::oracle_static::classify_quoted_inner(inner).is_empty() {
+        return Err(oracle_err(input));
+    }
+    Ok((rest, ()))
+}
+
+fn parse_cast_this_way_gains_rider_keyword_segment(input: &str) -> OracleResult<'_, ()> {
+    // `parse_keyword_grant_list` returns (keywords, remainder); it never
+    // returns an empty list.
+    let (_keywords, rest) =
+        sequence::parse_keyword_grant_list(input).ok_or_else(|| oracle_err(input))?;
+    Ok((rest, ()))
+}
+
+/// The recognizer's own consumed span, shared with the swallow detector: runs
+/// the same prefix + body core the lowering runs and returns the consumed byte
+/// length only when the consumed span is a COMPLETE rider sentence. A
+/// partially-consumed body yields no span — the lowering's own accepted span
+/// and the detector's sentence span therefore agree by construction.
+///
+/// The trailing-sentence tolerance exists because the detector runs on the REST
+/// OF THE UNIT: at Strago's real rider sentence the remainder is
+/// `" activate only as a sorcery."` (BF-P2-7), so a literal whole-remainder
+/// emptiness test would return no span, sever at the quoted internal period,
+/// and regress the detector positive. The two legs are therefore:
+///
+/// 1. the lowering's own accepted span — remainder exhausted modulo trailing
+///    whitespace (the shared `rider_remainder_is_complete` witness; the body
+///    grammar consumes its own sentence period); or
+/// 2. the span ends at one of the body grammar's own sentence terminals (`.`,
+///    or the quoted segment's closing `."`) AND the untrimmed remainder does
+///    not resume the modification list. Every mid-list partial stop resumes at
+///    a separator the grammar restores (`parse_keyword_grant_list` and the
+///    body `many0` both restore the separator they failed on), so leg 2
+///    rejects it; a partial stop that never reaches a sentence terminal is
+///    rejected by the terminal test.
+pub(crate) fn cast_this_way_gains_rider_consumed_len(text: &str) -> Option<usize> {
+    let text = text.trim_start();
+    // ASCII lowercasing preserves byte offsets: the detector slices the
+    // ORIGINAL text by the returned length, so a Unicode-aware fold that
+    // changed any character's byte length would corrupt the span.
+    let lower = text.to_ascii_lowercase();
+    let (rest, _cast_filter) = parse_cast_this_way_gains_rider_prefix(&lower)?;
+    let (remainder, _modifications) = try_parse_cast_this_way_gains_rider_body(rest)?;
+    let span = text.len() - remainder.len();
+    if rider_remainder_is_complete(remainder) {
+        return Some(span);
+    }
+    if consumed_span_ends_at_sentence_terminal(&lower[..span])
+        && !remainder_resumes_modification_list(remainder)
+    {
+        return Some(span);
+    }
+    None
+}
+
+/// Whether `span` ends at one of the body grammar's own sentence terminals —
+/// the quoted segment's closing `."` or the consumed terminal `.` — parsed with
+/// the grammar's own terminal shapes against the span's tail bytes, anchored at
+/// the span's end so a non-terminal tail byte can never satisfy it.
+///
+/// The quoted terminal has TWO measured shapes. As printed it is `."`; the
+/// swallow detector's sentence-join normalization inserts a space after every
+/// period (`strip_represented_tiered_pairs_from_line` rejoins with `" "`), so by
+/// the time the detector runs this helper the same closing quote arrives as
+/// `. "` (BF-P2-7 measured shape). Both are the quoted segment's own terminal,
+/// so both are accepted. Structural classification of already-parsed text, not
+/// parsing dispatch.
+fn consumed_span_ends_at_sentence_terminal(span: &str) -> bool {
+    (1..=3).rev().any(|tail_len| {
+        let start = span.len().saturating_sub(tail_len);
+        span.is_char_boundary(start)
+            && matches!(
+                alt((
+                    tag::<_, _, OracleError<'_>>(".\""),
+                    tag(". \""),
+                    tag("."),
+                ))
+                .parse(&span[start..]),
+                Ok((rest, _)) if rest.is_empty()
+            )
+    })
+}
+
+/// Whether the untrimmed remainder resumes the modification list — i.e. starts
+/// at one of the body grammar's own separators. A partially-consumed body stops
+/// at the separator it failed on, so this rejects every mid-list partial whose
+/// span happens to end at a sentence terminal.
+fn remainder_resumes_modification_list(remainder: &str) -> bool {
+    alt((
+        tag::<_, _, OracleError<'_>>(", and "),
+        tag(", "),
+        tag(" and "),
+        tag("and "),
+    ))
+    .parse(remainder)
+    .is_ok()
 }
 
 /// CR 603.6 + CR 702.26a: One self-referential event verb of a delayed-trigger
@@ -6263,7 +6584,7 @@ fn try_parse_airbend_clause(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
                         source_id: None,
                         graveyard_replacement: None,
                         enters_with_counter: None,
-                        enters_with_modifications: Vec::new(),
+                        enters_with_modifications: Default::default(),
                         mana_spend_permission: None,
                         cast_cost_modifier: None,
                     },
@@ -8805,6 +9126,21 @@ pub(crate) fn parse_effect_clause(text: &str, ctx: &mut ParseContext) -> ParsedE
         if let Some(clause) =
             try_parse_temporary_cant_become_tapped(TextPair::new(text, &cant_tap_lower))
         {
+            return clause;
+        }
+    }
+    // CR 608.2c + CR 611.2a: "If you cast a [quality] spell this way, it gains …"
+    // — the gains-modifications cast-permission rider (Strago and Relm; The
+    // Mysterious Sphere). Attaches as the `CastFromZone`/`CastCopyOfCard`
+    // sub-ability, consumed as permission metadata. Like the temporary-attack
+    // recognizer above, it OWNS ITS DURATION (the carrier has no duration
+    // channel), so it must dispatch BEFORE the clause shell peels a trailing
+    // duration off the clause — otherwise a duration-bound body (Alaundo the
+    // Seer's "it gains haste until end of turn") reaches the recognizer with
+    // its duration already removed and would be claimed as a permanent grant.
+    {
+        let gains_lower = text.to_lowercase();
+        if let Some(clause) = try_parse_cast_this_way_gains_rider(&gains_lower) {
             return clause;
         }
     }
@@ -41568,6 +41904,145 @@ fn strip_trailing_coin_heads_quantifier(text: &str) -> Option<&str> {
     Some(text[..base.len()].trim_end())
 }
 
+// CR 608.2c: only these explicit Hand-fold alternatives share one search result.
+// The A4 reveal caller retains its own unguarded, all-consuming eligibility gate.
+fn search_hand_fold_owners(non_absorbed: &[&ClauseIr]) -> Option<Vec<ClauseId>> {
+    let mut owners = Vec::new();
+    for member in non_absorbed {
+        if !matches!(member.parsed.effect, Effect::SearchLibrary { .. }) {
+            return None;
+        }
+        match &member.disposition {
+            ClauseDisposition::FoldSearchIntoElse {
+                intrinsic:
+                    Some(ContinuationAst::SearchDestination {
+                        destination: Zone::Hand,
+                        ..
+                    }),
+            } => owners.push(member.id),
+            ClauseDisposition::Emit {
+                intrinsic: Some(ContinuationAst::SearchDestination { destination, .. }),
+                ..
+            } if owners.is_empty() || *destination == Zone::Hand => {
+                owners.push(member.id);
+                return Some(owners);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+// CR 608.2c: bind only the immediately preceding source instruction. A pure
+// reveal may continue it; no unrelated clause can be skipped to find a search.
+fn adjacent_search_result_owners(
+    clauses: &[ClauseIr],
+    ctx: &ParseContext,
+) -> Option<Vec<ClauseId>> {
+    let (last, prefix) = clauses.split_last()?;
+    let clauses = if matches!(
+        last.disposition,
+        ClauseDisposition::Continue {
+            continuation: Some(
+                ContinuationAst::SearchRevealResult | ContinuationAst::SearchResultClauseHandled
+            )
+        }
+    ) {
+        if last.condition.is_some()
+            || last.parsed.condition.is_some()
+            || last.parsed.unlowered_guard.is_some()
+            || last.is_optional
+            || last.parsed.optional
+            || last.delayed_condition.is_some()
+            || last.prefix_delayed_condition.is_some()
+            || last.player_scope.is_some()
+            || last.opponent_may_scope.is_some()
+            || last.repeat_for.is_some()
+            || last.multi_target.is_some()
+        {
+            return None;
+        }
+        let previous = prefix.last()?;
+        let mut trial = ctx.clone_throwaway();
+        if !matches!(
+            parse_followup_continuation_ast(
+                last.source.fragment()?,
+                &previous.parsed.effect,
+                &mut trial
+            ),
+            Some(ContinuationAst::SearchRevealResult)
+        ) {
+            return None;
+        }
+        prefix
+    } else {
+        clauses
+    };
+    let last = clauses.last()?;
+    if !matches!(last.parsed.effect, Effect::SearchLibrary { .. })
+        || last.disposition.followup().is_some()
+        || last.parsed.sub_ability.is_some()
+        || last.parsed.multi_target.is_some()
+        || last.multi_target.is_some()
+        || last.parsed.unlowered_guard.is_some()
+        || last.delayed_condition.is_some()
+        || last.prefix_delayed_condition.is_some()
+        || last.player_scope.is_some()
+        || last.opponent_may_scope.is_some()
+        || last.repeat_for.is_some()
+    {
+        return None;
+    }
+    if matches!(last.disposition, ClauseDisposition::Emit { .. })
+        && (last.condition.is_some() || last.parsed.condition.is_some())
+    {
+        return None;
+    }
+    if matches!(
+        last.disposition,
+        ClauseDisposition::Emit {
+            intrinsic: None,
+            followup: None
+        }
+    ) {
+        return Some(vec![last.id]);
+    }
+    search_hand_fold_owners(&clauses.iter().rev().collect::<Vec<_>>())
+}
+
+// The unsupported State policy is unchanged outside this proven search-result
+// destination. Diagnose from the original AST before shell stripping loses it.
+fn unsupported_search_result_guard(
+    text: &str,
+    clauses: &[ClauseIr],
+    ctx: &ParseContext,
+) -> Option<(String, ParsedEffectClause)> {
+    adjacent_search_result_owners(clauses, ctx)?;
+    let mut trial = ctx.clone_throwaway();
+    let ClauseAst::Conditional {
+        guard: ConditionalGuard::Unlowered(GuardReading::State),
+        clause_text,
+        clause,
+    } = parse_clause_ast(text, &mut trial)
+    else {
+        return None;
+    };
+    let body = lower_clause_ast(*clause, &mut trial, &clause_text);
+    if !matches!(
+        body.effect,
+        Effect::ChangeZone {
+            target: TargetFilter::ParentTarget | TargetFilter::ParentTargetSlot { .. },
+            ..
+        }
+    ) || body.multi_target.is_some()
+        || body.sub_ability.is_some()
+        || is_ownership_candidate(GuardReading::State, &body)
+    {
+        return None;
+    }
+    Some((clause_text, body))
+}
+
 /// Parse an effect chain into its IR. A thin wrapper around
 /// [`parse_effect_chain_ir_body`] so every one of its return paths passes
 /// through the per-opponent choice tail rule
@@ -41750,6 +42225,9 @@ fn parse_effect_chain_ir_body(
     // player performs the action. Only propagates within a single sentence /
     // chain; the anchor is reset at each top-level call.
     let mut chunk_diagnostics: Vec<OracleDiagnostic> = Vec::new();
+    // CR 608.2c: a refused conditional can own only the next source chunk's
+    // alternative. Keep its identity outside the scrubbed executable metadata.
+    let mut pending_rejected_search_guard: Option<ClauseId> = None;
     // CR 608.2c: "Repeat the following process N times." appears as its own
     // sentence before the body clause. The count is stashed here and applied
     // to the immediately-following clause so the body executes N times.
@@ -41853,7 +42331,7 @@ fn parse_effect_chain_ir_body(
     // statement-level `return` — so no value can escape to the caller.
     let outer_declared_object_target = ctx.chain_declared_object_target.take();
     let outer_declared_slots = std::mem::take(&mut ctx.chain_declared_slots);
-    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+    'chunks: for (chunk_idx, chunk) in chunks.iter().enumerate() {
         // CR 601.2c + CR 608.2c: FIRST statement of the body, so the antecedent
         // is published PATH-INDEPENDENTLY — ahead of `try_parse_generic_instead_clause`
         // (the producer for the "If <cond>, instead <body>" rider that carries
@@ -41864,6 +42342,7 @@ fn parse_effect_chain_ir_body(
         // a stale antecedent for the next chunk.
         ctx.chain_declared_object_target = chain_declared_object_target(builder.clauses()).cloned();
         ctx.chain_declared_slots = chain_declared_slot_registry(builder.clauses());
+        let prospective_rejected_guard = pending_rejected_search_guard.take();
         // TOP of the iteration: check the PREVIOUS iteration's stamp, then re-arm.
         debug_assert!(
             pending_stamp
@@ -42296,6 +42775,28 @@ fn parse_effect_chain_ir_body(
             crate::parser::oracle_nom::condition::parse_otherwise_branch_connector(i)
         });
         if let Some((_, else_text)) = otherwise_rest {
+            // CR 608.2c: this alternative belongs to the immediately preceding
+            // refused source conditional, not an older represented condition.
+            if prospective_rejected_guard.is_some_and(|owner| {
+                builder.clauses().last().map(|clause| clause.id) == Some(owner)
+            }) {
+                builder
+                    .clause(
+                        &chunk.text,
+                        placeholder_parsed_clause("otherwise_placeholder"),
+                        chunk.boundary_after,
+                        ClauseDisposition::Emit {
+                            followup: None,
+                            intrinsic: None,
+                        },
+                    )
+                    .push();
+                builder
+                    .last_mut()
+                    .expect("just minted alternative source clause")
+                    .replace_with_gap("search_result_condition");
+                continue;
+            }
             // CR 608.2c: The else-branch is parsed as its own chain, so its anaphors
             // must inherit the referent established BEFORE the paired conditional it
             // is the else of. Walk the outer chain past that one conditional
@@ -43493,6 +43994,49 @@ fn parse_effect_chain_ir_body(
             (Some(reflexive), None) => Some(reflexive),
             (None, None) => None,
         };
+        // CR 608.2c + CR 611.2a: "If you do, it gains <modifications>" after the
+        // chain's most recent clause granted the cast is the same
+        // gains-modifications rider in its gate form (The Mysterious Sphere's
+        // copy route; synthetic Strago gate form). The parent context is what
+        // distinguishes this rider from a generic `IfYouDo` consequence, and
+        // this chain seam is the one place where the prior clauses are visible
+        // (mirroring `chain_granted_cast_permission_has_card_target`). A body
+        // this recognizer does not fully consume falls through unchanged, so
+        // every other "if you do, it gains …" member of the corpus keeps its
+        // existing lowering.
+        if condition
+            .as_ref()
+            .is_some_and(AbilityCondition::is_optional_effect_performed)
+            && chain_most_recent_clause_is_cast_grant(builder.clauses())
+        {
+            if let Some((remainder, modifications)) =
+                try_parse_cast_this_way_gains_rider_body(&text)
+            {
+                if rider_remainder_is_complete(remainder) {
+                    builder
+                        .clause(
+                            normalized_text,
+                            parsed_clause(Effect::AddPendingEntersModifications {
+                                rider: crate::types::ability::PendingEntersModifications {
+                                    modifications,
+                                    // The "If you do, it gains …" gate form carries no
+                                    // printed spell-quality condition; the gate is the
+                                    // optional-effect-performed condition itself.
+                                    cast_filter: None,
+                                },
+                            }),
+                            chunk.boundary_after,
+                            ClauseDisposition::Emit {
+                                followup: None,
+                                intrinsic: None,
+                            },
+                        )
+                        .condition(condition.clone())
+                        .push();
+                    continue;
+                }
+            }
+        }
         // CR 608.2c + CR 608.2d: When NO typed condition matched any pass above,
         // fall back to a structural-only strip that removes an unrepresentable
         // `If <X>, ` head ONLY when the body begins with `"you may "`. This
@@ -44513,6 +45057,13 @@ fn parse_effect_chain_ir_body(
         {
             ctx.object_pronoun_ref = Some(TargetFilter::SelfRef);
         }
+
+        let rejected_search_guard =
+            if player_scope.is_none() && opponent_may_scope.is_none() && repeat_for.is_none() {
+                unsupported_search_result_guard(normalized_text, builder.clauses(), ctx)
+            } else {
+                None
+            };
 
         // CR 603.7a: Check for temporal prefix before suffix. When present, parse the
         // inner effect through the full pipeline and wrap in CreateDelayedTrigger.
@@ -45929,30 +46480,7 @@ fn parse_effect_chain_ir_body(
             {
                 return None;
             }
-            let mut owners = Vec::new();
-            for member in &non_absorbed {
-                if !matches!(member.parsed.effect, Effect::SearchLibrary { .. }) {
-                    return None;
-                }
-                match &member.disposition {
-                    ClauseDisposition::FoldSearchIntoElse {
-                        intrinsic:
-                            Some(ContinuationAst::SearchDestination {
-                                destination: Zone::Hand,
-                                ..
-                            }),
-                    } => owners.push(member.id),
-                    ClauseDisposition::Emit {
-                        intrinsic: Some(ContinuationAst::SearchDestination { destination, .. }),
-                        ..
-                    } if owners.is_empty() || *destination == Zone::Hand => {
-                        owners.push(member.id);
-                        return Some(owners);
-                    }
-                    _ => return None,
-                }
-            }
-            None
+            search_hand_fold_owners(&non_absorbed)
         })();
         let effective_prev_is_search_destination_exile = absorbed_choice_prev.is_none()
             && non_absorbed.first().is_some_and(|previous| {
@@ -46001,551 +46529,595 @@ fn parse_effect_chain_ir_body(
                 (Some(imperative::ShuffleRestClause::Imperative) | None, _) => {}
             }
         }
-        let mut followup_continuation = effective_prev_effect
-            .as_ref()
-            .and_then(|eff| {
-                sequence::parse_followup_continuation_ast_with_search_destination(
-                    normalized_text,
-                    eff,
-                    ctx,
-                    effective_prev_is_search_destination_exile,
-                )
-            })
-            .or_else(|| {
-                // CR 608.2c: when the nearest non-absorbed clause is
-                // lookback-transparent (e.g. `Sacrifice` — Birthing Ritual),
-                // continue searching deeper for a `Dig`/`Mill` antecedent. The
-                // parser is the detector: only redirect if a deeper clause
-                // actually yields a `Dig`-patching continuation. Both arms
-                // patch the same `Dig`: `DigFromAmong` is the "put N from
-                // among those cards" selection (clause 3), `PutRest` is the
-                // trailing "put the rest on the bottom" remainder placement
-                // (clause 4). Both must reach back past the intervening
-                // `Sacrifice` to the `Dig`.
-                let nearest = effective_prev_effect.as_ref()?;
-                if !clause_is_dig_lookback_transparent(nearest) {
-                    return None;
-                }
-                non_absorbed.iter().skip(1).find_map(|c| {
-                    let deeper = effective_effect_of(c);
-                    match parse_followup_continuation_ast(normalized_text, &deeper, ctx) {
-                        Some(
-                            continuation @ (ContinuationAst::DigFromAmong { .. }
-                            | ContinuationAst::PutRest { .. }),
-                        ) => Some(continuation),
-                        _ => None,
-                    }
+        'source_clause: {
+            if let Some((fragment, body)) = rejected_search_guard.filter(|_| {
+                delayed_condition.is_none()
+                    && player_scope.is_none()
+                    && opponent_may_scope.is_none()
+                    && repeat_for.is_none()
+                    && !is_distributed_chunk
+            }) {
+                // CR 608.2c: retain this refused conditional at its own source
+                // position and preserve ownership of its immediate alternative.
+                builder
+                    .clause(
+                        &fragment,
+                        body,
+                        chunk.boundary_after,
+                        ClauseDisposition::Emit {
+                            followup: None,
+                            intrinsic: None,
+                        },
+                    )
+                    .push();
+                let rejected = builder
+                    .clauses()
+                    .last()
+                    .expect("just minted source clause")
+                    .id;
+                pending_rejected_search_guard = Some(rejected);
+                builder
+                    .clauses_mut()
+                    .iter_mut()
+                    .find(|clause| clause.id == rejected)
+                    .expect("minted clause remains in builder")
+                    .replace_with_gap("search_result_condition");
+                break 'source_clause;
+            }
+            let mut followup_continuation = effective_prev_effect
+                .as_ref()
+                .and_then(|eff| {
+                    sequence::parse_followup_continuation_ast_with_search_destination(
+                        normalized_text,
+                        eff,
+                        ctx,
+                        effective_prev_is_search_destination_exile,
+                    )
                 })
-            })
-            .or_else(|| {
-                // CR 701.20a + CR 608.2c: A clause disposing of cards revealed by an
-                // earlier `RevealUntil` ("put all cards revealed this way...",
-                // "put the nonland card into your hand and the rest...", "put the revealed cards...")
-                // may be separated from the `RevealUntil` by intervening transparent
-                // instructions that use the revealed card (such as `Pump` on Erratic Mutation,
-                // or `DealDamage` on Explosive Revelation).
-                // Scan `non_absorbed` (nearest-first) for a preceding `RevealUntil` antecedent.
-                // The parser is the detector: only bind if `parse_followup_continuation_ast`
-                // against the candidate `RevealUntil` produces a recognized pile-disposition
-                // continuation. The scan stops at an unparsed clause: an unrecognized
-                // instruction may itself select or re-bind the referent ("Choose one of the
-                // revealed creature cards", Dance, Pathetic Marionette), so a later "all
-                // other cards revealed this way" can no longer be read as the reveal's rest
-                // pile. `RevealUntilKept` is never bound across clauses: its "put it" /
-                // "put that card" anaphor names the nearest referent, and its application
-                // patches only the immediately preceding definition.
-                // A conditional "instead" override of an intervening damage
-                // instruction ("If the revealed land card was a Mountain, ~ deals
-                // double that damage instead") is lookback-transparent: it restates
-                // the instruction it replaces and neither selects nor re-binds the
-                // reveal's cards, so its placeholder does not end the scan.
-                non_absorbed
-                    .iter()
-                    .filter(|c| {
-                        !matches!(
-                            c.disposition,
-                            ClauseDisposition::ReplaceMeaning {
-                                kind: ReplaceMeaningKind::Instead(_)
-                            }
-                        )
-                    })
-                    .map(|c| effective_effect_of(c))
-                    .take_while(|effect| !matches!(effect, Effect::Unimplemented { .. }))
-                    .find_map(|deeper| match deeper {
-                        Effect::RevealUntil { .. } => {
-                            match parse_followup_continuation_ast(normalized_text, &deeper, ctx) {
-                                Some(
-                                    continuation @ (ContinuationAst::RevealUntilAllToZone {
-                                        ..
-                                    }
-                                    | ContinuationAst::PutRest { .. }),
-                                ) => Some(continuation),
-                                _ => None,
-                            }
+                .or_else(|| {
+                    // CR 608.2c: when the nearest non-absorbed clause is
+                    // lookback-transparent (e.g. `Sacrifice` — Birthing Ritual),
+                    // continue searching deeper for a `Dig`/`Mill` antecedent. The
+                    // parser is the detector: only redirect if a deeper clause
+                    // actually yields a `Dig`-patching continuation. Both arms
+                    // patch the same `Dig`: `DigFromAmong` is the "put N from
+                    // among those cards" selection (clause 3), `PutRest` is the
+                    // trailing "put the rest on the bottom" remainder placement
+                    // (clause 4). Both must reach back past the intervening
+                    // `Sacrifice` to the `Dig`.
+                    let nearest = effective_prev_effect.as_ref()?;
+                    if !clause_is_dig_lookback_transparent(nearest) {
+                        return None;
+                    }
+                    non_absorbed.iter().skip(1).find_map(|c| {
+                        let deeper = effective_effect_of(c);
+                        match parse_followup_continuation_ast(normalized_text, &deeper, ctx) {
+                            Some(
+                                continuation @ (ContinuationAst::DigFromAmong { .. }
+                                | ContinuationAst::PutRest { .. }),
+                            ) => Some(continuation),
+                            _ => None,
                         }
-                        _ => None,
                     })
-            })
-            .or_else(|| {
-                // CR 707.10c: a "you may choose new targets for the copy/copies"
-                // sentence still grants the copy's controller retargeting even
-                // when a clause that resolves between the copy and this sentence
-                // separates them — Narset's Reversal's "then return it to its
-                // owner's hand" bounce, Increasing Vengeance's conditional "copy
-                // that spell twice instead", Spinerock Tyrant's "those spells
-                // gain wither" rider. The nearest-clause lookback above only sees
-                // that intervening clause, so scan the non-absorbed clauses
-                // (nearest-first) for the closest one whose effect wraps a
-                // `CopySpell` and bind the permission there. If NO preceding copy
-                // exists, fall through so the clause stays an honest orphaned
-                // residual rather than a silently-wrong retarget.
-                let lower = normalized_text.to_lowercase();
-                let all_copies = sequence::copy_retarget_clause_all_copies(&lower)?;
-                non_absorbed
-                    .iter()
-                    .any(|c| sequence::effect_wraps_copy_spell(&effective_effect_of(c)))
-                    .then_some(ContinuationAst::CopyMayRetarget { all_copies })
-            })
-            .or_else(|| {
-                // CR 116.2c + CR 608.2c: "You may pay {W} to end this effect"
-                // names the continuous effect an EARLIER clause of this chain
-                // created. The NEAREST non-absorbed clause is an intervening one
-                // on every shipped card in the class — an `Attach` for the twelve
-                // Aura-form Licids, an `Unimplemented` "move" for Flanking Licid
-                // — so the nearest-clause lookback above cannot see the
-                // animation. Scan the non-absorbed clauses for one that installs
-                // a continuous effect. If none exists, fall through so the clause
-                // stays an honest orphaned residual rather than a silently-wrong
-                // termination.
-                //
-                // Gated on the SHAPE (`effect_installs_continuous_effect`), not
-                // on a Licid-specific animate-then-attach predicate: that is what
-                // makes this the CR 116.2c class rather than the Aura class, and
-                // it is why a non-`Attach` intervening clause is absorbed just the
-                // same. Uses the SAME predicate the binder guards on, so the def
-                // this detector saw is the def that gets stamped.
-                //
-                // The parser IS the detector: recognition is the extractor
-                // succeeding, never a text search.
-                let (_, cost) =
-                    crate::parser::clause_shell::parse_pay_to_end_effect_mana_cost(normalized_text)
-                        .ok()?;
-                non_absorbed
-                    .iter()
-                    .any(|c| effect_installs_continuous_effect(&effective_effect_of(c)))
-                    .then_some(ContinuationAst::EndEffectCost { cost })
-            });
-        if search_reveal_owners.is_some() {
-            followup_continuation = Some(ContinuationAst::SearchResultClauseHandled);
-        }
-        // CR 608.2c + CR 109.5: a reveal choice is the controller's only when the
-        // consuming instruction addresses the controller ("you" / imperative).
-        if let Some(ContinuationAst::RevealHandFilter { binding, .. }) = &followup_continuation {
-            let binding = *binding;
-            let reveal_is_player_scoped = non_absorbed
-                .first()
-                .is_some_and(|previous| previous.player_scope.is_some());
-            let gated = match binding {
-                RevealChoiceBinding::RevealedThisWay => true,
-                RevealChoiceBinding::FromIt => reveal_is_player_scoped,
-            };
-            if gated
-                && reveal_choice_consumer_actor(
-                    &text,
-                    player_scope.as_ref(),
-                    opponent_may_scope.as_ref(),
-                    is_distributed_chunk,
-                ) == ConsumerActor::Other
+                })
+                .or_else(|| {
+                    // CR 701.20a + CR 608.2c: A clause disposing of cards revealed by an
+                    // earlier `RevealUntil` ("put all cards revealed this way...",
+                    // "put the nonland card into your hand and the rest...", "put the revealed cards...")
+                    // may be separated from the `RevealUntil` by intervening transparent
+                    // instructions that use the revealed card (such as `Pump` on Erratic Mutation,
+                    // or `DealDamage` on Explosive Revelation).
+                    // Scan `non_absorbed` (nearest-first) for a preceding `RevealUntil` antecedent.
+                    // The parser is the detector: only bind if `parse_followup_continuation_ast`
+                    // against the candidate `RevealUntil` produces a recognized pile-disposition
+                    // continuation. The scan stops at an unparsed clause: an unrecognized
+                    // instruction may itself select or re-bind the referent ("Choose one of the
+                    // revealed creature cards", Dance, Pathetic Marionette), so a later "all
+                    // other cards revealed this way" can no longer be read as the reveal's rest
+                    // pile. `RevealUntilKept` is never bound across clauses: its "put it" /
+                    // "put that card" anaphor names the nearest referent, and its application
+                    // patches only the immediately preceding definition.
+                    // A conditional "instead" override of an intervening damage
+                    // instruction ("If the revealed land card was a Mountain, ~ deals
+                    // double that damage instead") is lookback-transparent: it restates
+                    // the instruction it replaces and neither selects nor re-binds the
+                    // reveal's cards, so its placeholder does not end the scan.
+                    non_absorbed
+                        .iter()
+                        .filter(|c| {
+                            !matches!(
+                                c.disposition,
+                                ClauseDisposition::ReplaceMeaning {
+                                    kind: ReplaceMeaningKind::Instead(_)
+                                }
+                            )
+                        })
+                        .map(|c| effective_effect_of(c))
+                        .take_while(|effect| !matches!(effect, Effect::Unimplemented { .. }))
+                        .find_map(|deeper| match deeper {
+                            Effect::RevealUntil { .. } => {
+                                match parse_followup_continuation_ast(normalized_text, &deeper, ctx)
+                                {
+                                    Some(
+                                        continuation @ (ContinuationAst::RevealUntilAllToZone {
+                                            ..
+                                        }
+                                        | ContinuationAst::PutRest { .. }),
+                                    ) => Some(continuation),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        })
+                })
+                .or_else(|| {
+                    // CR 707.10c: a "you may choose new targets for the copy/copies"
+                    // sentence still grants the copy's controller retargeting even
+                    // when a clause that resolves between the copy and this sentence
+                    // separates them — Narset's Reversal's "then return it to its
+                    // owner's hand" bounce, Increasing Vengeance's conditional "copy
+                    // that spell twice instead", Spinerock Tyrant's "those spells
+                    // gain wither" rider. The nearest-clause lookback above only sees
+                    // that intervening clause, so scan the non-absorbed clauses
+                    // (nearest-first) for the closest one whose effect wraps a
+                    // `CopySpell` and bind the permission there. If NO preceding copy
+                    // exists, fall through so the clause stays an honest orphaned
+                    // residual rather than a silently-wrong retarget.
+                    let lower = normalized_text.to_lowercase();
+                    let all_copies = sequence::copy_retarget_clause_all_copies(&lower)?;
+                    non_absorbed
+                        .iter()
+                        .any(|c| sequence::effect_wraps_copy_spell(&effective_effect_of(c)))
+                        .then_some(ContinuationAst::CopyMayRetarget { all_copies })
+                })
+                .or_else(|| {
+                    // CR 116.2c + CR 608.2c: "You may pay {W} to end this effect"
+                    // names the continuous effect an EARLIER clause of this chain
+                    // created. The NEAREST non-absorbed clause is an intervening one
+                    // on every shipped card in the class — an `Attach` for the twelve
+                    // Aura-form Licids, an `Unimplemented` "move" for Flanking Licid
+                    // — so the nearest-clause lookback above cannot see the
+                    // animation. Scan the non-absorbed clauses for one that installs
+                    // a continuous effect. If none exists, fall through so the clause
+                    // stays an honest orphaned residual rather than a silently-wrong
+                    // termination.
+                    //
+                    // Gated on the SHAPE (`effect_installs_continuous_effect`), not
+                    // on a Licid-specific animate-then-attach predicate: that is what
+                    // makes this the CR 116.2c class rather than the Aura class, and
+                    // it is why a non-`Attach` intervening clause is absorbed just the
+                    // same. Uses the SAME predicate the binder guards on, so the def
+                    // this detector saw is the def that gets stamped.
+                    //
+                    // The parser IS the detector: recognition is the extractor
+                    // succeeding, never a text search.
+                    let (_, cost) = crate::parser::clause_shell::parse_pay_to_end_effect_mana_cost(
+                        normalized_text,
+                    )
+                    .ok()?;
+                    non_absorbed
+                        .iter()
+                        .any(|c| effect_installs_continuous_effect(&effective_effect_of(c)))
+                        .then_some(ContinuationAst::EndEffectCost { cost })
+                });
+            if search_reveal_owners.is_some() {
+                followup_continuation = Some(ContinuationAst::SearchResultClauseHandled);
+            }
+            // CR 608.2c + CR 109.5: a reveal choice is the controller's only when the
+            // consuming instruction addresses the controller ("you" / imperative).
+            if let Some(ContinuationAst::RevealHandFilter { binding, .. }) = &followup_continuation
             {
-                followup_continuation = None;
-                // CR 608.2c + CR 109.5: a consumer addressed to a player other
-                // than the controller names a reveal choice that player makes
-                // ("from it") or a card chosen from the revealed hand ("revealed
-                // this way"); `RevealHand` has no chooser for it, so the consumer
-                // binds nothing. Honest gap — never a raw-filter zone move or a
-                // card-parking reveal.
+                let binding = *binding;
+                let reveal_is_player_scoped = non_absorbed
+                    .first()
+                    .is_some_and(|previous| previous.player_scope.is_some());
+                let gated = match binding {
+                    RevealChoiceBinding::RevealedThisWay => true,
+                    RevealChoiceBinding::FromIt => reveal_is_player_scoped,
+                };
+                if gated
+                    && reveal_choice_consumer_actor(
+                        &text,
+                        player_scope.as_ref(),
+                        opponent_may_scope.as_ref(),
+                        is_distributed_chunk,
+                    ) == ConsumerActor::Other
+                {
+                    followup_continuation = None;
+                    // CR 608.2c + CR 109.5: a consumer addressed to a player other
+                    // than the controller names a reveal choice that player makes
+                    // ("from it") or a card chosen from the revealed hand ("revealed
+                    // this way"); `RevealHand` has no chooser for it, so the consumer
+                    // binds nothing. Honest gap — never a raw-filter zone move or a
+                    // card-parking reveal.
+                    clause.effect =
+                        Effect::unimplemented("non_controller_reveal_choice", normalized_text);
+                }
+            }
+            // CR 608.2c + CR 109.5: a clause that itself runs per player makes its own
+            // reveal choice as that player; the resolver's reveal chooser inside a
+            // player-scope iteration is the printed controller, so such a choice
+            // cannot be represented — honest gap.
+            if (player_scope.is_some() || opponent_may_scope.is_some() || is_distributed_chunk)
+                && crate::game::effects::reveal_hand::effect_parks_reveal_card_choice(
+                    &clause.effect,
+                )
+            {
                 clause.effect =
                     Effect::unimplemented("non_controller_reveal_choice", normalized_text);
             }
-        }
-        // CR 608.2c + CR 109.5: a clause that itself runs per player makes its own
-        // reveal choice as that player; the resolver's reveal chooser inside a
-        // player-scope iteration is the printed controller, so such a choice
-        // cannot be represented — honest gap.
-        if (player_scope.is_some() || opponent_may_scope.is_some() || is_distributed_chunk)
-            && crate::game::effects::reveal_hand::effect_parks_reveal_card_choice(&clause.effect)
-        {
-            clause.effect = Effect::unimplemented("non_controller_reveal_choice", normalized_text);
-        }
-        let absorb_followup = followup_continuation
-            .as_ref()
-            .is_some_and(|continuation| continuation_absorbs_current(continuation, &clause.effect));
-        // CR 608.2c: "a <type> card they revealed this way" is the card chosen
-        // from that player's revealed hand; "For each <the reveal's population>,"
-        // re-scopes the instruction over the same players — a second per-player
-        // pass after every reveal (CR 608.2c) — not a count.
-        if !absorb_followup
-            && matches!(
-                followup_continuation,
-                Some(ContinuationAst::RevealHandFilter {
-                    binding: RevealChoiceBinding::RevealedThisWay,
-                    ..
-                })
-            )
-            && bind_revealed_this_way_consumer(
-                &mut clause.effect,
-                &mut repeat_for,
-                &mut player_scope,
-                non_absorbed
-                    .first()
-                    .and_then(|previous| previous.player_scope.as_ref()),
-            ) == ConsumerBinding::Declined
-        {
-            followup_continuation = None;
-            // CR 608.2c: the consumer names a card chosen from the revealed hand,
-            // but its shape (population, repeat, or verb) cannot be re-bound to
-            // that choice. Keeping the parsed effect would act on its raw filter —
-            // a card other than one revealed this way — so the consumer is an
-            // honest gap.
-            clause.effect = Effect::unimplemented("unbound_revealed_this_way", normalized_text);
-        }
-        // CR 118.12a + CR 608.2c: "[instruction] unless [payment]. If [connector],
-        // [instruction]" — a continuation whose leading head names the unless payment's
-        // outcome. When the head lowered to no condition (no connector arm recognises
-        // it) the body would run unconditionally, and `detect_condition_if`'s
-        // `unless_pay` exemption hides the loss. Fail it closed.
-        if condition.is_none()
-            && clause.condition.is_none()
-            && clause.unlowered_guard.is_none()
-            && conditions::split_leading_conditional(normalized_text).is_some()
-            && non_absorbed.iter().any(|c| c.unless_pay.is_some())
-        {
-            clause.effect =
-                Effect::unimplemented("unless_paid_continuation_dropped", normalized_text);
-        }
-
-        // Build a temporary def for intrinsic continuation detection and cascade check.
-        // The intrinsic continuation parser needs the assembled effect to determine
-        // what continuation pattern applies.
-        let mut temp_def = AbilityDefinition::new(kind, clause.effect.clone());
-        // Wire sub_ability for TargetOnly unwrapping in intrinsic_continuation_effect.
-        if matches!(clause.effect, Effect::TargetOnly { .. }) {
-            temp_def.sub_ability = clause.sub_ability.clone();
-        }
-        let intrinsic_continuation = parse_intrinsic_continuation_ast(
-            normalized_text,
-            intrinsic_continuation_effect(&temp_def),
-            full_text,
-            ctx,
-        );
-
-        // Phase 1.5: cascade-vs-AST structural diff.
-        {
-            let cascade_snap = super::swallow_check::CascadeSnapshot {
-                is_optional,
-                opponent_may_scope: opponent_may_scope.as_ref(),
-                condition: condition.as_ref().or(clause.condition.as_ref()),
-                repeat_for: repeat_for.as_ref(),
-                player_scope: player_scope.as_ref(),
-                clause_duration: clause.duration.as_ref(),
-            };
-            // Build temporary defs for the cascade check
-            let mut check_def = AbilityDefinition::new(kind, clause.effect.clone());
-            if is_optional {
-                check_def.optional = true;
-                check_def.optional_for = opponent_may_scope;
-            }
-            if clause.optional {
-                check_def.optional = true;
-            }
-            if let Some(ref qty) = repeat_for {
-                check_def.repeat_for = Some(qty.clone());
-            }
-            if let Some(ref scope) = player_scope {
-                check_def.player_scope = Some(scope.clone());
-            }
-            if let Some(ref duration) = clause.duration {
-                check_def = check_def.duration(duration.clone());
-            }
-            if let Some(cond) = condition.as_ref().or(clause.condition.as_ref()) {
-                check_def = check_def.condition(cond.clone());
-            }
-            if let Some(ref spec) = multi_target {
-                check_def = check_def.multi_target(spec.clone());
-            } else if let Some(ref spec) = clause.multi_target {
-                check_def = check_def.multi_target(spec.clone());
-            }
-            if let Some(ref unit) = clause.distribute {
-                check_def = check_def.distribute(unit.clone());
-            }
-            if let Some(ref modifier) = unless_pay {
-                check_def = check_def.unless_pay(modifier.clone());
-            }
-            // Include delayed_condition wrapping for accurate cascade check
-            if let Some(ref delayed_cond) = delayed_condition {
-                let inner = check_def;
-                let lifted_condition = inner.condition.clone();
-                let lifted_optional = inner.optional;
-                let lifted_optional_for = inner.optional_for;
-                let lifted_repeat_for = inner.repeat_for.clone();
-                let lifted_player_scope = inner.player_scope.clone();
-                check_def = AbilityDefinition::new(
-                    kind,
-                    Effect::CreateDelayedTrigger {
-                        condition: delayed_cond.clone(),
-                        effect: Box::new(inner),
-                        uses_tracked_set: needs_tracked_set,
-                    },
-                );
-                check_def.condition = lifted_condition;
-                check_def.optional = lifted_optional;
-                check_def.optional_for = lifted_optional_for;
-                check_def.repeat_for = lifted_repeat_for;
-                check_def.player_scope = lifted_player_scope;
-            }
-            if needs_tracked_set {
-                rewrite_parent_targets_to_tracked_set(
-                    &mut check_def.effect,
-                    cast_anaphor_is_exiled,
-                );
-            }
-            let mut check_defs = vec![check_def];
-            let is_target_only = matches!(clause.effect, Effect::TargetOnly { .. });
-            if !is_target_only {
-                if let Some(ref sub) = clause.sub_ability {
-                    check_defs.push(*sub.clone());
-                }
-            }
+            let absorb_followup = followup_continuation.as_ref().is_some_and(|continuation| {
+                continuation_absorbs_current(continuation, &clause.effect)
+            });
+            // CR 608.2c: "a <type> card they revealed this way" is the card chosen
+            // from that player's revealed hand; "For each <the reveal's population>,"
+            // re-scopes the instruction over the same players — a second per-player
+            // pass after every reveal (CR 608.2c) — not a count.
+            if !absorb_followup
+                && matches!(
+                    followup_continuation,
+                    Some(ContinuationAst::RevealHandFilter {
+                        binding: RevealChoiceBinding::RevealedThisWay,
+                        ..
+                    })
+                )
+                && bind_revealed_this_way_consumer(
+                    &mut clause.effect,
+                    &mut repeat_for,
+                    &mut player_scope,
+                    non_absorbed
+                        .first()
+                        .and_then(|previous| previous.player_scope.as_ref()),
+                ) == ConsumerBinding::Declined
             {
-                let mut cascade_diags = Vec::new();
-                super::swallow_check::check_cascade_diff(
-                    &cascade_snap,
-                    &check_defs,
-                    &mut cascade_diags,
-                );
-                for d in cascade_diags {
-                    ctx.push_diagnostic(d);
-                }
+                followup_continuation = None;
+                // CR 608.2c: the consumer names a card chosen from the revealed hand,
+                // but its shape (population, repeat, or verb) cannot be re-bound to
+                // that choice. Keeping the parsed effect would act on its raw filter —
+                // a card other than one revealed this way — so the consumer is an
+                // honest gap.
+                clause.effect = Effect::unimplemented("unbound_revealed_this_way", normalized_text);
             }
-        }
-
-        if let Some(owners) = search_reveal_owners {
-            for owner in owners {
-                let member = builder
-                    .clauses_mut()
-                    .iter_mut()
-                    .find(|member| member.id == owner)
-                    .expect("bound search owner remains in this builder");
-                if let ClauseDisposition::Emit {
-                    intrinsic: Some(ContinuationAst::SearchDestination { reveal, .. }),
-                    ..
-                }
-                | ClauseDisposition::FoldSearchIntoElse {
-                    intrinsic: Some(ContinuationAst::SearchDestination { reveal, .. }),
-                } = &mut member.disposition
-                {
-                    *reveal = true;
-                }
+            // CR 118.12a + CR 608.2c: "[instruction] unless [payment]. If [connector],
+            // [instruction]" — a continuation whose leading head names the unless payment's
+            // outcome. When the head lowered to no condition (no connector arm recognises
+            // it) the body would run unconditionally, and `detect_condition_if`'s
+            // `unless_pay` exemption hides the loss. Fail it closed.
+            if condition.is_none()
+                && clause.condition.is_none()
+                && clause.unlowered_guard.is_none()
+                && conditions::split_leading_conditional(normalized_text).is_some()
+                && non_absorbed.iter().any(|c| c.unless_pay.is_some())
+            {
+                clause.effect =
+                    Effect::unimplemented("unless_paid_continuation_dropped", normalized_text);
             }
-        }
 
-        // If this clause is absorbed by a followup continuation from the previous
-        // clause, mark it and store the continuation on the PREVIOUS clause.
-        if absorb_followup {
-            // Store the followup continuation — it applies to the previous clause.
-            // We handle this by pushing an absorbed marker clause.
-            if let Some(continuation) = followup_continuation {
-                builder
-                    .clause(
-                        normalized_text,
-                        clause,
-                        chunk.boundary_after,
-                        ClauseDisposition::Continue {
-                            continuation: Some(continuation),
+            // Build a temporary def for intrinsic continuation detection and cascade check.
+            // The intrinsic continuation parser needs the assembled effect to determine
+            // what continuation pattern applies.
+            let mut temp_def = AbilityDefinition::new(kind, clause.effect.clone());
+            // Wire sub_ability for TargetOnly unwrapping in intrinsic_continuation_effect.
+            if matches!(clause.effect, Effect::TargetOnly { .. }) {
+                temp_def.sub_ability = clause.sub_ability.clone();
+            }
+            let intrinsic_continuation = parse_intrinsic_continuation_ast(
+                normalized_text,
+                intrinsic_continuation_effect(&temp_def),
+                full_text,
+                ctx,
+            );
+
+            // Phase 1.5: cascade-vs-AST structural diff.
+            {
+                let cascade_snap = super::swallow_check::CascadeSnapshot {
+                    is_optional,
+                    opponent_may_scope: opponent_may_scope.as_ref(),
+                    condition: condition.as_ref().or(clause.condition.as_ref()),
+                    repeat_for: repeat_for.as_ref(),
+                    player_scope: player_scope.as_ref(),
+                    clause_duration: clause.duration.as_ref(),
+                };
+                // Build temporary defs for the cascade check
+                let mut check_def = AbilityDefinition::new(kind, clause.effect.clone());
+                if is_optional {
+                    check_def.optional = true;
+                    check_def.optional_for = opponent_may_scope;
+                }
+                if clause.optional {
+                    check_def.optional = true;
+                }
+                if let Some(ref qty) = repeat_for {
+                    check_def.repeat_for = Some(qty.clone());
+                }
+                if let Some(ref scope) = player_scope {
+                    check_def.player_scope = Some(scope.clone());
+                }
+                if let Some(ref duration) = clause.duration {
+                    check_def = check_def.duration(duration.clone());
+                }
+                if let Some(cond) = condition.as_ref().or(clause.condition.as_ref()) {
+                    check_def = check_def.condition(cond.clone());
+                }
+                if let Some(ref spec) = multi_target {
+                    check_def = check_def.multi_target(spec.clone());
+                } else if let Some(ref spec) = clause.multi_target {
+                    check_def = check_def.multi_target(spec.clone());
+                }
+                if let Some(ref unit) = clause.distribute {
+                    check_def = check_def.distribute(unit.clone());
+                }
+                if let Some(ref modifier) = unless_pay {
+                    check_def = check_def.unless_pay(modifier.clone());
+                }
+                // Include delayed_condition wrapping for accurate cascade check
+                if let Some(ref delayed_cond) = delayed_condition {
+                    let inner = check_def;
+                    let lifted_condition = inner.condition.clone();
+                    let lifted_optional = inner.optional;
+                    let lifted_optional_for = inner.optional_for;
+                    let lifted_repeat_for = inner.repeat_for.clone();
+                    let lifted_player_scope = inner.player_scope.clone();
+                    check_def = AbilityDefinition::new(
+                        kind,
+                        Effect::CreateDelayedTrigger {
+                            condition: delayed_cond.clone(),
+                            effect: Box::new(inner),
+                            uses_tracked_set: needs_tracked_set,
                         },
-                    )
-                    .condition(condition)
-                    .is_optional(is_optional)
-                    .opponent_may_scope(opponent_may_scope)
-                    .repeat_for(repeat_for)
-                    .player_scope(player_scope)
-                    .starting_with(starting_with.clone())
-                    .multi_target(multi_target)
-                    .where_x_expression(where_x_expression)
-                    .target_selection_mode(chunk_ctx.target_selection_mode)
-                    .target_chooser(chunk_ctx.target_chooser.clone())
-                    .declared_target_choice_timing(chunk_ctx.declared_target_choice_timing.take())
-                    .printed_color_choice(chunk_ctx.pending_printed_color_choice.take())
-                    .push();
+                    );
+                    check_def.condition = lifted_condition;
+                    check_def.optional = lifted_optional;
+                    check_def.optional_for = lifted_optional_for;
+                    check_def.repeat_for = lifted_repeat_for;
+                    check_def.player_scope = lifted_player_scope;
+                }
+                if needs_tracked_set {
+                    rewrite_parent_targets_to_tracked_set(
+                        &mut check_def.effect,
+                        cast_anaphor_is_exiled,
+                    );
+                }
+                let mut check_defs = vec![check_def];
+                let is_target_only = matches!(clause.effect, Effect::TargetOnly { .. });
+                if !is_target_only {
+                    if let Some(ref sub) = clause.sub_ability {
+                        check_defs.push(*sub.clone());
+                    }
+                }
+                {
+                    let mut cascade_diags = Vec::new();
+                    super::swallow_check::check_cascade_diff(
+                        &cascade_snap,
+                        &check_defs,
+                        &mut cascade_diags,
+                    );
+                    for d in cascade_diags {
+                        ctx.push_diagnostic(d);
+                    }
+                }
             }
-            continue;
-        }
 
-        // Non-absorbed followup continuation — store on the current clause
-        // (it applies to the PREVIOUS clause in lowering).
-        let mut followup_for_this = if followup_continuation.is_some() && !absorb_followup {
-            followup_continuation
-        } else {
-            None
-        };
+            if let Some(owners) = search_reveal_owners {
+                for owner in owners {
+                    let member = builder
+                        .clauses_mut()
+                        .iter_mut()
+                        .find(|member| member.id == owner)
+                        .expect("bound search owner remains in this builder");
+                    if let ClauseDisposition::Emit {
+                        intrinsic: Some(ContinuationAst::SearchDestination { reveal, .. }),
+                        ..
+                    }
+                    | ClauseDisposition::FoldSearchIntoElse {
+                        intrinsic: Some(ContinuationAst::SearchDestination { reveal, .. }),
+                    } = &mut member.disposition
+                    {
+                        *reveal = true;
+                    }
+                }
+            }
 
-        if let Some(ContinuationAst::RevealHandFilter {
-            card_filter,
-            choice_optional: true,
-            ..
-        }) = &mut followup_for_this
-        {
-            if matches!(
+            // If this clause is absorbed by a followup continuation from the previous
+            // clause, mark it and store the continuation on the PREVIOUS clause.
+            if absorb_followup {
+                // Store the followup continuation — it applies to the previous clause.
+                // We handle this by pushing an absorbed marker clause.
+                if let Some(continuation) = followup_continuation {
+                    builder
+                        .clause(
+                            normalized_text,
+                            clause,
+                            chunk.boundary_after,
+                            ClauseDisposition::Continue {
+                                continuation: Some(continuation),
+                            },
+                        )
+                        .condition(condition)
+                        .is_optional(is_optional)
+                        .opponent_may_scope(opponent_may_scope)
+                        .repeat_for(repeat_for)
+                        .player_scope(player_scope)
+                        .starting_with(starting_with.clone())
+                        .multi_target(multi_target)
+                        .where_x_expression(where_x_expression)
+                        .target_selection_mode(chunk_ctx.target_selection_mode)
+                        .target_chooser(chunk_ctx.target_chooser.clone())
+                        .declared_target_choice_timing(
+                            chunk_ctx.declared_target_choice_timing.take(),
+                        )
+                        .printed_color_choice(chunk_ctx.pending_printed_color_choice.take())
+                        .push();
+                }
+                continue 'chunks;
+            }
+
+            // Non-absorbed followup continuation — store on the current clause
+            // (it applies to the PREVIOUS clause in lowering).
+            let mut followup_for_this = if followup_continuation.is_some() && !absorb_followup {
+                followup_continuation
+            } else {
+                None
+            };
+
+            if let Some(ContinuationAst::RevealHandFilter {
                 card_filter,
-                None | Some(TargetFilter::Any | TargetFilter::None)
+                choice_optional: true,
+                ..
+            }) = &mut followup_for_this
+            {
+                if matches!(
+                    card_filter,
+                    None | Some(TargetFilter::Any | TargetFilter::None)
+                ) {
+                    if let Effect::ChangeZone { target, .. } = &clause.effect {
+                        *card_filter = Some(target.clone());
+                    }
+                }
+            }
+            let is_optional = is_optional
+                && !matches!(
+                    followup_for_this,
+                    Some(ContinuationAst::RevealHandFilter {
+                        choice_optional: true,
+                        ..
+                    })
+                );
+
+            // CR 601.2c + CR 608.2d: a multi-slot target list is one link per slot,
+            // and a shared "you may" over it has no per-link form — unless the
+            // resolver folds the slots into one cast window (CR 608.2g), whose
+            // decline already is that "you may", so the head asks nothing first.
+            let free_cast_slot_list =
+                multi_target_list::is_multi_slot_list(multi_target.as_ref(), &clause)
+                    && multi_target_list::is_free_cast_slot_list(&clause);
+            if is_optional
+                && multi_target_list::is_multi_slot_list(multi_target.as_ref(), &clause)
+                && !free_cast_slot_list
+            {
+                multi_target_list::fail_closed_optional_list(&mut clause, normalized_text);
+            }
+            let is_optional = is_optional && !free_cast_slot_list;
+
+            // CR 603.6 + CR 608.2k: A reflexive zone-change trigger body ("When a
+            // creature is put onto the battlefield this way, it deals damage equal to
+            // its power …" — Vivien's Invocation) refers to the object the trigger
+            // condition introduced, not the resolving spell. The bare-pronoun "it"
+            // was classified `SelfRef` (no `ctx.subject`), so its "its power" anaphor
+            // was rebound to `Power{Source}` (the spell, power 0). Restore it to
+            // `Anaphoric` so the runtime reads the entering creature's power via the
+            // trigger-event-source slot. Gated to `ZoneChangedThisWay` so a true
+            // self-reference clause is untouched. A "When … this way" head reaches
+            // here as the reflexive creation gate carrying that zone change.
+            if condition
+                .as_ref()
+                .and_then(AbilityCondition::zone_changed_this_way_head)
+                .is_some()
+            {
+                restore_this_way_trigger_anaphor(&mut clause.effect);
+            }
+            // CR 603.12 + CR 608.2c: a "When <zone change> this way" reflexive is
+            // supported only when its gate reads the instruction that performed the
+            // zone change and its body's object reference reaches the stack object.
+            if let Some(gap) = zone_change_reflexive::unsupported_zone_change_reflexive(
+                condition.as_ref(),
+                zone_change_head,
+                &clause.effect,
+                &text_lower,
+                player_scope.as_ref(),
+                builder.clauses(),
             ) {
-                if let Effect::ChangeZone { target, .. } = &clause.effect {
-                    *card_filter = Some(target.clone());
+                unimplemented_clause(&mut builder, gap, normalized_text, chunk.boundary_after);
+                continue 'chunks;
+            }
+
+            // CR 614.1a + CR 614.6: LAST RESORT for an "instead" override whose
+            // condition never found a typed home. Every specific owner above has now
+            // declined (they `continue`, or they set `condition`), so reaching here
+            // with `instead_condition_unlowerable` and no recovered condition means the
+            // override body is about to be emitted as an ordinary, UNCONDITIONAL chain
+            // clause — a sequel to the very effect it is supposed to REPLACE. A
+            // replaced event never happens (CR 614.6), so the engine would then run
+            // both branches with the condition silently dropped: Anax, Hardened in the
+            // Forge made 1 + 2 = three Satyrs on every nontoken creature death,
+            // regardless of its power. Fail honestly instead of lying.
+            if instead_condition_unlowerable && condition.is_none() {
+                unimplemented_clause(
+                    &mut builder,
+                    "instead_condition",
+                    normalized_text,
+                    chunk.boundary_after,
+                );
+                continue 'chunks;
+            }
+
+            let clause_declared_group = chunk_ctx.clause_declared_group.take();
+            if let Some(group) = clause_declared_group {
+                declarations.push((builder.clauses().len(), group));
+            }
+            // CR 115.1 + CR 701.9b: `target_selection_mode` snapshots the parser's
+            // per-chunk selection mode. Set to `Random` by `parse_target_with_ctx`
+            // when "random " was stripped from this chunk's target phrase.
+            builder
+                .clause(
+                    normalized_text,
+                    clause,
+                    chunk.boundary_after,
+                    ClauseDisposition::Emit {
+                        followup: followup_for_this,
+                        intrinsic: intrinsic_continuation,
+                    },
+                )
+                .condition(condition)
+                .is_optional(is_optional)
+                .opponent_may_scope(opponent_may_scope)
+                .accepting_player_bindings(accepting_player_bindings)
+                .repeat_for(repeat_for)
+                .player_scope(player_scope)
+                .starting_with(starting_with.clone())
+                .delayed_condition(delayed_condition)
+                .multi_target(multi_target)
+                .where_x_expression(where_x_expression)
+                .unless_pay(unless_pay)
+                .target_selection_mode(chunk_ctx.target_selection_mode)
+                .target_chooser(chunk_ctx.target_chooser.clone())
+                .declared_target_choice_timing(chunk_ctx.declared_target_choice_timing.take())
+                .printed_color_choice(chunk_ctx.pending_printed_color_choice.take())
+                .declared_player_group(clause_declared_group)
+                .push();
+
+            // CR 115.1 + CR 608.2c: the comparative gate's "that creature" reads the
+            // single object the immediately preceding instruction announced
+            // (`TargetReadOrigin::ParentAnnouncement`), so this instruction declares
+            // no target of its own. The origin is per INSTRUCTION — every `Target`
+            // read on it shares it — so an instruction that would ALSO announce its
+            // own object target ("…put counters on target creature you control")
+            // would have one scope naming two objects. That mixed shape is refused
+            // rather than represented.
+            if comparative_gate_producer.is_some() {
+                if let Some(reader) = builder.last_mut() {
+                    if clause_announces_own_target(reader) {
+                        reader.parsed = parsed_clause(Effect::unimplemented(
+                            "comparative_pt_rider_declares_target",
+                            normalized_text,
+                        ));
+                    } else {
+                        reader.target_reads = TargetReadOrigin::ParentAnnouncement;
+                    }
                 }
             }
-        }
-        let is_optional = is_optional
-            && !matches!(
-                followup_for_this,
-                Some(ContinuationAst::RevealHandFilter {
-                    choice_optional: true,
-                    ..
-                })
-            );
 
-        // CR 601.2c + CR 608.2d: a multi-slot target list is one link per slot,
-        // and a shared "you may" over it has no per-link form — unless the
-        // resolver folds the slots into one cast window (CR 608.2g), whose
-        // decline already is that "you may", so the head asks nothing first.
-        let free_cast_slot_list =
-            multi_target_list::is_multi_slot_list(multi_target.as_ref(), &clause)
-                && multi_target_list::is_free_cast_slot_list(&clause);
-        if is_optional
-            && multi_target_list::is_multi_slot_list(multi_target.as_ref(), &clause)
-            && !free_cast_slot_list
-        {
-            multi_target_list::fail_closed_optional_list(&mut clause, normalized_text);
-        }
-        let is_optional = is_optional && !free_cast_slot_list;
-
-        // CR 603.6 + CR 608.2k: A reflexive zone-change trigger body ("When a
-        // creature is put onto the battlefield this way, it deals damage equal to
-        // its power …" — Vivien's Invocation) refers to the object the trigger
-        // condition introduced, not the resolving spell. The bare-pronoun "it"
-        // was classified `SelfRef` (no `ctx.subject`), so its "its power" anaphor
-        // was rebound to `Power{Source}` (the spell, power 0). Restore it to
-        // `Anaphoric` so the runtime reads the entering creature's power via the
-        // trigger-event-source slot. Gated to `ZoneChangedThisWay` so a true
-        // self-reference clause is untouched. A "When … this way" head reaches
-        // here as the reflexive creation gate carrying that zone change.
-        if condition
-            .as_ref()
-            .and_then(AbilityCondition::zone_changed_this_way_head)
-            .is_some()
-        {
-            restore_this_way_trigger_anaphor(&mut clause.effect);
-        }
-        // CR 603.12 + CR 608.2c: a "When <zone change> this way" reflexive is
-        // supported only when its gate reads the instruction that performed the
-        // zone change and its body's object reference reaches the stack object.
-        if let Some(gap) = zone_change_reflexive::unsupported_zone_change_reflexive(
-            condition.as_ref(),
-            zone_change_head,
-            &clause.effect,
-            &text_lower,
-            player_scope.as_ref(),
-            builder.clauses(),
-        ) {
-            unimplemented_clause(&mut builder, gap, normalized_text, chunk.boundary_after);
-            continue;
-        }
-
-        // CR 614.1a + CR 614.6: LAST RESORT for an "instead" override whose
-        // condition never found a typed home. Every specific owner above has now
-        // declined (they `continue`, or they set `condition`), so reaching here
-        // with `instead_condition_unlowerable` and no recovered condition means the
-        // override body is about to be emitted as an ordinary, UNCONDITIONAL chain
-        // clause — a sequel to the very effect it is supposed to REPLACE. A
-        // replaced event never happens (CR 614.6), so the engine would then run
-        // both branches with the condition silently dropped: Anax, Hardened in the
-        // Forge made 1 + 2 = three Satyrs on every nontoken creature death,
-        // regardless of its power. Fail honestly instead of lying.
-        if instead_condition_unlowerable && condition.is_none() {
-            unimplemented_clause(
-                &mut builder,
-                "instead_condition",
-                normalized_text,
-                chunk.boundary_after,
-            );
-            continue;
-        }
-
-        let clause_declared_group = chunk_ctx.clause_declared_group.take();
-        if let Some(group) = clause_declared_group {
-            declarations.push((builder.clauses().len(), group));
-        }
-        // CR 115.1 + CR 701.9b: `target_selection_mode` snapshots the parser's
-        // per-chunk selection mode. Set to `Random` by `parse_target_with_ctx`
-        // when "random " was stripped from this chunk's target phrase.
-        builder
-            .clause(
-                normalized_text,
-                clause,
-                chunk.boundary_after,
-                ClauseDisposition::Emit {
-                    followup: followup_for_this,
-                    intrinsic: intrinsic_continuation,
-                },
-            )
-            .condition(condition)
-            .is_optional(is_optional)
-            .opponent_may_scope(opponent_may_scope)
-            .accepting_player_bindings(accepting_player_bindings)
-            .repeat_for(repeat_for)
-            .player_scope(player_scope)
-            .starting_with(starting_with.clone())
-            .delayed_condition(delayed_condition)
-            .multi_target(multi_target)
-            .where_x_expression(where_x_expression)
-            .unless_pay(unless_pay)
-            .target_selection_mode(chunk_ctx.target_selection_mode)
-            .target_chooser(chunk_ctx.target_chooser.clone())
-            .declared_target_choice_timing(chunk_ctx.declared_target_choice_timing.take())
-            .printed_color_choice(chunk_ctx.pending_printed_color_choice.take())
-            .declared_player_group(clause_declared_group)
-            .push();
-
-        // CR 115.1 + CR 608.2c: the comparative gate's "that creature" reads the
-        // single object the immediately preceding instruction announced
-        // (`TargetReadOrigin::ParentAnnouncement`), so this instruction declares
-        // no target of its own. The origin is per INSTRUCTION — every `Target`
-        // read on it shares it — so an instruction that would ALSO announce its
-        // own object target ("…put counters on target creature you control")
-        // would have one scope naming two objects. That mixed shape is refused
-        // rather than represented.
-        if comparative_gate_producer.is_some() {
-            if let Some(reader) = builder.last_mut() {
-                if clause_announces_own_target(reader) {
-                    reader.parsed = parsed_clause(Effect::unimplemented(
-                        "comparative_pt_rider_declares_target",
-                        normalized_text,
-                    ));
-                } else {
-                    reader.target_reads = TargetReadOrigin::ParentAnnouncement;
+            // CR 115.1 + CR 608.2c: the target P/T threshold gate's "that creature"
+            // names the earlier instruction's target, but its `TargetMatchesFilter {
+            // subject_slot: None }` also reads this instruction's own first object
+            // target when the instruction resolves. An instruction that announces its
+            // own target ("…, destroy target creature") would have the gate test the
+            // rider's object as well as the antecedent, so that shape is refused
+            // rather than misbound.
+            if leading_route == Some(LeadingConditionRoute::TargetPtThreshold) {
+                if let Some(reader) = builder.last_mut() {
+                    refuse_target_pt_threshold_rider_with_own_target(reader);
                 }
-            }
-        }
-
-        // CR 115.1 + CR 608.2c: the target P/T threshold gate's "that creature"
-        // names the earlier instruction's target, but its `TargetMatchesFilter {
-        // subject_slot: None }` also reads this instruction's own first object
-        // target when the instruction resolves. An instruction that announces its
-        // own target ("…, destroy target creature") would have the gate test the
-        // rider's object as well as the antecedent, so that shape is refused
-        // rather than misbound.
-        if leading_route == Some(LeadingConditionRoute::TargetPtThreshold) {
-            if let Some(reader) = builder.last_mut() {
-                refuse_target_pt_threshold_rider_with_own_target(reader);
             }
         }
 
@@ -50207,6 +50779,26 @@ fn consequent_is_a_property_of_the_granted_cast(def: &AbilityDefinition) -> bool
         &*def.effect,
         Effect::CastFromZone { .. } | Effect::GenericEffect { .. }
     )
+}
+
+/// CR 608.2c: whether the chain's most recent emitted clause is a cast grant —
+/// the `CastFromZone` / `CastCopyOfCard` effects a gains-modifications rider can
+/// attach to as permission metadata. Deliberately NOT `GrantCastingPermission`:
+/// that class is owned by `refuse_cast_rider_on_lingering_grant`, which stays
+/// the fail-closed guard for lingering grants. Mirrors the reverse non-`Continue`
+/// walk of [`chain_granted_cast_permission_has_card_target`].
+fn chain_most_recent_clause_is_cast_grant(clauses: &[ClauseIr]) -> bool {
+    clauses
+        .iter()
+        .rev()
+        // allow-noncombinator: structural reverse walk over parsed clause IR, not parsing dispatch
+        .find(|clause| !matches!(clause.disposition, ClauseDisposition::Continue { .. }))
+        .is_some_and(|clause| {
+            matches!(
+                &clause.parsed.effect,
+                Effect::CastFromZone { .. } | Effect::CastCopyOfCard { .. }
+            )
+        })
 }
 
 /// CR 603.7: Checks whether an earlier clause in this chain granted a card-casting
