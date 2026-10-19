@@ -179,6 +179,8 @@ export interface NativeSocketAdapterOptions {
   socketFactory: PhaseSocketFactory;
   /** Present on release only; preview parity is verified by the shell. */
   expectedServerVersion?: string;
+  /** Native P2P owns terminal fan-out and ACK ordering across local seat sockets. */
+  callerManagedTerminalDelivery?: boolean;
 }
 
 /** Native server setup for one local P2P seat. The PeerJS connection remains
@@ -215,6 +217,9 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 155 — Full terminal deliveries retain recipient-filtered final views for
+ *       crash-safe cleanup and recovery. This Full-only capability changes no
+ *       P2P frames (wire stays 136) and no Lobby messages.
  * 154 — PendingCostMoveResume gains CounterCostRemovalPayment (a counter-removal
  *       cost paused on a CR 616.1 replacement choice; the activation reads the
  *       settled count, CR 118.11) and ManaAbilityCostCursor gains
@@ -938,7 +943,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 154;
+export const PROTOCOL_VERSION = 155;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
@@ -1559,6 +1564,7 @@ export class WebSocketAdapter implements EngineAdapter {
   /** Set by AiDriverFault: the server permanently rejects every later submission for this game code. */
   private aiDriverFault: { gameCode: string | null; message: string } | null = null;
   private gameEnded = false;
+  private terminalCleanupPending = false;
   /**
    * Populated once the server's `ServerHello` arrives. `null` between the
    * WebSocket opening and the hello being delivered. Consumers see it via
@@ -2288,7 +2294,7 @@ export class WebSocketAdapter implements EngineAdapter {
     this.receivedGameStarted = false;
     this.emit({ type: "actionPendingChanged", pending: false });
     this.emit({ type: "latencyChanged", latencyMs: null });
-    if (this.gameEnded) {
+    if (this.gameEnded && !this.terminalCleanupPending) {
       this.emit({ type: "sessionChanged", session: null });
     }
     this.listeners = [];
@@ -3099,6 +3105,13 @@ export class WebSocketAdapter implements EngineAdapter {
       case "TerminalResult": {
         const delivery = (msg.data as { delivery?: FullTerminalDelivery }).delivery;
         if (!delivery) break;
+        if (this.options.nativePregame?.callerManagedTerminalDelivery) {
+          this.gameEnded = true;
+          this.emit({ type: "actionPendingChanged", pending: false });
+          this.emit({ type: "sessionChanged", session: null });
+          this.emit({ type: "terminalDelivery", delivery });
+          break;
+        }
         void (async () => {
           if (!(await commitFullTerminalDelivery(delivery))) {
             this.emit({
@@ -3109,13 +3122,20 @@ export class WebSocketAdapter implements EngineAdapter {
           }
           this.gameEnded = true;
           this.emit({ type: "actionPendingChanged", pending: false });
-          this.emit({ type: "sessionChanged", session: null });
+          const terminalSession = this.currentSession();
+          this.terminalCleanupPending = true;
+          if (terminalSession) {
+            this.emit({ type: "sessionChanged", session: { ...terminalSession, terminalOnly: true } });
+          }
           this.emit({ type: "terminalDelivery", delivery });
-          await acknowledgeFullTerminalDelivery(
+          if (await acknowledgeFullTerminalDelivery(
             this.serverUrl,
-            delivery.delivery_id,
+            delivery.deliveryId,
             delivery.credential,
-          );
+          )) {
+            this.terminalCleanupPending = false;
+            this.emit({ type: "sessionChanged", session: null });
+          }
         })().catch((error: unknown) => {
           this.emit({
             type: "terminalUnavailable",

@@ -95,6 +95,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // carrier (`GameState.resolving_spell_final_part`; `deferred_spell_delivery` removed).
 // v152 adds `ShortcutDecisionSchema.suggested_declaration` and `.leading_aims`, and
 // `ShortcutProposal.leading_aims`.
+// v155 adds Full-only recipient terminal final-view cleanup/recovery authority.
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
 const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
@@ -197,7 +198,8 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // and removes the loyalty-grant sibling variant.
 // +83: v154 adds `PendingCostMoveResume::CounterCostRemovalPayment` and
 //      `ManaAbilityCostCursor.counter_removal` to GameState.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 83;
+// +84: v155 adds Full-only recipient terminal final-view cleanup and recovery.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 84;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.

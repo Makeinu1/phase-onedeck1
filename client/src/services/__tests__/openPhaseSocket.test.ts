@@ -454,10 +454,21 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("accepts the literal Full v154 deferred counter-cost removal, kind-selected grant, shortcut-suggestion and populated Bestow protocol", async () => {
+  it("rejects Full v154 before it can lose a retained terminal final view", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
     ws.deliverMessage(helloFrame({ protocol_version: 154 }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("accepts the literal Full v155 terminal recovery protocol", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 155 }));
 
     await expect(promise).resolves.toBeDefined();
     expect(ws.close).not.toHaveBeenCalled();
