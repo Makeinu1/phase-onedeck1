@@ -91,6 +91,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // `BatchCompletion::TopCardContestRoundComplete`).
 // v149 moves the CR 608.2n owed final part of a paused spell onto the resolution
 // carrier (`GameState.resolving_spell_final_part`; `deferred_spell_delivery` removed).
+// v152 adds Full-only recipient terminal final-view cleanup/recovery authority.
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
 const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
@@ -187,7 +188,8 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 //      `enters_with_modifications` object and the effect's `rider` key), neither parseable
 //      by a v149 peer.
 // +80: v151 carries populated Bestow restoration payloads.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 80;
+// +81: v152 adds Full-only recipient terminal final-view cleanup and recovery.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 81;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
