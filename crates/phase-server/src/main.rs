@@ -19232,11 +19232,15 @@ mod game_submission_tests {
             let mut socket_a = connect_and_hello(url.clone()).await;
             let (game_code, player_token, full_key) =
                 create_started_ai_game(&mut socket_a, None, DeckData::default(), None).await;
-            let before_revision = app_state
-                .sessions
-                .lock()
+            // Empty libraries skip the mulligan (`start_game_with_starting_player`),
+            // so the started game is in a Priority window where PassPriority is a
+            // legal action, not a MulliganDecision that would refuse it.
+            //
+            // Observe through the awaited lock: `try_session` answers `None`
+            // whenever a transition holds the session lease, which the executor
+            // does while it runs the Action asynchronously.
+            let before_revision = lock_session(&app_state.sessions, &game_code)
                 .await
-                .try_session(&game_code)
                 .expect("started Full session")
                 .state_revision;
 
@@ -19253,11 +19257,8 @@ mod game_submission_tests {
 
             let action_revision = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    let revision = app_state
-                        .sessions
-                        .lock()
+                    let revision = lock_session(&app_state.sessions, &game_code)
                         .await
-                        .try_session(&game_code)
                         .expect("Action-first session stays live")
                         .state_revision;
                     if revision > before_revision {
@@ -19296,13 +19297,11 @@ mod game_submission_tests {
                 reconnect_revision >= action_revision,
                 "reconnect must observe the Action-first snapshot or a later one"
             );
-            let manager = app_state.sessions.lock().await;
+            let session = lock_session(&app_state.sessions, &game_code)
+                .await
+                .expect("reconnected Full session");
             assert!(
-                manager
-                    .try_session(&game_code)
-                    .expect("reconnected Full session")
-                    .state_revision
-                    >= reconnect_revision,
+                session.state_revision >= reconnect_revision,
                 "reconnect snapshot must come from the authoritative session revision"
             );
         })
