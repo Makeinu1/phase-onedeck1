@@ -20474,8 +20474,14 @@ mod handshake_tests {
 
     #[test]
     fn bestow_payload_full_game_refuses_previous_and_accepts_current() {
-        // Independent literals discriminate a reverted version bump. A current
-        // lobby version cannot rescue an incompatible full GameState reader.
+        // The Bestow payload first appeared at Full protocol 151. The pre-Bestow
+        // literal 150 is independent of `PROTOCOL_VERSION`, so a reverted bump is
+        // caught; the server and accepted values follow the current Full version,
+        // which later bumps move. A current lobby version cannot rescue an
+        // incompatible full GameState reader.
+        const BESTOW_PAYLOAD_PROTOCOL: u32 = 151;
+        const PRE_BESTOW_PROTOCOL: u32 = BESTOW_PAYLOAD_PROTOCOL - 1;
+        assert!(PROTOCOL_VERSION >= BESTOW_PAYLOAD_PROTOCOL);
         let classify = |protocol_version| {
             classify_hello_gate(
                 false,
@@ -20490,14 +20496,14 @@ mod handshake_tests {
             )
         };
         assert_eq!(
-            classify(150),
+            classify(PRE_BESTOW_PROTOCOL),
             HelloGateOutcome::RejectProtocol {
-                client: 150,
-                server: 151
+                client: PRE_BESTOW_PROTOCOL,
+                server: PROTOCOL_VERSION
             }
         );
         assert_eq!(
-            classify(151),
+            classify(PROTOCOL_VERSION),
             HelloGateOutcome::Accept(ClientHelloInfo {
                 client_version: "bestow-peer".into(),
                 build_commit: "bestow-build".into(),
