@@ -514,9 +514,11 @@ class NativeP2PBridge {
   /**
    * The seat's view when it is already its recipient-bound Full terminal
    * delivery at that delivery's terminal revision, as `restoreTerminalViews`
-   * leaves it once the Full session has been retired. Such a seat has no
-   * engine authority to reattach to. A seat suspended while the game was live
-   * stopped receiving views, so its view is older and this returns `null`.
+   * or `retainSuspendedTerminalViews` leaves it once the Full session has been
+   * retired. Such a seat has no engine authority to reattach to. Returns `null`
+   * while the seat still holds a live (older) view or its terminal has not been
+   * committed: a seat suspended while the game was live stopped receiving
+   * views, and is only given its final view once the terminal commit succeeds.
    */
   retainedTerminalView(playerId: PlayerId): NativeResumedView | null {
     const delivery = this.terminalDeliveries.get(playerId);
@@ -528,6 +530,18 @@ class NativeP2PBridge {
       || view.snapshot.state.waiting_for.type !== "GameOver"
     ) return null;
     return { revision: view.revision, snapshot: view.snapshot };
+  }
+
+  /**
+   * Keep a suspended seat's Full final view once the host's terminal commit has
+   * succeeded, so its return is served from it rather than from a loopback
+   * attachment the retired session refuses. Called only after the commit:
+   * a terminal that did not commit leaves the seat's view untouched.
+   */
+  retainSuspendedTerminalViews(finalViews: ReadonlyMap<PlayerId, GameState>, revision: number): void {
+    for (const [playerId, finalView] of finalViews) {
+      if (playerId !== 0 && !this.clients.has(playerId)) this.seedTerminalView(playerId, finalView, revision);
+    }
   }
 
   /**
@@ -794,16 +808,16 @@ class NativeP2PBridge {
       // loopback client to report the terminal revision, so its cached view is
       // older by construction and cannot be cross-checked. Its recipient-bound
       // Full final view is the only authority for it: `readTerminalDeliveries`
-      // already bound it to this terminal revision, display and Full key, so
-      // seed it the way `restoreTerminalViews` does for a retired session. The
-      // host seat and every attached seat keep the strict check below.
+      // already bound it to this terminal revision, display and Full key. The
+      // view is retained (`retainSuspendedTerminalViews`) only once the caller's
+      // commit succeeds. The host seat and every attached seat keep the strict
+      // check below.
       if (
         playerId !== 0
         && !this.clients.has(playerId)
         && delivery.terminalRevision === revision
         && delivery.finalView?.waiting_for.type === "GameOver"
       ) {
-        this.seedTerminalView(playerId, delivery.finalView, revision);
         states.set(playerId, delivery.finalView);
         continue;
       }
@@ -3387,6 +3401,9 @@ export class P2PHostAdapter implements EngineAdapter {
     }
     this.terminalResult = result;
     this.gameRunState = "terminal";
+    // The terminal is durable: a suspended seat that returns is now served its
+    // Full final view instead of a reattachment the retired session refuses.
+    if (finalViews) this.nativeBridge?.retainSuspendedTerminalViews(finalViews, revision);
     await Promise.all([...this.guestSessions].map(async ([playerId, session]) => {
       try {
         const terminalState = this.nativeBridge

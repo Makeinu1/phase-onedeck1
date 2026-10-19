@@ -9890,7 +9890,7 @@ describe("P2PHostAdapter — contest input", () => {
      * refused by the server, and the guest's recipient-bound final view is
      * reachable only through its terminal delivery.
      */
-    async function nativeTerminalOverSuspendedGuest() {
+    async function nativeTerminalOverSuspendedGuest(options: { commitUnavailable?: boolean } = {}) {
       const fullKey = { game_code: "native-game", generation: 4 };
       const { adapter, emitConnection, guest } = await startedNativeHostWithGuest(fullKey);
       const events: P2PAdapterEvent[] = [];
@@ -9930,6 +9930,7 @@ describe("P2PHostAdapter — contest input", () => {
       // The terminal Concede retired the Full session: the server refuses every
       // reconnect for its identities, exactly as it does for a retired seat.
       nativeWebSocketMocks.initializePregame.mockRejectedValue(new Error("Full session retired"));
+      if (options.commitUnavailable) terminalMocks.commitP2PTerminalResult.mockResolvedValueOnce(false);
 
       await adapter.sendConcede();
       expect(nativeWebSocketMocks.sentActions).toContainEqual(expect.objectContaining({
@@ -9984,6 +9985,25 @@ describe("P2PHostAdapter — contest input", () => {
       expect(nativeWebSocketMocks.initializePregame.mock.calls.length).toBe(attachments);
       expect(frames.some((message) => message.type === "reconnect_rejected")).toBe(false);
       await vi.waitFor(() => expect(nativeTerminalMocks.acknowledge).toHaveBeenCalledTimes(2));
+      adapter.dispose();
+    });
+
+    it("retains a suspended seat's final view only once the terminal commit succeeds", async () => {
+      const { adapter, events } = await nativeTerminalOverSuspendedGuest({ commitUnavailable: true });
+      const host = adapter as unknown as {
+        terminalResult: unknown;
+        nativeBridge: {
+          latestViews: Map<number, { revision: number }>;
+          retainedTerminalView: (playerId: number) => unknown;
+        };
+      };
+
+      expect(events).toContainEqual(expect.objectContaining({ type: "terminalUnavailable" }));
+      expect(host.terminalResult).toBeNull();
+      // The suspended seat still holds the live view it last received: nothing
+      // that never committed is handed to it as its terminal.
+      expect(host.nativeBridge.latestViews.get(1)?.revision).toBe(1);
+      expect(host.nativeBridge.retainedTerminalView(1)).toBeNull();
       adapter.dispose();
     });
 

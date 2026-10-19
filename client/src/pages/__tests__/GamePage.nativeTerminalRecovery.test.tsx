@@ -255,6 +255,7 @@ describe("native terminal production consumer before cleanup ownership", () => {
         playerIds: () => [0, 1],
         terminalFinalViews: async () => new Map<PlayerId, GameState>([[0, finalState], [1, finalState]]),
         terminalDisplay: () => terminal.display,
+        retainSuspendedTerminalViews: vi.fn(),
         terminalCleanupAuthority: cleanupAuthority,
         acknowledgeTerminalCleanup: acknowledge,
         dispose: vi.fn(),
