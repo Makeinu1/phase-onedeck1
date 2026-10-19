@@ -533,6 +533,30 @@ class NativeP2PBridge {
   }
 
   /**
+   * The view a returning, suspended seat is handed: its retained terminal view,
+   * else the current view of a live reattachment. When the reattachment is
+   * refused because the Full session has been retired (a terminal the seat was
+   * away for, whose commit has not seeded it yet or did not complete), the
+   * recipient-bound terminal rows are restored the way `reconcileConcede` and a
+   * native resume do. Only when there is no terminal to restore does the
+   * reattachment's own failure stand, leaving the seat suspended.
+   */
+  async returningSeatView(playerId: PlayerId): Promise<NativeResumedView> {
+    const retained = this.retainedTerminalView(playerId);
+    if (retained) return retained;
+    try {
+      return await this.resumeGuest(playerId);
+    } catch (resumeError) {
+      // A restore that itself fails leaves the reattachment's failure as the
+      // seat's outcome: it is what the host reports for the refused return.
+      if (!(await this.restoreTerminalViews().catch(() => false))) throw resumeError;
+      const restored = this.retainedTerminalView(playerId);
+      if (!restored) throw resumeError;
+      return restored;
+    }
+  }
+
+  /**
    * Keep a suspended seat's Full final view once the host's terminal commit has
    * succeeded, so its return is served from it rather than from a loopback
    * attachment the retired session refuses. Called only after the commit:
@@ -1390,6 +1414,8 @@ export class P2PHostAdapter implements EngineAdapter {
    * until the host's store has seen every accepted transition.
    */
   private pendingHostTerminalEmit: P2PTerminalResult | null = null;
+  /** The in-flight terminal commit; a second caller shares its outcome. */
+  private terminalCommitInFlight: Promise<boolean> | null = null;
   /** Serializes host publications, so a retry never interleaves with another publisher. */
   private hostPublicationQueue: Promise<void> = Promise.resolve();
   /** The in-flight settlement of owed host publications; concurrent callers share it. */
@@ -3341,10 +3367,26 @@ export class P2PHostAdapter implements EngineAdapter {
    * already reads GameOver from the published snapshot). A failed seat never
    * enters `terminalDelivered`, and the sweep heals it.
    */
-  private async commitTerminalIfComplete(
+  private commitTerminalIfComplete(
     snapshot: EngineSnapshot,
     revision: number,
     reason: string = "Game complete",
+  ): Promise<boolean> {
+    // One commit at a time: a caller arriving while the commit is in flight (a
+    // returning seat's retry, a reconciled Concede) waits for its outcome rather
+    // than committing a second, differently identified terminal result.
+    if (this.terminalCommitInFlight) return this.terminalCommitInFlight;
+    const commit = this.commitTerminalOnce(snapshot, revision, reason).finally(() => {
+      if (this.terminalCommitInFlight === commit) this.terminalCommitInFlight = null;
+    });
+    this.terminalCommitInFlight = commit;
+    return commit;
+  }
+
+  private async commitTerminalOnce(
+    snapshot: EngineSnapshot,
+    revision: number,
+    reason: string,
   ): Promise<boolean> {
     const { waiting_for: waitingFor } = snapshot.state;
     if (waitingFor.type !== "GameOver") return true;
@@ -4742,6 +4784,21 @@ export class P2PHostAdapter implements EngineAdapter {
     try {
       const handoff = await this.reconnectHandoff(pid);
       if (this.pendingReconnectSessions.get(pid) !== session || !this.ownsAuthority()) return;
+      // A native seat handed a Full final view returns to a game that ended while
+      // it was away. If the host's terminal never committed (the redial raced the
+      // commit, or the commit ended unavailable) it is committed now, from the
+      // same recipient-bound Full views, so this seat is given its terminal result
+      // instead of a final board with no statement. If the authority is still
+      // unavailable the commit reports `terminalUnavailable` and the seat is handed
+      // the final board alone, exactly as every attached seat was.
+      if (
+        this.nativeBridge
+        && this.terminalResult === null
+        && handoff.snapshot.state.waiting_for.type === "GameOver"
+      ) {
+        await this.commitTerminalIfComplete(handoff.snapshot, handoff.revision);
+        if (this.pendingReconnectSessions.get(pid) !== session || !this.ownsAuthority()) return;
+      }
       const terminalReconnect = this.terminalResult !== null;
       if (terminalReconnect) {
         if (
@@ -4837,12 +4894,10 @@ export class P2PHostAdapter implements EngineAdapter {
       // A returning seat reattaches to the engine authority first (it was suspended when
       // its channel dropped), and its handoff is the view that reattachment returned.
       // A retired Full session has no authority left to reattach to; its seat's
-      // handoff is the recipient-bound terminal view the bridge already holds.
+      // handoff is the recipient-bound terminal view the bridge holds or, when
+      // the reattachment is refused for a retired session, restores.
       if (!this.nativeBridge.isGuestAttached(pid)) {
-        this.nativeDeliveredViews.set(
-          pid,
-          this.nativeBridge.retainedTerminalView(pid) ?? await this.nativeBridge.resumeGuest(pid),
-        );
+        this.nativeDeliveredViews.set(pid, await this.nativeBridge.returningSeatView(pid));
       }
       const delivered = this.nativeDeliveredViews.get(pid);
       if (!delivered) throw new AdapterError("P2P_ERROR", `No delivered native snapshot for seat ${pid}`, true);

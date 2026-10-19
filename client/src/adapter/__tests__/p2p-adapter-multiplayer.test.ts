@@ -1341,6 +1341,126 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     } finally { adapter.dispose(); }
   });
 
+  it("restores a retired Full session's terminal for a returning seat when the first terminal commit was unavailable", async () => {
+    nativeWebSocketMocks.real = true;
+    const { adapter, emitConnection } = makeNativeHost(2, { gameId: "retired-redial", roomCode: "ABCDE" });
+    const events: P2PAdapterEvent[] = [];
+    adapter.onEvent((event) => events.push(event));
+    const fullKey = { game_code: "RETIRED", generation: 1 };
+    const attach = async (pid: number) => {
+      await vi.waitFor(() => expect(AuditSocket.sockets).toHaveLength(pid + 1));
+      const socket = AuditSocket.sockets[pid];
+      await flushPromises(20);
+      socket.frame("ServerHello", { server_version: "0.0.0-test", build_commit: "testhash", protocol_version: PROTOCOL_VERSION, mode: "Full" });
+      await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThan(0));
+      socket.frame("SessionAttached", { game_code: "RETIRED", player_id: pid, player_token: `retired-native-${pid}`, full_key: fullKey });
+      for (const s of AuditSocket.sockets) s.frame("PlayerSlotsUpdate", { slots: [], full_key: fullKey });
+    };
+    try {
+      const init = adapter.initialize();
+      await attach(0);
+      await init;
+      const joining = joinGuest(emitConnection, { type: "guest_deck", deckData: { player: { main_deck: ["Plains"], sideboard: [] } } });
+      await attach(1);
+      const guest = await joining;
+      const start = adapter.initializeGame();
+      await vi.waitFor(() => expect(AuditSocket.sockets[0].sent.some((m) => m.type === "SeatMutate")).toBe(true));
+      for (const [pid, s] of AuditSocket.sockets.entries()) {
+        s.frame("GameStarted", { state_revision: 1, state: remoteState("before the terminal"), your_player: pid, full_key: fullKey });
+      }
+      AuditSocket.sockets[0].frame("PlayerSlotsUpdate", { slots: [], full_key: fullKey });
+      await start;
+      await flushPromises(30);
+      const setup = (await guest.getSentMessages()).find((m) => (m as P2PMessage).type === "game_setup") as Extract<P2PMessage, { type: "game_setup" }>;
+
+      // The guest drops while the game is live: its loopback seat is suspended.
+      guest.simulateClose();
+      await vi.waitFor(() => expect(AuditSocket.sockets[1].readyState).toBe(3));
+
+      // The game ends while it is away, and the host's terminal commit is unavailable.
+      const finalView = (pid: number) => ({
+        ...remoteState(`retired terminal ${pid}`),
+        waiting_for: { type: "GameOver", data: { winner: 0 } },
+        eliminated_players: [1],
+        filteredFor: pid,
+      }) as unknown as GameState;
+      const hostFinal = finalView(0);
+      const guestFinal = finalView(1);
+      const delivery = (deliveryId: string, view: GameState): FullTerminalDelivery => ({
+        key: fullKey,
+        terminalRevision: 2,
+        deliveryId,
+        credential: `${deliveryId}-credential`,
+        display: { winner: 0, reason: "Full terminal reason" },
+        finalView: view,
+      });
+      const deliveries = new Map<string, FullTerminalDelivery>([
+        ["retired-native-0", delivery("host-delivery", hostFinal)],
+        ["retired-native-1", delivery("guest-delivery", guestFinal)],
+      ]);
+      nativeTerminalMocks.bootstrap.mockImplementation(async (_url, _key, playerToken) =>
+        deliveries.get(playerToken ?? "") ?? null);
+      terminalMocks.commitP2PTerminalResult.mockResolvedValueOnce(false);
+      AuditSocket.sockets[0].frame("StateUpdate", { state_revision: 2, state: hostFinal, events: [], full_key: fullKey });
+      await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({ type: "terminalUnavailable" })));
+      const host = adapter as unknown as { terminalResult: { revision: number } | null };
+      expect(host.terminalResult).toBeNull();
+
+      // The guest redials after the server retired the session: the server's real
+      // refusal for its identity is an Error frame on the reattachment socket.
+      const redial = joinGuest(emitConnection, { type: "reconnect", playerToken: setup.playerToken! });
+      await vi.waitFor(() => expect(AuditSocket.sockets).toHaveLength(3));
+      const refused = AuditSocket.sockets[2];
+      await flushPromises(20);
+      refused.frame("ServerHello", { server_version: "0.0.0-test", build_commit: "testhash", protocol_version: PROTOCOL_VERSION, mode: "Full" });
+      await vi.waitFor(() => expect(refused.sent.length).toBeGreaterThan(0));
+      refused.frame("Error", { message: "Reconnect session identity is no longer current" });
+      const returning = await redial;
+
+      await vi.waitFor(async () => {
+        expect(await returning.getSentMessages()).toContainEqual(expect.objectContaining({ type: "terminal_result" }));
+      });
+      const frames = await returning.getSentMessages() as P2PMessage[];
+      const ack = frames.find((m): m is Extract<P2PMessage, { type: "reconnect_ack" }> => m.type === "reconnect_ack");
+      const terminal = frames.find((m): m is Extract<P2PMessage, { type: "terminal_result" }> => m.type === "terminal_result");
+      expect(ack?.state).toEqual(guestFinal);
+      expect(ack?.revision).toBe(2);
+      expect(terminal?.result.recipient).toBe(1);
+      expect(terminal?.result.finalStateCommitment).toBe(await p2pFinalStateCommitment(guestFinal));
+      expect(frames.findIndex((m) => m.type === "reconnect_ack"))
+        .toBeLessThan(frames.findIndex((m) => m.type === "terminal_result"));
+      expect(frames.some((m) => m.type === "reconnect_rejected")).toBe(false);
+      expect(host.terminalResult?.revision).toBe(2);
+      expect(terminalMocks.commitP2PTerminalResult).toHaveBeenCalledTimes(2);
+    } finally { adapter.dispose(); }
+  });
+
+  it("shares one in-flight terminal commit between concurrent callers", async () => {
+    const { adapter } = makeHost(2);
+    await adapter.initialize();
+    const gate = deferred<boolean>();
+    terminalMocks.commitP2PTerminalResult.mockReturnValueOnce(gate.promise);
+    const host = adapter as unknown as {
+      commitTerminalIfComplete: (snapshot: EngineSnapshot, revision: number) => Promise<boolean>;
+      terminalResult: { revision: number } | null;
+    };
+    const snapshot: EngineSnapshot = {
+      state: { ...remoteState("terminal"), waiting_for: { type: "GameOver", data: { winner: 0 } } } as unknown as GameState,
+      legalResult: { actions: [], autoPassRecommended: false },
+      seq: 1,
+    };
+    const first = host.commitTerminalIfComplete(snapshot, 3);
+    const second = host.commitTerminalIfComplete(snapshot, 3);
+    await vi.waitFor(() => expect(terminalMocks.commitP2PTerminalResult).toHaveBeenCalledTimes(1));
+    await flushPromises(20);
+    expect(terminalMocks.commitP2PTerminalResult).toHaveBeenCalledTimes(1);
+    gate.resolve(true);
+    await expect(Promise.all([first, second])).resolves.toEqual([true, true]);
+    expect(terminalMocks.commitP2PTerminalResult).toHaveBeenCalledTimes(1);
+    expect(host.terminalResult?.revision).toBe(3);
+    adapter.dispose();
+  });
+
   it("keeps a disconnected native seat reconnectable when Concede rejects before send", async () => {
     const { adapter, emitConnection } = makeNativeHost(3, {
       gameId: "native-concede-regression",
