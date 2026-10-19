@@ -5099,6 +5099,9 @@ export class P2PHostAdapter implements EngineAdapter {
         } catch {
           keepFence = true;
           this.uncertainConcedeSeats.add(pid);
+          // The send or the failed reconciliation may have reattached the seat; it is
+          // still away, so the engine authority must keep seeing it gone while fenced.
+          suspendIfStillAway();
           this.emit({
             type: "error",
             message: "Could not reconcile the Concede outcome; the seat remains fenced.",
@@ -5160,6 +5163,9 @@ export class P2PHostAdapter implements EngineAdapter {
         } catch {
           keepFence = true;
           this.uncertainConcedeSeats.add(pid);
+          // The send or the failed reconciliation may have reattached the seat; it is
+          // still away, so the engine authority must keep seeing it gone while fenced.
+          suspendIfStillAway();
           this.emit({
             type: "error",
             message: "Could not reconcile the Concede outcome; the seat remains fenced.",

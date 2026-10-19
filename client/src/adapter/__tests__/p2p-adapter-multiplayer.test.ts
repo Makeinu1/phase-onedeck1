@@ -10002,6 +10002,103 @@ describe("P2PHostAdapter — contest input", () => {
       adapter.dispose();
     });
 
+    it("keeps a dropped seat suspended while an unreconciled Concede stays fenced", async () => {
+      const { adapter, guest } = await startedNativeHostWithGuest();
+      const host = adapter as unknown as {
+        nativeBridge: {
+          isGuestAttached: (playerId: number) => boolean;
+          reattachGuest: (playerId: number) => Promise<void>;
+          reconcileConcede: (playerId: number) => Promise<unknown>;
+        };
+        disconnectedSeats: Map<number, unknown>;
+        uncertainConcedeSeats: Set<number>;
+        eliminatedSeats: Set<number>;
+      };
+      guest.simulateClose();
+      await flushPromises(20);
+      expect(host.disconnectedSeats.has(1)).toBe(true);
+      expect(host.nativeBridge.isGuestAttached(1)).toBe(false);
+
+      // The reconciliation reattaches the seat and then cannot read the authority.
+      const bridge = host.nativeBridge;
+      vi.spyOn(bridge, "reconcileConcede").mockImplementation(async (playerId: number) => {
+        await bridge.reattachGuest(playerId);
+        throw new Error("authoritative view unavailable");
+      });
+      nativeWebSocketMocks.initializePregame.mockResolvedValue(NATIVE_GUEST_ATTACHMENT);
+
+      // The Concede's own send reattached the seat and its response was lost.
+      nativeWebSocketMocks.submitAction.mockRejectedValueOnce(new Error("response lost after send"));
+      await adapter.concedeDisconnected(1);
+      expect(host.uncertainConcedeSeats.has(1)).toBe(true);
+      expect(host.eliminatedSeats.has(1)).toBe(false);
+      expect(host.nativeBridge.isGuestAttached(1)).toBe(false);
+      expect(nativeWebSocketMocks.openSockets.has(1)).toBe(false);
+
+      // The retry reconciles first: it reattaches the seat again, fails again, and
+      // the still-away seat must be released again.
+      const attachments = nativeWebSocketMocks.initializePregame.mock.calls.length;
+      await adapter.concedeDisconnected(1);
+      expect(nativeWebSocketMocks.initializePregame.mock.calls.length).toBe(attachments + 1);
+      expect(host.uncertainConcedeSeats.has(1)).toBe(true);
+      expect(host.nativeBridge.isGuestAttached(1)).toBe(false);
+      expect(nativeWebSocketMocks.openSockets.has(1)).toBe(false);
+      adapter.dispose();
+    });
+
+    it("releases a still-away seat after a reconciled Concede reached a terminal without eliminating it", async () => {
+      const { adapter, guest } = await startedNativeHostWithGuest();
+      const host = adapter as unknown as {
+        nativeBridge: {
+          isGuestAttached: (playerId: number) => boolean;
+          reattachGuest: (playerId: number) => Promise<void>;
+          reconcileConcede: (playerId: number) => Promise<unknown>;
+          viewerUpdates: () => Map<number, unknown>;
+          suspendGuest: (playerId: number) => void;
+        };
+        disconnectedSeats: Map<number, unknown>;
+        eliminatedSeats: Set<number>;
+      };
+      guest.simulateClose();
+      await flushPromises(20);
+      expect(host.disconnectedSeats.has(1)).toBe(true);
+
+      const bridge = host.nativeBridge;
+      const terminal: { snapshot: EngineSnapshot; events: GameEvent[]; revision: number } = {
+        snapshot: {
+          state: {
+            ...remoteState("terminal without elimination"),
+            waiting_for: { type: "GameOver", data: { winner: 0 } },
+            eliminated_players: [],
+          } as unknown as GameState,
+          legalResult: { actions: [], autoPassRecommended: false },
+          seq: 9,
+        },
+        events: [],
+        revision: 9,
+      };
+      // The reconciliation leaves the seat reattached on a live (not yet retired)
+      // authority that reports a terminal in which the seat was not eliminated.
+      vi.spyOn(bridge, "reconcileConcede").mockImplementation(async (playerId: number) => {
+        await bridge.reattachGuest(playerId);
+        return terminal;
+      });
+      vi.spyOn(bridge, "viewerUpdates").mockReturnValue(new Map([[0, terminal]]));
+      nativeWebSocketMocks.initializePregame.mockResolvedValue(NATIVE_GUEST_ATTACHMENT);
+      nativeWebSocketMocks.submitAction.mockRejectedValueOnce(new Error("response lost after send"));
+      // Reattaching for the send is what the authority would see; the terminal
+      // reconciliation then hands back a still-attached seat.
+      const suspend = vi.spyOn(bridge, "suspendGuest");
+
+      await adapter.concedeDisconnected(1);
+
+      expect(host.eliminatedSeats.has(1)).toBe(false);
+      expect(suspend).toHaveBeenCalledWith(1);
+      expect(host.nativeBridge.isGuestAttached(1)).toBe(false);
+      expect(nativeWebSocketMocks.openSockets.has(1)).toBe(false);
+      adapter.dispose();
+    });
+
     /**
      * A started native game whose guest really dropped (its loopback seat is
      * suspended, so the revision barrier no longer waits on it and its cached
