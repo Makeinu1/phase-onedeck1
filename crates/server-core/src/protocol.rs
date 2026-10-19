@@ -3476,7 +3476,11 @@ mod tests {
     /// v153: `DebugAction` gains `GainLife` / `LoseLife` (Sandbox life changes
     /// through the CR 119.3 events), carried in `GameAction::Debug`; a v152 peer
     /// cannot parse the tags, so it must be refused before it can receive or
-    /// send one. P2P moves in lockstep (wire 135); lobby messages unchanged.
+    /// send one. A parked replacement also records whether its life event came
+    /// from such an action (`PendingReplacement.unrepresentable_life_change`,
+    /// `"Reject"`, omitted when ordinary), so its resumed delivery rejects an
+    /// unrepresentable result. P2P moves in lockstep (wire 135); lobby messages
+    /// unchanged.
     ///
     /// v152: `ShortcutDecisionSchema` gains `suggested_declaration` and
     /// `leading_aims`, and `ShortcutProposal` gains `leading_aims`; a v151 peer

@@ -22,7 +22,9 @@ use crate::types::zones::Zone;
 
 use super::effects::attach::{attach_to as attach_object_to, attach_to_player};
 use super::effects::change_zone::shuffle_library;
-use super::effects::life::{apply_life_gain, apply_life_loss, ReplacementDeferred};
+use super::effects::life::{
+    try_apply_life_gain, try_apply_life_loss, LifeChangeError, ReplacementDeferred,
+};
 use super::engine::{
     action_rejection_for_engine_error, explicit_debug_permission_rejection, preflight_debug_action,
     EngineError,
@@ -753,8 +755,8 @@ enum DebugLifeChange {
     Loss,
 }
 
-/// CR 119.3: Apply a sandbox life gain/loss through `apply_life_gain` /
-/// `apply_life_loss`, so replacement (CR 614.1a, CR 616.1) and can't (CR 101.2)
+/// CR 119.3: Apply a sandbox life gain/loss through `try_apply_life_gain` /
+/// `try_apply_life_loss`, so replacement (CR 614.1a, CR 616.1) and can't (CR 101.2)
 /// effects apply, then settle the action the way the reducer settles any action.
 fn apply_debug_life_change(
     state: &mut GameState,
@@ -770,34 +772,13 @@ fn apply_debug_life_change(
             player_id.0
         )));
     }
-    // Representability, checked before any mutation (no wrap, no clamp).
-    let delta = i32::try_from(amount).map_err(|_| {
-        EngineError::InvalidAction("Debug: life change amount is not representable".into())
-    })?;
-    let player = state
-        .players
-        .iter()
-        .find(|p| p.id == player_id)
-        .expect("the validated debug player must remain present");
-    let representable = match change {
-        DebugLifeChange::Gain => {
-            player.life.checked_add(delta).is_some()
-                && player.life_gained_this_turn.checked_add(amount).is_some()
-        }
-        DebugLifeChange::Loss => {
-            player.life.checked_sub(delta).is_some()
-                && player.life_lost_this_turn.checked_add(amount).is_some()
-        }
-    };
-    if !representable {
-        return Err(EngineError::InvalidAction(
-            "Debug: resulting life total is not representable".into(),
-        ));
-    }
     let event_start = events.len();
+    // The final edit is the single representability authority: an unrepresentable
+    // result (after any replacement) rejects the action and the action boundary
+    // restores its snapshot — no wrap, no clamp, nothing settles.
     let outcome = match change {
-        DebugLifeChange::Gain => apply_life_gain(state, player_id, amount, events),
-        DebugLifeChange::Loss => apply_life_loss(state, player_id, amount, events),
+        DebugLifeChange::Gain => try_apply_life_gain(state, player_id, amount, events),
+        DebugLifeChange::Loss => try_apply_life_loss(state, player_id, amount, events),
     };
     match outcome {
         Ok(_) => {
@@ -819,16 +800,21 @@ fn apply_debug_life_change(
         }
         // CR 616.1: the authority installed the replacement-order prompt; its
         // resume path owns the event's triggers and SBAs.
-        Err(ReplacementDeferred::ReplacementChoice) => {}
+        Err(LifeChangeError::Deferred(ReplacementDeferred::ReplacementChoice)) => {}
         // CR 614.6 + CR 603.7: the substitute is paused on its own prompt. Queue
         // (never dispatch) ordinary and delayed triggers for the resume's drain;
         // no SBAs mid-resolution.
-        Err(ReplacementDeferred::SubstitutionContinuation { .. }) => {
+        Err(LifeChangeError::Deferred(ReplacementDeferred::SubstitutionContinuation {
+            ..
+        })) => {
             super::triggers::collect_triggers_into_deferred(state, &events[event_start..]);
             super::triggers::collect_delayed_trigger_contexts_into_deferred(
                 state,
                 &events[event_start..],
             );
+        }
+        Err(LifeChangeError::Unrepresentable(unrepresentable)) => {
+            return Err(unrepresentable.into());
         }
     }
     Ok(())
@@ -2951,6 +2937,7 @@ mod tests {
         use crate::game::scenario_db::GameScenarioDbExt;
         use crate::types::ability::{ChooseOneOfKind, PlayerFilter};
         use crate::types::actions::MAX_DEBUG_LIFE_AMOUNT;
+        use crate::types::game_state::{PendingReplacement, UnrepresentablePolicy};
         use crate::types::phase::Phase;
 
         fn scenario() -> GameScenario {
@@ -3012,6 +2999,183 @@ mod tests {
             runner.state().players[player.0 as usize]
                 .graveyard
                 .contains(&id)
+        }
+
+        /// The exact rejection text of an unrepresentable final life edit (no other
+        /// engine error carries it).
+        const NOT_REPRESENTABLE: &str = "life change is not representable";
+
+        fn assert_not_representable(error: &EngineError) {
+            assert!(
+                matches!(
+                    error,
+                    EngineError::InvalidAction(message) if message == NOT_REPRESENTABLE
+                ),
+                "expected the exact unrepresentable-life rejection, got {error:?}"
+            );
+        }
+
+        /// Everything the action boundary must restore exactly when it rejects
+        /// an action: every player's life and per-turn counters, the state
+        /// revision, the prompt and its parked proposal, the stack, the resolved
+        /// rules journal and the Pridemate's counters.
+        #[derive(Debug, PartialEq)]
+        struct RollbackSet {
+            players: Vec<(i32, u32, u32)>,
+            state_revision: u64,
+            waiting_for: WaitingFor,
+            pending_replacement: Option<PendingReplacement>,
+            stack_is_empty: bool,
+            journal_len: usize,
+            pridemate_counters: u32,
+        }
+
+        fn rollback_set(runner: &GameRunner, pridemate: ObjectId) -> RollbackSet {
+            let state = runner.state();
+            RollbackSet {
+                players: state
+                    .players
+                    .iter()
+                    .map(|player| {
+                        (
+                            player.life,
+                            player.life_gained_this_turn,
+                            player.life_lost_this_turn,
+                        )
+                    })
+                    .collect(),
+                state_revision: state.state_revision,
+                waiting_for: state.waiting_for.clone(),
+                pending_replacement: state.pending_replacement.clone(),
+                stack_is_empty: state.stack.is_empty(),
+                journal_len: state.resolved_rules_journal.entries().len(),
+                pridemate_counters: p1p1(runner, pridemate),
+            }
+        }
+
+        fn replacement_prompt_open(runner: &GameRunner) -> bool {
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::ReplacementChoice { .. }
+            )
+        }
+
+        fn parked_policy(runner: &GameRunner) -> Option<UnrepresentablePolicy> {
+            runner
+                .state()
+                .pending_replacement
+                .as_ref()
+                .map(|pending| pending.unrepresentable_life_change)
+        }
+
+        /// Answers the open replacement-order prompts with index 0 until one
+        /// answer is rejected; returns the rollback set taken just before that
+        /// answer and its error.
+        fn answer_until_rejected(
+            runner: &mut GameRunner,
+            pridemate: ObjectId,
+        ) -> (RollbackSet, EngineError) {
+            for _ in 0..16 {
+                assert!(
+                    replacement_prompt_open(runner),
+                    "reach guard: an ordering prompt must be open, got {:?}",
+                    runner.state().waiting_for
+                );
+                let before = rollback_set(runner, pridemate);
+                match runner.act(GameAction::ChooseReplacement { index: 0 }) {
+                    Ok(_) => {}
+                    Err(error) => return (before, error),
+                }
+            }
+            panic!("no replacement answer was rejected");
+        }
+
+        /// The delivering `ChooseReplacement` is rejected with the exact error,
+        /// the previously accepted proposal and prompt are restored, and
+        /// answering again is rejected the same way (the prompt stays answerable).
+        fn assert_choice_rejected_and_still_answerable(
+            runner: &mut GameRunner,
+            pridemate: ObjectId,
+        ) {
+            let (before, error) = answer_until_rejected(runner, pridemate);
+            assert_not_representable(&error);
+            assert_eq!(
+                rollback_set(runner, pridemate),
+                before,
+                "a rejected answer must restore the accepted proposal and prompt"
+            );
+            assert!(replacement_prompt_open(runner));
+            let again = runner
+                .act(GameAction::ChooseReplacement { index: 0 })
+                .expect_err("the restored prompt must reject the same answer again");
+            assert_not_representable(&again);
+            assert_eq!(rollback_set(runner, pridemate), before);
+        }
+
+        /// Answers any open ordering prompts with index 0 until none remains.
+        fn answer_to_completion(runner: &mut GameRunner) {
+            for _ in 0..16 {
+                if !replacement_prompt_open(runner) {
+                    return;
+                }
+                runner
+                    .act(GameAction::ChooseReplacement { index: 0 })
+                    .expect("a representable control answer must be accepted");
+            }
+            panic!("the replacement prompts never completed");
+        }
+
+        /// Submits `action` expecting an unrepresentable final result: either the
+        /// action itself is rejected with the rollback set unchanged, or it parks
+        /// an ordering prompt whose delivering answer is.
+        fn submit_expecting_rejection(
+            runner: &mut GameRunner,
+            pridemate: ObjectId,
+            action: GameAction,
+        ) {
+            let before = rollback_set(runner, pridemate);
+            match runner.act(action) {
+                Err(error) => {
+                    assert_not_representable(&error);
+                    assert_eq!(
+                        rollback_set(runner, pridemate),
+                        before,
+                        "the rejected action must leave the state unchanged"
+                    );
+                }
+                Ok(_) => assert_choice_rejected_and_still_answerable(runner, pridemate),
+            }
+        }
+
+        /// Puts `count` Bloodletter of Aclazotz objects (P0) in play, with the
+        /// replacement parsed from the card's verbatim Oracle text.
+        fn add_bloodletters(runner: &mut GameRunner, count: usize) {
+            let parsed = crate::parser::oracle::parse_oracle_text(
+                "Flying\nIf an opponent would lose life during your turn, they lose twice that much \
+                 life instead. (Damage causes loss of life.)",
+                "Bloodletter of Aclazotz",
+                &["Flying".to_string()],
+                &["Creature".to_string()],
+                &["Vampire".to_string(), "Demon".to_string()],
+            );
+            assert_eq!(
+                parsed.replacements.len(),
+                1,
+                "reach guard: Bloodletter's life-loss doubler must parse"
+            );
+            for index in 0..count {
+                let id = create_object(
+                    runner.state_mut(),
+                    CardId(9_800 + index as u64),
+                    P0,
+                    "Bloodletter of Aclazotz".to_string(),
+                    Zone::Battlefield,
+                );
+                let object = runner.state_mut().objects.get_mut(&id).unwrap();
+                object.replacement_definitions = parsed.replacements.clone().into();
+                object.base_replacement_definitions =
+                    std::sync::Arc::new(parsed.replacements.clone());
+            }
         }
 
         /// CR 119.3 + CR 603.2 + CR 603.3: a debug gain is a real life-gain event,
@@ -3456,8 +3620,8 @@ mod tests {
             assert_eq!(life(&runner, P0), expected);
         }
 
-        /// Unrepresentable results are rejected before any mutation — no wrap,
-        /// no clamp.
+        /// Unrepresentable final results are rejected unchanged by the action
+        /// boundary — no wrap, no clamp.
         #[test]
         fn debug_life_change_rejects_unrepresentable_results_unchanged() {
             type Setup = fn(&mut GameState);
@@ -3481,7 +3645,10 @@ mod tests {
                 let before = runner.state().players[0].clone();
                 let revision = runner.state().state_revision;
 
-                assert!(runner.act(action).is_err(), "case {index} must be rejected");
+                let error = runner
+                    .act(action)
+                    .expect_err(&format!("case {index} must be rejected"));
+                assert_not_representable(&error);
                 let after = &runner.state().players[0];
                 assert_eq!(after.life, before.life, "case {index}");
                 assert_eq!(
@@ -3496,6 +3663,324 @@ mod tests {
                 assert!(runner.state().stack.is_empty(), "case {index}");
                 assert_eq!(p1p1(&runner, mate), 0, "case {index}");
             }
+        }
+
+        /// The final gain edit is the representability authority: Rhox Faithmender
+        /// ("If you would gain life, you gain twice that much life instead.")
+        /// doubles a requested 1 to 2, and a life total of `i32::MAX - 1` cannot
+        /// take it. The action is rejected unchanged; one below the limit it
+        /// applies in full.
+        #[test]
+        fn debug_gain_final_life_overflow_after_a_parsed_doubler_is_rejected_unchanged() {
+            // Accepted control: 1 doubled to 2 reaches i32::MAX exactly.
+            let mut scenario = scenario();
+            scenario.with_life(P0, i32::MAX - 2);
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            add_card(&mut scenario, P0, "Rhox Faithmender");
+            let mut runner = debug_runner(scenario);
+            act_ok(&mut runner, gain(P0, 1));
+            assert_eq!(life(&runner, P0), i32::MAX);
+            runner.advance_until_stack_empty();
+            assert_eq!(p1p1(&runner, mate), 1);
+
+            let mut scenario = self::scenario();
+            scenario.with_life(P0, i32::MAX - 1);
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            add_card(&mut scenario, P0, "Rhox Faithmender");
+            let mut runner = debug_runner(scenario);
+            let before = rollback_set(&runner, mate);
+            let error = runner
+                .act(gain(P0, 1))
+                .expect_err("a doubled gain past i32::MAX must be rejected, not panic");
+            assert_not_representable(&error);
+            assert_eq!(rollback_set(&runner, mate), before);
+        }
+
+        /// The gained-this-turn counter is checked by the same final edit.
+        #[test]
+        fn debug_gain_final_counter_overflow_after_a_parsed_doubler_is_rejected_unchanged() {
+            let mut scenario = scenario();
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            add_card(&mut scenario, P0, "Rhox Faithmender");
+            let mut runner = debug_runner(scenario);
+            runner.state_mut().players[0].life_gained_this_turn = u32::MAX - 2;
+            act_ok(&mut runner, gain(P0, 1));
+            assert_eq!(runner.state().players[0].life_gained_this_turn, u32::MAX);
+            runner.advance_until_stack_empty();
+            assert_eq!(p1p1(&runner, mate), 1);
+
+            let mut scenario = self::scenario();
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            add_card(&mut scenario, P0, "Rhox Faithmender");
+            let mut runner = debug_runner(scenario);
+            runner.state_mut().players[0].life_gained_this_turn = u32::MAX - 1;
+            let before = rollback_set(&runner, mate);
+            let error = runner
+                .act(gain(P0, 1))
+                .expect_err("a doubled gain past the per-turn counter must be rejected");
+            assert_not_representable(&error);
+            assert_eq!(rollback_set(&runner, mate), before);
+        }
+
+        /// A choice-resumed delivery is rejected the same way: Rhox Faithmender
+        /// and Boon Reflection make the player order the doublers (CR 616.1),
+        /// 1 doubled twice is 4, and `i32::MAX - 3` cannot take it. The
+        /// delivering answer is rejected, the accepted proposal and prompt are
+        /// restored and stay answerable.
+        #[test]
+        fn debug_gain_choice_resumed_overflow_is_rejected_and_the_prompt_stays_answerable() {
+            // Accepted control: i32::MAX - 4 + 4 reaches i32::MAX.
+            let mut scenario = scenario();
+            scenario.with_life(P0, i32::MAX - 4);
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            add_card(&mut scenario, P0, "Rhox Faithmender");
+            add_card(&mut scenario, P0, "Boon Reflection");
+            let mut runner = debug_runner(scenario);
+            act_ok(&mut runner, gain(P0, 1));
+            assert!(
+                replacement_prompt_open(&runner),
+                "reach guard: two doublers must park an ordering prompt, got {:?}",
+                runner.state().waiting_for
+            );
+            answer_to_completion(&mut runner);
+            assert_eq!(life(&runner, P0), i32::MAX);
+            runner.advance_until_stack_empty();
+            assert_eq!(p1p1(&runner, mate), 1);
+
+            let mut scenario = self::scenario();
+            scenario.with_life(P0, i32::MAX - 3);
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            add_card(&mut scenario, P0, "Rhox Faithmender");
+            add_card(&mut scenario, P0, "Boon Reflection");
+            let mut runner = debug_runner(scenario);
+            act_ok(&mut runner, gain(P0, 1));
+            assert!(
+                replacement_prompt_open(&runner),
+                "reach guard: two doublers must park an ordering prompt, got {:?}",
+                runner.state().waiting_for
+            );
+            assert_eq!(
+                parked_policy(&runner),
+                Some(UnrepresentablePolicy::Reject),
+                "reach guard: a debug gain's parked proposal is stamped for rejection"
+            );
+            assert_choice_rejected_and_still_answerable(&mut runner, mate);
+            assert_eq!(life(&runner, P0), i32::MAX - 3);
+        }
+
+        /// CR 616.1f: a re-parked record keeps the rejection stamp. Three
+        /// doublers re-park the ordering prompt after the first answer; the
+        /// delivering (third) application of 1 -> 2 -> 4 -> 8 overflows
+        /// `i32::MAX - 7` and is rejected.
+        #[test]
+        fn debug_gain_reparked_choice_keeps_the_rejection_stamp() {
+            // Accepted control: i32::MAX - 8 + 8 reaches i32::MAX.
+            let mut scenario = scenario();
+            scenario.with_life(P0, i32::MAX - 8);
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            add_card(&mut scenario, P0, "Rhox Faithmender");
+            add_card(&mut scenario, P0, "Boon Reflection");
+            add_card(&mut scenario, P0, "Alhammarret's Archive");
+            let mut runner = debug_runner(scenario);
+            act_ok(&mut runner, gain(P0, 1));
+            answer_to_completion(&mut runner);
+            assert_eq!(life(&runner, P0), i32::MAX);
+            runner.advance_until_stack_empty();
+            assert_eq!(p1p1(&runner, mate), 1);
+
+            let mut scenario = self::scenario();
+            scenario.with_life(P0, i32::MAX - 7);
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            add_card(&mut scenario, P0, "Rhox Faithmender");
+            add_card(&mut scenario, P0, "Boon Reflection");
+            add_card(&mut scenario, P0, "Alhammarret's Archive");
+            let mut runner = debug_runner(scenario);
+            act_ok(&mut runner, gain(P0, 1));
+            assert_eq!(parked_policy(&runner), Some(UnrepresentablePolicy::Reject));
+            runner
+                .act(GameAction::ChooseReplacement { index: 0 })
+                .expect("the first answer only applies one doubler and re-parks");
+            assert!(
+                replacement_prompt_open(&runner),
+                "reach guard: the first answer must re-park an ordering prompt, got {:?}",
+                runner.state().waiting_for
+            );
+            let reparked = runner
+                .state()
+                .pending_replacement
+                .as_ref()
+                .expect("a re-parked record is pending");
+            assert_eq!(
+                reparked.candidates.len(),
+                2,
+                "reach guard: two doublers remain to be ordered"
+            );
+            assert_eq!(
+                reparked.unrepresentable_life_change,
+                UnrepresentablePolicy::Reject,
+                "the re-parked record must keep the rejection stamp"
+            );
+            assert_choice_rejected_and_still_answerable(&mut runner, mate);
+            assert_eq!(life(&runner, P0), i32::MAX - 7);
+        }
+
+        /// Bloodletter of Aclazotz ("If an opponent would lose life during your
+        /// turn, they lose twice that much life instead.") parsed from its
+        /// Oracle text: eleven copies turn a requested 1,000,000 into
+        /// 1,000,000 x 2^11 = 2,048,000,000, which fits (accepted control); the
+        /// twelfth makes 4,096,000,000, which fits a `u32` but not an `i32` delta
+        /// and is rejected unchanged.
+        #[test]
+        fn debug_lose_parsed_doublers_accept_the_representable_and_reject_the_i32_overflow() {
+            let mut scenario = scenario();
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            let mut runner = debug_runner(scenario);
+            add_bloodletters(&mut runner, 11);
+            act_ok(&mut runner, lose(P1, MAX_DEBUG_LIFE_AMOUNT));
+            answer_to_completion(&mut runner);
+            assert_eq!(
+                life(&runner, P1),
+                20 - 2_048_000_000,
+                "reach guard: eleven doublers apply (CR 616.1f repeats until none remain)"
+            );
+            assert_eq!(runner.state().players[1].life_lost_this_turn, 2_048_000_000);
+            assert_eq!(p1p1(&runner, mate), 0);
+
+            let mut scenario = self::scenario();
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            let mut runner = debug_runner(scenario);
+            add_bloodletters(&mut runner, 12);
+            submit_expecting_rejection(&mut runner, mate, lose(P1, MAX_DEBUG_LIFE_AMOUNT));
+            assert_eq!(life(&runner, P1), 20);
+        }
+
+        /// One parsed doubler: the final loss overflows the life total
+        /// (`i32::MIN + 3` losing 2 doubled to 4) or the lost-this-turn counter
+        /// (`u32::MAX - 3` losing 2 doubled to 4), and is rejected unchanged; one
+        /// below each limit applies.
+        #[test]
+        fn debug_lose_final_overflow_after_a_parsed_doubler_is_rejected_unchanged() {
+            // (case, P1 life, P1 lost-this-turn counter, accepted result)
+            let cases: [(&str, i32, u32, Option<(i32, u32)>); 4] = [
+                ("life total, accepted", i32::MIN + 4, 0, Some((i32::MIN, 4))),
+                ("life total, rejected", i32::MIN + 3, 0, None),
+                ("counter, accepted", 20, u32::MAX - 4, Some((16, u32::MAX))),
+                ("counter, rejected", 20, u32::MAX - 3, None),
+            ];
+            for (name, start_life, lost_counter, accepted) in cases {
+                let mut scenario = scenario();
+                scenario.with_life(P1, start_life);
+                let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+                let mut runner = debug_runner(scenario);
+                runner.state_mut().players[1].life_lost_this_turn = lost_counter;
+                add_bloodletters(&mut runner, 1);
+                match accepted {
+                    Some((life_after, counter_after)) => {
+                        act_ok(&mut runner, lose(P1, 2));
+                        answer_to_completion(&mut runner);
+                        let player = &runner.state().players[1];
+                        assert_eq!(
+                            (player.life, player.life_lost_this_turn),
+                            (life_after, counter_after),
+                            "{name}: the doubled loss (2 -> 4) must apply in full"
+                        );
+                    }
+                    None => submit_expecting_rejection(&mut runner, mate, lose(P1, 2)),
+                }
+            }
+        }
+
+        /// A cross-event substitute of the ingress gain is held to the same rule:
+        /// Tainted Remedy ("If an opponent would gain life, that player loses
+        /// that much life instead.") turns P0's gain of 2 into a loss of 2, and
+        /// that substituted loss is not representable, so the action is rejected
+        /// instead of the loss being silently skipped.
+        #[test]
+        fn debug_gain_replaced_by_an_unrepresentable_substitute_loss_is_rejected() {
+            // (life total, per-turn lost counter, gain, accepted)
+            let cases = [
+                (i32::MIN + 2, 0, 2, true),
+                (i32::MIN + 1, 0, 2, false),
+                (20, u32::MAX - 2, 2, true),
+                (20, u32::MAX - 1, 2, false),
+            ];
+            for (start_life, lost_counter, amount, accepted) in cases {
+                let mut scenario = scenario();
+                scenario.with_life(P0, start_life);
+                let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+                add_card(&mut scenario, P1, "Tainted Remedy");
+                let mut runner = debug_runner(scenario);
+                runner.state_mut().players[0].life_lost_this_turn = lost_counter;
+                if accepted {
+                    act_ok(&mut runner, gain(P0, amount));
+                    let player = &runner.state().players[0];
+                    assert_eq!(
+                        player.life_gained_this_turn, 0,
+                        "reach guard: the gain was replaced by a loss (start {start_life})"
+                    );
+                    assert_eq!(
+                        player.life,
+                        start_life - amount as i32,
+                        "the substituted loss applies when representable"
+                    );
+                    assert_eq!(p1p1(&runner, mate), 0, "no gain occurred, so no trigger");
+                } else {
+                    let before = rollback_set(&runner, mate);
+                    let error = runner
+                        .act(gain(P0, amount))
+                        .expect_err("an unrepresentable substituted loss must reject the action");
+                    assert_not_representable(&error);
+                    assert_eq!(rollback_set(&runner, mate), before);
+                }
+            }
+        }
+
+        /// The substitute can also be chosen at the ordering prompt. Tainted
+        /// Remedy and Boon Reflection ("If you would gain life, you gain twice
+        /// that much life instead.") both apply to P0's gain, so the player
+        /// orders them (CR 616.1). At `i32::MIN` both orders end in an
+        /// unrepresentable loss (lose 1, or gain 2 then lose 2); whichever
+        /// answer delivers it is rejected and the prompt stays answerable. At
+        /// `i32::MIN + 2` both orders apply.
+        #[test]
+        fn debug_gain_resumed_substitute_loss_overflow_is_rejected_and_answerable() {
+            let mut scenario = scenario();
+            scenario.with_life(P0, i32::MIN + 2);
+            add_card(&mut scenario, P0, "Boon Reflection");
+            add_card(&mut scenario, P1, "Tainted Remedy");
+            let mut runner = debug_runner(scenario);
+            act_ok(&mut runner, gain(P0, 1));
+            assert!(
+                replacement_prompt_open(&runner),
+                "reach guard: both replacements apply, so an ordering prompt opens, got {:?}",
+                runner.state().waiting_for
+            );
+            answer_to_completion(&mut runner);
+            let accepted_life = life(&runner, P0);
+            assert!(
+                accepted_life == i32::MIN + 1 || accepted_life == i32::MIN,
+                "Tainted first loses 1 (MIN + 1); Boon first gains 2 then loses 2 (MIN); got {accepted_life}"
+            );
+
+            let mut scenario = self::scenario();
+            scenario.with_life(P0, i32::MIN);
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            add_card(&mut scenario, P0, "Boon Reflection");
+            add_card(&mut scenario, P1, "Tainted Remedy");
+            let mut runner = debug_runner(scenario);
+            act_ok(&mut runner, gain(P0, 1));
+            assert!(
+                replacement_prompt_open(&runner),
+                "reach guard: both replacements apply, so an ordering prompt opens, got {:?}",
+                runner.state().waiting_for
+            );
+            assert_eq!(
+                parked_policy(&runner),
+                Some(UnrepresentablePolicy::Reject),
+                "reach guard: a debug gain's parked proposal is stamped for rejection"
+            );
+            assert_choice_rejected_and_still_answerable(&mut runner, mate);
+            assert_eq!(life(&runner, P0), i32::MIN);
         }
 
         /// The sandbox audit log describes both actions (engine-owned wording).

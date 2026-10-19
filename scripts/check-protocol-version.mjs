@@ -93,7 +93,10 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // carrier (`GameState.resolving_spell_final_part`; `deferred_spell_delivery` removed).
 // v152 adds `ShortcutDecisionSchema.suggested_declaration` and `.leading_aims`, and
 // `ShortcutProposal.leading_aims`.
-// v153 adds the DebugAction GainLife / LoseLife sandbox action tags.
+// v153 adds the DebugAction GainLife / LoseLife sandbox action tags, and a parked
+// replacement records whether its life event came from such an action
+// (`PendingReplacement.unrepresentable_life_change`, "Reject", omitted when
+// ordinary), so its resumed delivery rejects an unrepresentable result.
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
 const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
@@ -192,7 +195,10 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +80: v151 carries populated Bestow restoration payloads.
 // +81: v152 adds `ShortcutDecisionSchema.suggested_declaration` and `.leading_aims`,
 //      and `ShortcutProposal.leading_aims`.
-// +82: v153 adds the DebugAction GainLife / LoseLife action tags.
+// +82: v153 adds the DebugAction GainLife / LoseLife action tags, and a parked
+//      replacement records whether its life event came from such an action
+//      (`PendingReplacement.unrepresentable_life_change`, "Reject", omitted when
+//      ordinary), so its resumed delivery rejects an unrepresentable result.
 const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 82;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
@@ -300,7 +306,9 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 //      effect's `rider` key).
 // +79: wire 133 moves with full-game v151 for populated Bestow payloads.
 // +80: wire 134 moves with full-game v152 for the shortcut suggestion fields.
-// +81: wire 135 moves with full-game v153 for the DebugAction life-change tags.
+// +81: wire 135 moves with full-game v153 for the DebugAction life-change tags and
+//      the parked replacement's `unrepresentable_life_change` stamp ("Reject",
+//      omitted when ordinary).
 const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 81;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an

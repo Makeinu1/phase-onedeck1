@@ -120,10 +120,16 @@ pub fn resolve(
     // CR 701.12g: the player gains or loses the difference to reach the stat's
     // previous value (a gain/loss, not a set). The helpers re-check CR
     // 119.7/119.8 and route through the replacement pipeline.
-    let diff = stat_value - old_life;
+    let diff = super::life::life_total_difference(
+        player_id,
+        stat_value,
+        old_life,
+        "exchange life total with stat",
+    );
     let deferred = match diff.signum() {
         1 => apply_life_gain(state, player_id, diff as u32, events).err(),
-        -1 => apply_life_loss(state, player_id, (-diff) as u32, events).err(),
+        // `unsigned_abs`: the difference may be `i32::MIN`.
+        -1 => apply_life_loss(state, player_id, diff.unsigned_abs(), events).err(),
         _ => None,
     };
     if deferred.is_some() {

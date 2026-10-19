@@ -3487,12 +3487,21 @@ pub(super) fn handle_resolution_choice(
                                 // firewall rejected any life-gain replacement/observer
                                 // (`apply_life_gain` re-runs the replacement pipeline, so a
                                 // lump gain would fire an observer ONCE not N×).
-                                let _ = crate::game::effects::life::apply_life_gain(
+                                // The shortcut is an action-ingress edit: a gain the engine
+                                // cannot represent (the saturated amount never fits an `i32`
+                                // delta) rejects the action through the boundary rollback.
+                                // A deferral stays ignored — the firewall excludes life
+                                // replacements, so none can be pending here.
+                                if let Err(effects::life::LifeChangeError::Unrepresentable(
+                                    unrepresentable,
+                                )) = crate::game::effects::life::try_apply_life_gain(
                                     state,
                                     *p,
                                     per_cycle_delta.saturating_mul(amount),
                                     events,
-                                );
+                                ) {
+                                    return Err(unrepresentable.into());
+                                }
                             }
                         }
                         // Reaching here means the growth applied.

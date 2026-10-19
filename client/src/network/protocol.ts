@@ -107,7 +107,10 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  *
  * Bumps to date:
  *  135 — action and preview_mana_payment carry GameAction, whose Debug payload
- *       gains DebugAction GainLife / LoseLife. A v134 peer cannot parse the new
+ *       gains DebugAction GainLife / LoseLife, and game_setup / state_update
+ *       carry a parked replacement that records whether its life event came
+ *       from such an action (pending_replacement.unrepresentable_life_change,
+ *       "Reject", omitted when ordinary). A v134 peer cannot parse the new
  *       tags, so first contact rejects the skew. Bumped in lockstep with
  *       full-game protocol 153.
  *  134 — game_setup and state_update carry GameState whose loop offers may carry

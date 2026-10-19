@@ -66,8 +66,12 @@ pub struct TournamentRequestId(pub u64);
 ///      life-loss events, carried in `GameAction::Debug` on
 ///      `ClientMessage::Action`. A v152 peer cannot parse either tag — a
 ///      conditional PARSE bump like 76/79, breaking only while one of these
-///      actions is actually sent. No `GameState` shape changes. Full-game
-///      peers and P2P move in lockstep (wire 135); no lobby carrier names it.
+///      actions is actually sent. A parked replacement records whether its
+///      life event came from such an action, so its resumed delivery rejects
+///      an unrepresentable result: `GameState` gains one optional key inside
+///      `pending_replacement` (`unrepresentable_life_change`, `"Reject"`,
+///      omitted when ordinary). Full-game peers and P2P move in lockstep
+///      (wire 135); no lobby carrier names it.
 ///
 /// 152 — `ShortcutDecisionSchema` gains `suggested_declaration` (the offer's
 ///      eliminating suggestion) and `leading_aims` (published slots a trigger on
