@@ -16544,18 +16544,26 @@ mod tests {
     }
 
     /// CR 101.3 + CR 616.1f: the loop stops at the replacement whose result is
-    /// unrepresentable. One source carries fourteen `Times { 2 }` loss doublers;
-    /// twelve applications take 1,000,000 to 4,096,000,000 (fits a `u32`), the
-    /// thirteenth overflows and is the last one applied (it is marked applied
-    /// before its applier runs); the fourteenth never applies.
+    /// unrepresentable. One source carries three `Times { 30000 }` loss
+    /// multipliers (commuting, so no ordering prompt and the pipeline applies
+    /// them in turn); the first takes 100,000 to 3,000,000,000 (fits a `u32`),
+    /// the second overflows and is the last one applied (it is marked applied
+    /// before its applier runs), and the third never applies. A bare 3-def
+    /// source keeps the row to at most three pipeline passes, and the
+    /// pipeline's own depth bound (`MAX_REPLACEMENT_DEPTH`) caps it regardless.
     #[test]
     fn lose_life_times_overflow_stops_the_loop_at_the_overflowing_replacement() {
-        let defs: Vec<_> = (0..14)
-            .map(|_| life_qmod_def(ReplacementEvent::LoseLife, QuantityModification::DOUBLE))
+        let defs: Vec<_> = (0..3)
+            .map(|_| {
+                life_qmod_def(
+                    ReplacementEvent::LoseLife,
+                    QuantityModification::Times { factor: 30_000 },
+                )
+            })
             .collect();
         let mut state = test_state_with_object(ObjectId(10), Zone::Battlefield, defs);
         let mut events = Vec::new();
-        let result = replace_event(&mut state, life_loss_event(1_000_000), &mut events);
+        let result = replace_event(&mut state, life_loss_event(100_000), &mut events);
         let ReplacementResult::Execute(ProposedEvent::LifeLoss {
             amount, applied, ..
         }) = result
@@ -16563,13 +16571,13 @@ mod tests {
             panic!("expected Execute of the unchanged LifeLoss, got {result:?}");
         };
         assert_eq!(
-            amount, 4_096_000_000,
-            "the event as left by twelve applications"
+            amount, 3_000_000_000,
+            "the event as left by the one representable application"
         );
         assert_eq!(
             applied.len(),
-            13,
-            "the thirteenth is marked applied, the fourteenth never is"
+            2,
+            "the overflowing second is marked applied, the third never is"
         );
         assert_eq!(
             state.replacement_quantity_overflow,

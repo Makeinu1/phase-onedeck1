@@ -3827,80 +3827,112 @@ mod tests {
             assert_eq!(life(&runner, P0), i32::MAX - 7);
         }
 
-        /// CR 101.3 + CR 616.1: twelve doublers (Boon Reflection, "If you would
-        /// gain life, you gain twice that much life instead.") turn a requested
-        /// 1,000,000 into 1,000,000 x 2^11 = 2,048,000,000 after eleven
-        /// doublings (accepted control, 20 + that fits an `i32`). The twelfth
-        /// doubling is 4,096,000,000: the checked replacement multiply reports
-        /// it as unrepresentable, so the answer that applies it is rejected
-        /// unchanged and the prompt stays answerable, with no later prompt asked.
+        /// Puts one P0 permanent per entry of `factors` in play, each carrying a
+        /// `Multiply { factor, EventContextAmount }` replacement execute of
+        /// `event` (the shape Boon Reflection / Bloodletter of Aclazotz parse to,
+        /// with a chosen factor). Distinct objects with an execute body are
+        /// order-material, so every application but the last is a CR 616.1
+        /// ordering prompt. The factors are chosen so that the overflow needs
+        /// three candidates, not a dozen doubling cards.
+        fn add_life_multipliers(runner: &mut GameRunner, event: ReplacementEvent, factors: &[i32]) {
+            use crate::types::ability::{QuantityRef, ReplacementPlayerScope};
+            for (index, factor) in factors.iter().enumerate() {
+                let amount = QuantityExpr::Multiply {
+                    factor: *factor,
+                    inner: Box::new(QuantityExpr::Ref {
+                        qty: QuantityRef::EventContextAmount,
+                    }),
+                };
+                let effect = match event {
+                    ReplacementEvent::GainLife => Effect::GainLife {
+                        amount,
+                        player: TargetFilter::Controller,
+                    },
+                    ReplacementEvent::LoseLife => Effect::LoseLife {
+                        amount,
+                        target: None,
+                    },
+                    _ => panic!("add_life_multipliers supports GainLife and LoseLife only"),
+                };
+                let mut definition = ReplacementDefinition::new(event.clone())
+                    .execute(AbilityDefinition::new(AbilityKind::Spell, effect));
+                definition.valid_player = Some(ReplacementPlayerScope::AnyPlayer);
+                let id = create_object(
+                    runner.state_mut(),
+                    CardId(9_900 + index as u64),
+                    P0,
+                    format!("Life Multiplier {index}"),
+                    Zone::Battlefield,
+                );
+                let object = runner.state_mut().objects.get_mut(&id).unwrap();
+                object.replacement_definitions = vec![definition.clone()].into();
+                object.base_replacement_definitions = std::sync::Arc::new(vec![definition]);
+            }
+        }
+
+        /// CR 101.3 + CR 616.1: three multipliers (x10, x10, x1,000) would take a
+        /// requested 1,000,000 to 100,000,000,000, past an `i32`. Prompts are asked
+        /// while two or more candidates remain (three, then two): the first answer
+        /// applies one multiplier (at most 1,000,000,000, which fits), and the
+        /// second applies another and then auto-applies the last, whose checked
+        /// multiply reports the result as unrepresentable. That answer is
+        /// rejected unchanged, the prompt stays answerable, and no later prompt is
+        /// asked. The accepted control (x10, x10, x20 = 2,000,000,000) fits and
+        /// applies in full.
         #[test]
-        fn debug_gain_twelve_parsed_doublers_reject_the_twelfth_doubling() {
-            // Accepted control: eleven Boon Reflections.
+        fn debug_gain_large_multipliers_reject_the_overflowing_application() {
+            // Accepted control: the product 2,000 x 1,000,000 fits an i32.
             let mut scenario = scenario();
             let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
-            for _ in 0..11 {
-                add_card(&mut scenario, P0, "Boon Reflection");
-            }
             let mut runner = debug_runner(scenario);
+            add_life_multipliers(&mut runner, ReplacementEvent::GainLife, &[10, 10, 20]);
             act_ok(&mut runner, gain(P0, MAX_DEBUG_LIFE_AMOUNT));
             assert!(
                 replacement_prompt_open(&runner),
-                "reach guard: eleven doublers park an ordering prompt, got {:?}",
+                "reach guard: three multipliers park an ordering prompt, got {:?}",
                 runner.state().waiting_for
             );
             answer_to_completion(&mut runner);
-            assert_eq!(life(&runner, P0), 20 + 2_048_000_000);
+            assert_eq!(life(&runner, P0), 20 + 2_000_000_000);
             assert_eq!(
                 runner.state().players[0].life_gained_this_turn,
-                2_048_000_000
+                2_000_000_000
             );
             runner.advance_until_stack_empty();
             assert_eq!(p1p1(&runner, mate), 1);
 
-            // (Boon Reflection copies, Rhox Faithmender copies): the same parsed
-            // execute from distinct cards.
-            for (boons, rhoxes) in [(12usize, 0usize), (6, 6)] {
-                let mut scenario = self::scenario();
-                let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
-                for _ in 0..boons {
-                    add_card(&mut scenario, P0, "Boon Reflection");
-                }
-                for _ in 0..rhoxes {
-                    add_card(&mut scenario, P0, "Rhox Faithmender");
-                }
-                let mut runner = debug_runner(scenario);
-                act_ok(&mut runner, gain(P0, MAX_DEBUG_LIFE_AMOUNT));
-                assert!(
-                    replacement_prompt_open(&runner),
-                    "reach guard: twelve doublers park an ordering prompt, got {:?}",
-                    runner.state().waiting_for
-                );
-                assert_eq!(
-                    parked_policy(&runner),
-                    Some(UnrepresentablePolicy::Reject),
-                    "reach guard: a debug gain's parked proposal is stamped for rejection"
-                );
-                let accepted = assert_choice_rejected_and_still_answerable(&mut runner, mate);
-                // Prompts are asked while two or more candidates remain, so by
-                // derivation ten answers are accepted and the eleventh (which
-                // applies the eleventh doubling, then auto-applies the twelfth and
-                // overflows) is rejected. The exact integer is UNPROBED (tests are
-                // only compiled locally); the invariant asserted is that some
-                // answers were accepted first, the rejection is the exact
-                // unrepresentable error (checked above), and it lands before the
-                // prompts run out.
-                assert!(
-                    (1..=11).contains(&accepted),
-                    "({boons}, {rhoxes}): accepted {accepted} answers before the rejection"
-                );
-                assert_eq!(life(&runner, P0), 20);
-                assert_eq!(
-                    runner.state().replacement_quantity_overflow,
-                    None,
-                    "({boons}, {rhoxes}): the rejected action's snapshot restore clears the record"
-                );
-            }
+            // Overflow: the product 100,000 x 1,000,000 does not fit.
+            let mut scenario = self::scenario();
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            let mut runner = debug_runner(scenario);
+            add_life_multipliers(&mut runner, ReplacementEvent::GainLife, &[10, 10, 1_000]);
+            act_ok(&mut runner, gain(P0, MAX_DEBUG_LIFE_AMOUNT));
+            assert!(
+                replacement_prompt_open(&runner),
+                "reach guard: three multipliers park an ordering prompt, got {:?}",
+                runner.state().waiting_for
+            );
+            assert_eq!(
+                parked_policy(&runner),
+                Some(UnrepresentablePolicy::Reject),
+                "reach guard: a debug gain's parked proposal is stamped for rejection"
+            );
+            let accepted = assert_choice_rejected_and_still_answerable(&mut runner, mate);
+            // Prompts are asked while two or more candidates remain: the first
+            // answer applies one multiplier (at most x1,000 = 1,000,000,000, which
+            // fits) and leaves two, the second answer applies another and then
+            // auto-applies the last, which overflows. The exact count is not
+            // load-bearing; some answer was accepted before the rejection.
+            assert!(
+                (1..=2).contains(&accepted),
+                "accepted {accepted} answers before the rejection"
+            );
+            assert_eq!(life(&runner, P0), 20);
+            assert_eq!(
+                runner.state().replacement_quantity_overflow,
+                None,
+                "the rejected action's snapshot restore clears the record"
+            );
         }
 
         /// Bloodletter of Aclazotz ("If an opponent would lose life during your
@@ -3933,17 +3965,16 @@ mod tests {
             assert_eq!(life(&runner, P1), 20);
         }
 
-        /// CR 101.3: a thirteenth doubler takes 4,096,000,000 to 8,192,000,000,
-        /// which does not even fit a `u32`; the loss is rejected unchanged.
-        /// Guard row: the twelfth-copy row above is rejected by the final edit
-        /// already; the loop-stop discrimination is in the `replacement` unit
-        /// row `lose_life_times_overflow_stops_the_loop_at_the_overflowing_replacement`.
+        /// CR 101.3: the loss twin of the large-multiplier gain row. Three
+        /// multipliers (x10, x10, x1,000) take 1,000,000 past an `i32`; the loss is
+        /// rejected unchanged. The loop-stop discrimination is in the `replacement`
+        /// unit row `lose_life_times_overflow_stops_the_loop_at_the_overflowing_replacement`.
         #[test]
-        fn debug_lose_thirteen_parsed_doublers_are_rejected_unchanged() {
+        fn debug_lose_large_multipliers_reject_the_overflowing_application() {
             let mut scenario = scenario();
             let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
             let mut runner = debug_runner(scenario);
-            add_bloodletters(&mut runner, 13);
+            add_life_multipliers(&mut runner, ReplacementEvent::LoseLife, &[10, 10, 1_000]);
             submit_expecting_rejection(&mut runner, mate, lose(P1, MAX_DEBUG_LIFE_AMOUNT));
             assert_eq!(life(&runner, P1), 20);
             assert_eq!(runner.state().replacement_quantity_overflow, None);
