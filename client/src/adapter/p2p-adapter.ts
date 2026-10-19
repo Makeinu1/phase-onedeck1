@@ -790,6 +790,23 @@ class NativeP2PBridge {
     if (!deliveries) throw new AdapterError("P2P_ERROR", "Full terminal authority is unavailable", true);
     const states = new Map<PlayerId, GameState>();
     for (const [playerId, delivery] of deliveries) {
+      // A guest seat suspended while the game was live (`suspendGuest`) has no
+      // loopback client to report the terminal revision, so its cached view is
+      // older by construction and cannot be cross-checked. Its recipient-bound
+      // Full final view is the only authority for it: `readTerminalDeliveries`
+      // already bound it to this terminal revision, display and Full key, so
+      // seed it the way `restoreTerminalViews` does for a retired session. The
+      // host seat and every attached seat keep the strict check below.
+      if (
+        playerId !== 0
+        && !this.clients.has(playerId)
+        && delivery.terminalRevision === revision
+        && delivery.finalView?.waiting_for.type === "GameOver"
+      ) {
+        this.seedTerminalView(playerId, delivery.finalView, revision);
+        states.set(playerId, delivery.finalView);
+        continue;
+      }
       const current = this.latestViews.get(playerId);
       if (
         delivery.terminalRevision !== revision
@@ -842,17 +859,22 @@ class NativeP2PBridge {
       ) {
         throw new AdapterError("P2P_ERROR", `Full terminal view is invalid for seat ${playerId}`, false);
       }
-      this.latestViews.set(playerId, {
-        snapshot: {
-          state: delivery.finalView,
-          legalResult: EMPTY_LEGAL_ACTIONS,
-          seq: nextSnapshotSeq(),
-        },
-        events: [],
-        revision,
-      });
+      this.seedTerminalView(playerId, delivery.finalView, revision);
     }
     return true;
+  }
+
+  /** Record a seat's recipient-bound Full final view as its latest view at the terminal revision. */
+  private seedTerminalView(playerId: PlayerId, finalView: GameState, revision: number): void {
+    this.latestViews.set(playerId, {
+      snapshot: {
+        state: finalView,
+        legalResult: EMPTY_LEGAL_ACTIONS,
+        seq: nextSnapshotSeq(),
+      },
+      events: [],
+      revision,
+    });
   }
 
   private async readTerminalDeliveries(): Promise<Map<PlayerId, FullTerminalDelivery> | null> {
