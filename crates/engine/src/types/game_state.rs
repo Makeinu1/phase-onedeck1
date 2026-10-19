@@ -6033,6 +6033,83 @@ pub struct PendingCounterRemovalInFlight {
     pub counter_count_before: u32,
 }
 
+/// CR 118.3 + CR 601.2h + CR 616.1: a counter-removal cost whose current removal
+/// waits on a replacement choice. `in_flight` is that removal (settled by
+/// measurement once the replacement pipeline delivers it, CR 118.11);
+/// `remaining` are the cost's later removals, still unpaid. Held by
+/// [`PendingCostMoveResume::CounterCostRemovalPayment`] on the stack route and
+/// by [`ManaAbilityCostCursor::counter_removal`] on the mana route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PausedCounterCostRemoval {
+    pub in_flight: PendingCounterRemovalInFlight,
+    pub remaining: Vec<PendingCounterRemoval>,
+    /// Where this removal's replacement subtree begins, recorded when the payer
+    /// proposed it. Required on the wire: a missing boundary must not decode as
+    /// depth 0, which would read a mid-resolution subtree as retired.
+    pub replacement_subtree: ReplacementSubtreeBoundary,
+}
+
+/// CR 616.1 + CR 608.2c: where a counter removal's replacement subtree begins.
+/// Everything the removal's replacement installs (its post-effect drain, an
+/// effect removal queue, a rider) is above this position: on frames above
+/// `resolution_depth`, or nested (CR 616.1g) into the post-replacement frame
+/// that was the drain owner when the removal was proposed
+/// (`install_post_replacement_drain`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacementSubtreeBoundary {
+    pub resolution_depth: usize,
+    pub enclosing: Option<EnclosingPostReplacementFrame>,
+}
+
+/// The post-replacement frame a removal's own post-effect drain nests into, and
+/// how many drains it held when the removal was proposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnclosingPostReplacementFrame {
+    /// The frame's identity. `None` for an unstamped frame: never dispatched,
+    /// journal-replayed, or from a pre-identity payload. An unstamped frame is
+    /// then read positionally.
+    pub frame: Option<PostReplacementFrameId>,
+    pub drains: usize,
+}
+
+impl ReplacementSubtreeBoundary {
+    /// The current position of `stack`, as the payer records it.
+    pub(crate) fn at(stack: &ResolutionStack) -> Self {
+        Self {
+            resolution_depth: stack.len(),
+            enclosing: stack
+                .active_post_replacement_or_paired_parent()
+                .map(|drains| EnclosingPostReplacementFrame {
+                    frame: drains.frame_id(),
+                    drains: drains.len(),
+                }),
+        }
+    }
+
+    /// Whether nothing the subtree installed remains: no frame above the
+    /// recorded depth, and the enclosing frame (found by identity, wherever it
+    /// now sits) holds no more drains than it did.
+    pub(crate) fn is_retired(&self, stack: &ResolutionStack) -> bool {
+        stack.len() <= self.resolution_depth
+            && self
+                .enclosing
+                .is_none_or(|enclosing| enclosing.is_retired(stack))
+    }
+}
+
+impl EnclosingPostReplacementFrame {
+    fn is_retired(self, stack: &ResolutionStack) -> bool {
+        let drains_now = match self.frame {
+            Some(id) => stack.post_replacement_frame_drain_count(id),
+            None => stack
+                .active_post_replacement_or_paired_parent()
+                .map(PostReplacementDrainStack::len),
+        };
+        // A consumed frame took its nested drains with it.
+        drains_now.is_none_or(|drains| drains <= self.drains)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PendingCounterRemovalQueue {
     /// Remaining per-object counter removals.
@@ -8089,6 +8166,17 @@ pub struct ManaAbilityCostCursor {
     /// count rather than sharing one value.
     #[serde(default)]
     pub next_counter_choice: usize,
+    /// CR 602.2b + CR 605.3b + CR 118.11: counters actually removed by this
+    /// activation's counter legs so far; `Some(0)` = a counter leg removed none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_removed_counters: Option<u32>,
+    /// CR 118.11 + CR 616.1: a counter leg of this cost whose removal waits on a
+    /// replacement choice. The cursor has already advanced past that leg; on
+    /// resume the removal is settled by measurement, credited to
+    /// `cost_removed_counters`, and the leg's later removals are paid before
+    /// any later component.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter_removal: Option<Box<PausedCounterCostRemoval>>,
     /// The current selected-exile component, after the move that paused has
     /// been consumed. Its remaining objects must move before the cost cursor
     /// advances to the next component.
@@ -8167,7 +8255,9 @@ pub enum WardSacrificePaymentResume {
 /// activation and unpaid payment cursor until the move has settled.
 /// `SacrificeForCost` owns a full selected sacrifice component across one or
 /// more replacement-choice action boundaries, including its event span and
-/// LKI record identities. `CollectEvidencePayment` and `UnlessBouncePayment`
+/// LKI record identities; `Cast` carries the same pair for a multi-object
+/// battlefield move (a counted return to hand or exile).
+/// `CollectEvidencePayment` and `UnlessBouncePayment`
 /// retain their selected-object program counters and exact completion tails.
 /// `WardSacrificePayment` retains either the ordered aggregate suffix or the
 /// sequential re-prompt basis until the current sacrifice's replacement choice
@@ -8183,6 +8273,16 @@ pub enum PendingCostMoveResume {
         paused_at_index: usize,
         destination: Zone,
         completion: PendingCostMoveCompletion,
+        /// CR 603.2 + CR 603.10a: Cost events emitted in earlier actions of
+        /// this one logical multi-object cost move (a counted return to hand or
+        /// exile). They are stamped and settled only when every selected object
+        /// has moved, so a group split by a replacement choice stays one group.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deferred_cost_events: Vec<GameEvent>,
+        /// CR 603.10a: Per-turn LKI record identities emitted by completed
+        /// moves before a replacement-choice boundary.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        departure_record_indices: Vec<usize>,
     },
     SacrificeForCost {
         player: PlayerId,
@@ -8262,6 +8362,21 @@ pub enum PendingCostMoveResume {
         player: PlayerId,
         pending: Box<PendingCast>,
     },
+    /// CR 118.3 + CR 122.1 + CR 601.2h + CR 602.2b + CR 616.1: A counter-removal
+    /// cost of a cast or activation paused while a replacement choice settles
+    /// its current removal. The resume settles that removal by measurement,
+    /// credits an activation's own removed-counter count (CR 118.11), pays the
+    /// cost's later removals, then runs `completion`. `pending` is `None` only
+    /// between the cost payer parking this root and its caller attaching the
+    /// payment (`unattached_activation_slot_mut`); `cost_paid_object` is the
+    /// selected object the handlers stamp once the cost is paid.
+    CounterCostRemovalPayment {
+        player: PlayerId,
+        pending: Option<Box<PendingCast>>,
+        removal: Box<PausedCounterCostRemoval>,
+        cost_paid_object: Option<ObjectId>,
+        completion: PendingCostMoveCompletion,
+    },
     /// CR 606.4 + CR 614.1a + CR 616.1: A loyalty activation paused on a
     /// counter-cost replacement-ordering choice (e.g. Doubling Season vs an
     /// opponent's Vorinclex halving the loyalty counters). The counter is
@@ -8321,7 +8436,67 @@ pub enum PendingCostMoveResume {
     RandomDiscardUnlessPayment(Box<RandomDiscardUnlessPaymentResume>),
 }
 
+/// CR 616.1 + CR 608.2c: where a parked counter-cost root's own replacement
+/// subtree stands. Private plumbing; not serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CounterCostRootSubtree {
+    Absent,
+    Unfinished,
+    Retired,
+}
+
+impl GameState {
+    /// CR 616.1 + CR 608.2c: whether the parked root holds a counter-cost
+    /// removal, and if so whether everything that removal's replacement
+    /// installed has finished.
+    pub(crate) fn counter_cost_root_subtree(&self) -> CounterCostRootSubtree {
+        match self
+            .pending_cost_move_resume
+            .as_ref()
+            .and_then(PendingCostMoveResume::paused_counter_removal)
+        {
+            None => CounterCostRootSubtree::Absent,
+            Some(paused)
+                if paused
+                    .replacement_subtree
+                    .is_retired(&self.resolution_stack) =>
+            {
+                CounterCostRootSubtree::Retired
+            }
+            Some(_) => CounterCostRootSubtree::Unfinished,
+        }
+    }
+
+    /// CR 601.2h + CR 605.3b + CR 616.1: a parked counter-cost root whose
+    /// replacement subtree has retired is due: it is the innermost unfinished
+    /// work and resumes before any other resolution work.
+    pub(crate) fn counter_cost_root_is_due(&self) -> bool {
+        self.counter_cost_root_subtree() == CounterCostRootSubtree::Retired
+    }
+}
+
 impl PendingCostMoveResume {
+    /// CR 601.2h + CR 616.1: the counter-cost removal this root holds paused on
+    /// its replacement choice — the stack route's own record, or the mana cursor's.
+    /// Exhaustive so a new root is classified.
+    pub(crate) fn paused_counter_removal(&self) -> Option<&PausedCounterCostRemoval> {
+        match self {
+            Self::CounterCostRemovalPayment { removal, .. } => Some(removal),
+            Self::ManaAbilityPayment { cursor, .. } => cursor.counter_removal.as_deref(),
+            Self::Cast { .. }
+            | Self::SacrificeForCost { .. }
+            | Self::WardSacrificePayment { .. }
+            | Self::ReplacementMayCost { .. }
+            | Self::Foretell { .. }
+            | Self::CollectEvidencePayment { .. }
+            | Self::UnlessBouncePayment { .. }
+            | Self::ActivationMillPayment { .. }
+            | Self::LoyaltyActivation { .. }
+            | Self::CounterAdditionUnlessPayment { .. }
+            | Self::RandomDiscardUnlessPayment(_) => None,
+        }
+    }
+
     /// CR 601.2h + CR 602.2b + CR 605.3b + CR 116.2h: Whether the paused cost
     /// move belongs to casting a spell, activating an ability (a mana ability
     /// included) or performing a special action, none of which gives a player
@@ -8333,6 +8508,7 @@ impl PendingCostMoveResume {
             PendingCostMoveResume::Cast { .. }
             | PendingCostMoveResume::ManaAbilityPayment { .. }
             | PendingCostMoveResume::ActivationMillPayment { .. }
+            | PendingCostMoveResume::CounterCostRemovalPayment { .. }
             | PendingCostMoveResume::LoyaltyActivation { .. } => true,
             // CR 116.2h: foretelling is a special action; its {2} is paid before
             // its exile move, which can then pause on a replacement.
@@ -8353,6 +8529,43 @@ impl PendingCostMoveResume {
             | PendingCostMoveResume::UnlessBouncePayment { .. }
             | PendingCostMoveResume::CounterAdditionUnlessPayment { .. }
             | PendingCostMoveResume::RandomDiscardUnlessPayment(_) => false,
+        }
+    }
+
+    /// CR 601.2h + CR 602.2b: the payment slot and completion of a root the
+    /// cost payer parked before its caller could attach the paused cast or
+    /// activation. `None` for an attached root and for every root that never
+    /// takes a caller's payment.
+    pub(crate) fn unattached_activation_slot_mut(
+        &mut self,
+    ) -> Option<(
+        &mut Option<Box<PendingCast>>,
+        &mut PendingCostMoveCompletion,
+    )> {
+        match self {
+            PendingCostMoveResume::Cast {
+                pending: slot @ None,
+                completion,
+                ..
+            }
+            | PendingCostMoveResume::CounterCostRemovalPayment {
+                pending: slot @ None,
+                completion,
+                ..
+            } => Some((slot, completion)),
+            PendingCostMoveResume::Cast { .. }
+            | PendingCostMoveResume::CounterCostRemovalPayment { .. }
+            | PendingCostMoveResume::SacrificeForCost { .. }
+            | PendingCostMoveResume::WardSacrificePayment { .. }
+            | PendingCostMoveResume::ReplacementMayCost { .. }
+            | PendingCostMoveResume::Foretell { .. }
+            | PendingCostMoveResume::CollectEvidencePayment { .. }
+            | PendingCostMoveResume::UnlessBouncePayment { .. }
+            | PendingCostMoveResume::ManaAbilityPayment { .. }
+            | PendingCostMoveResume::ActivationMillPayment { .. }
+            | PendingCostMoveResume::LoyaltyActivation { .. }
+            | PendingCostMoveResume::CounterAdditionUnlessPayment { .. }
+            | PendingCostMoveResume::RandomDiscardUnlessPayment(_) => None,
         }
     }
 }
@@ -8871,7 +9084,10 @@ impl GameState {
             }
             PendingCastOwner::CostMove => match self.pending_cost_move_resume.as_ref()? {
                 PendingCostMoveResume::Cast { pending, .. }
-                | PendingCostMoveResume::SacrificeForCost { pending, .. } => pending.as_deref(),
+                | PendingCostMoveResume::SacrificeForCost { pending, .. }
+                | PendingCostMoveResume::CounterCostRemovalPayment { pending, .. } => {
+                    pending.as_deref()
+                }
                 PendingCostMoveResume::CollectEvidencePayment { resume, .. } => {
                     match resume.as_ref() {
                         CollectEvidenceResume::Casting { pending_cast, .. } => Some(pending_cast),
@@ -8913,7 +9129,10 @@ impl GameState {
             }
             PendingCastOwner::CostMove => match self.pending_cost_move_resume.as_mut()? {
                 PendingCostMoveResume::Cast { pending, .. }
-                | PendingCostMoveResume::SacrificeForCost { pending, .. } => pending.as_deref_mut(),
+                | PendingCostMoveResume::SacrificeForCost { pending, .. }
+                | PendingCostMoveResume::CounterCostRemovalPayment { pending, .. } => {
+                    pending.as_deref_mut()
+                }
                 PendingCostMoveResume::CollectEvidencePayment { resume, .. } => {
                     match resume.as_mut() {
                         CollectEvidenceResume::Casting { pending_cast, .. } => Some(pending_cast),
@@ -9230,7 +9449,11 @@ fn visit_cost_move_resume_events(
     f: &mut impl FnMut(&mut GameEvent),
 ) {
     match resume {
-        PendingCostMoveResume::SacrificeForCost {
+        PendingCostMoveResume::Cast {
+            deferred_cost_events,
+            ..
+        }
+        | PendingCostMoveResume::SacrificeForCost {
             deferred_cost_events,
             ..
         } => deferred_cost_events.iter_mut().for_each(&mut *f),
@@ -9254,12 +9477,12 @@ fn visit_cost_move_resume_events(
                 f(event);
             }
         }
-        PendingCostMoveResume::Cast { .. }
-        | PendingCostMoveResume::WardSacrificePayment { .. }
+        PendingCostMoveResume::WardSacrificePayment { .. }
         | PendingCostMoveResume::ReplacementMayCost { .. }
         | PendingCostMoveResume::Foretell { .. }
         | PendingCostMoveResume::UnlessBouncePayment { .. }
         | PendingCostMoveResume::ActivationMillPayment { .. }
+        | PendingCostMoveResume::CounterCostRemovalPayment { .. }
         | PendingCostMoveResume::LoyaltyActivation { .. } => {}
     }
 }
@@ -9609,6 +9832,11 @@ pub struct PendingManaAbility {
     /// resolve in inline mana ability resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_paid_object: Option<CostPaidObjectSnapshot>,
+    /// CR 602.2b + CR 605.3b + CR 118.11: the cost cursor's final
+    /// `ManaAbilityCostCursor::cost_removed_counters` total, carried across the
+    /// CR 605.3b colour prompt into `produce_mana_from_ability`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_removed_counters: Option<u32>,
     /// CR 605.3a: Other identical, choice-free mana sources the controller
     /// could activate for the same `SingleColor` prompt (their other
     /// Treasures, etc.). Computed only when the prompt is `SingleColor` and the
@@ -17073,14 +17301,26 @@ pub enum WaitingFor {
         eligible: Vec<TargetRef>,
         phase: TimeTravelPhase,
     },
-    /// CR 608.2d: While applying `ChooseObjectsIntoTrackedSet`, the affected player
-    /// selects `min..=max` battlefield permanents from `eligible`. The
-    /// chosen objects are written into a fresh tracked set so a downstream
-    /// `PayCost { ScaledMana }` and `IfYouDo`/`Untap` reference the exact
-    /// selection. An empty selection is legal when `min == 0`.
+    /// CR 608.2d: A resolving effect asks `player` to choose `min..=max` entries of
+    /// `eligible`. Two kinds of selection share this prompt.
+    ///
+    /// `ChooseObjectsIntoTrackedSet` (and the Contraption crank prompt in
+    /// `game::contraptions`): the affected player selects `min..=max`
+    /// battlefield permanents. The chosen objects are written into a fresh
+    /// tracked set so a downstream `PayCost { ScaledMana }` and `IfYouDo`/`Untap`
+    /// reference the exact selection. An empty selection is legal when
+    /// `min == 0`.
+    ///
+    /// CR 115.10a + CR 608.2d, an untargeted described damage recipient ("a
+    /// creature or player" — no "target"): `eligible` is every creature and
+    /// player the instruction may hit, `min = 1` and `max = Some(1)`. The pick
+    /// binds to the parked damage instruction and no tracked set is published.
+    /// Hexproof, shroud and protection do not restrict `eligible`: it is a
+    /// choice, not a target.
     ChooseObjectsSelection {
         player: PlayerId,
-        /// Eligible battlefield permanents matching the effect's filter.
+        /// Eligible battlefield permanents matching the effect's filter, and, for
+        /// a described damage recipient, players.
         eligible: Vec<TargetRef>,
         /// Minimum number of distinct eligible objects that must be selected.
         #[serde(default)]
@@ -17089,8 +17329,9 @@ pub enum WaitingFor {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max: Option<u32>,
         /// CR 608.2: triggering event of the ability whose `ChooseObjectsIntoTrackedSet`
-        /// raised this prompt. Restored around the continuation drain so the stashed
-        /// `PayCost { payer: TriggeringPlayer }` resolves to the correct player.
+        /// or described damage recipient raised this prompt. Restored around the
+        /// continuation drain so a stashed `PayCost { payer: TriggeringPlayer }` (or
+        /// any other trigger-context read) resolves to the correct player.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger_event: Option<crate::types::events::GameEvent>,
     },
@@ -24875,6 +25116,10 @@ impl PostReplacementDrainStack {
         self.drains.is_empty()
     }
 
+    pub fn len(&self) -> usize {
+        self.drains.len()
+    }
+
     /// Is there a continuation that has not run yet?
     ///
     /// A `Dispatching` drain does NOT count: its continuation is already running,
@@ -27488,6 +27733,33 @@ impl GameState {
             .expect("the active spell-resolution frame must be structurally consumable")
     }
 
+    /// CR 608.2c + CR 608.2e + CR 101.4 + CR 118.12a: make the continuation
+    /// directly below the active paused drain that drain's active child, as
+    /// `ResolutionStack::promote_ability_continuation_after_post_replacement_draw`
+    /// does — unless it sits below a parked counter-cost root's replacement
+    /// subtree. A continuation below the root's boundary is outer work (a later
+    /// seat's "unless" choice of a resolving ability, say), and outer work never
+    /// rises above the root's subtree: it stays where it is, and the drain retires
+    /// as the top. The stack is `[.., continuation, drain]` here, so the
+    /// continuation is below the boundary exactly when `len < depth + 2`. The one
+    /// guard for both promote callers.
+    fn promote_paused_drain_tail_within_counter_cost_subtree(
+        &mut self,
+    ) -> Result<bool, ResolutionStackError> {
+        let continuation_is_outer = self
+            .pending_cost_move_resume
+            .as_ref()
+            .and_then(PendingCostMoveResume::paused_counter_removal)
+            .is_some_and(|paused| {
+                self.resolution_stack.len() < paused.replacement_subtree.resolution_depth + 2
+            });
+        if continuation_is_outer {
+            return Ok(false);
+        }
+        self.resolution_stack
+            .promote_ability_continuation_after_post_replacement_draw()
+    }
+
     /// Removes a completed independent MultiDraw frame. A frame carrying the
     /// deferred connive re-entry remains resident until that exact link is
     /// consumed by its action/resume owner.
@@ -27528,9 +27800,7 @@ impl GameState {
             .observe_draw_sequence_frame_id(next_frame_id);
         let completed = self.resolution_stack.take_active_multi_draw()?;
         if paired_post_replacement {
-            let _ = self
-                .resolution_stack
-                .promote_ability_continuation_after_post_replacement_draw()?;
+            let _ = self.promote_paused_drain_tail_within_counter_cost_subtree()?;
         }
         Ok(completed)
     }
@@ -27603,9 +27873,7 @@ impl GameState {
             // own later instructions (an outer chain's tail parked outside the
             // pair) now resume with that outer event context readable, so promote
             // them out from under its frame; their completion retires it.
-            let _ = self
-                .resolution_stack
-                .promote_ability_continuation_after_post_replacement_draw();
+            let _ = self.promote_paused_drain_tail_within_counter_cost_subtree();
             // CR 614.12a + CR 614.13a: a Devour-only ChangeZone snapshot stays
             // resident while its exact post-replacement child resolves. Once that
             // child is retired, the snapshot is again the active owner and its
@@ -33669,6 +33937,7 @@ mod forced_cascade_window_tests {
                         per_cycle: None,
                         shortened_by: None,
                         published_declaration: None,
+                        leading_aims: Vec::new(),
                         road: crate::analysis::loop_check::OfferRoad::Ring,
                         period: Default::default(),
                     },
@@ -39357,6 +39626,7 @@ mod tests {
                         chosen_exiled: Vec::new(),
                         chosen_sacrificed_battlefield: Vec::new(),
                         cost_paid_object: None,
+                        cost_removed_counters: None,
                         batch_siblings: Vec::new(),
                     }),
                 },
@@ -39470,6 +39740,7 @@ mod tests {
                     chosen_exiled: Vec::new(),
                     chosen_sacrificed_battlefield: Vec::new(),
                     cost_paid_object: None,
+                    cost_removed_counters: None,
                     batch_siblings: Vec::new(),
                 })),
             };
@@ -41326,6 +41597,157 @@ mod tests {
         );
     }
 
+    /// CR 104.4b: a replacement-paused counted cost move keeps its earlier
+    /// action fragments' events in `PendingCostMoveResume::Cast`. Those events
+    /// can name an LKI incarnation, so the loop-state normalization must visit
+    /// them (`visit_cost_move_resume_events`): the incarnation they name
+    /// survives pruning and the canonical renumbering follows it.
+    #[test]
+    fn normalize_for_loop_visits_the_cast_cost_move_ledger_events() {
+        fn snapshot(power: i32) -> LKISnapshot {
+            LKISnapshot {
+                name: "Loop Entrant".to_string(),
+                token_image_ref: None,
+                power: Some(power),
+                toughness: Some(2),
+                base_power: Some(2),
+                base_toughness: Some(2),
+                mana_value: 2,
+                controller: PlayerId(0),
+                owner: PlayerId(0),
+                card_types: vec![CoreType::Creature],
+                subtypes: Vec::new(),
+                supertypes: Vec::new(),
+                keywords: Vec::new(),
+                colors: Vec::new(),
+                chosen_attributes: Vec::new(),
+                counters: HashMap::new(),
+                tapped: false,
+                is_suspected: false,
+                attachments: Vec::new(),
+            }
+        }
+
+        let entrant = ObjectId(50);
+        let referenced_incarnation = 7;
+        let mut record =
+            ZoneChangeRecord::test_minimal(entrant, Some(Zone::Battlefield), Zone::Hand);
+        record.entered_incarnation = Some(referenced_incarnation);
+        let deferred_event = GameEvent::ZoneChanged {
+            object_id: entrant,
+            from: Some(Zone::Battlefield),
+            to: Zone::Hand,
+            record: Box::new(record),
+        };
+
+        let mut state = GameState::new_two_player(7);
+        state.pending_cost_move_resume = Some(PendingCostMoveResume::Cast {
+            player: PlayerId(0),
+            pending: None,
+            chosen: vec![],
+            paused_at_index: 0,
+            destination: Zone::Hand,
+            completion: PendingCostMoveCompletion::FinishPending,
+            deferred_cost_events: vec![deferred_event],
+            departure_record_indices: vec![],
+        });
+        // No stack entry or other carrier names either incarnation.
+        state
+            .lki_by_incarnation
+            .entry(entrant)
+            .or_default()
+            .insert(referenced_incarnation, snapshot(5));
+        state
+            .lki_by_incarnation
+            .entry(entrant)
+            .or_default()
+            .insert(8, snapshot(2));
+
+        let normalized = state.normalize_for_loop();
+        let retained: Vec<u64> = normalized
+            .lki_by_incarnation
+            .get(&entrant)
+            .map(|incarnations| incarnations.keys().copied().collect())
+            .unwrap_or_default();
+        // Positive control: the unreferenced incarnation is pruned in the same call.
+        assert_eq!(
+            retained.len(),
+            1,
+            "only the incarnation the Cast ledger event names survives, got {retained:?}"
+        );
+        let named = match &normalized.pending_cost_move_resume {
+            Some(PendingCostMoveResume::Cast {
+                deferred_cost_events,
+                ..
+            }) => match deferred_cost_events.as_slice() {
+                [GameEvent::ZoneChanged { record, .. }] => record.entered_incarnation,
+                other => panic!("unexpected ledger events {other:?}"),
+            },
+            other => panic!("unexpected cost-move root {other:?}"),
+        };
+        assert_eq!(
+            named,
+            retained.first().copied(),
+            "the ledger event's incarnation follows the canonical renumbering"
+        );
+    }
+
+    /// Wire compatibility of `PendingCostMoveResume::Cast`'s ledger: an empty
+    /// ledger is not written, and a root serialized before the fields existed
+    /// deserializes with both empty.
+    #[test]
+    fn cast_cost_move_root_ledger_is_additive_on_the_wire() {
+        let root = PendingCostMoveResume::Cast {
+            player: PlayerId(0),
+            pending: None,
+            chosen: vec![ObjectId(3)],
+            paused_at_index: 0,
+            destination: Zone::Hand,
+            completion: PendingCostMoveCompletion::FinishPending,
+            deferred_cost_events: vec![],
+            departure_record_indices: vec![],
+        };
+        let json = serde_json::to_string(&root).expect("serialize the root");
+        assert!(
+            !json.contains("deferred_cost_events") && !json.contains("departure_record_indices"),
+            "an empty ledger is not written: {json}"
+        );
+        // Reach guard: a non-empty ledger is written, and survives a round trip.
+        let populated = PendingCostMoveResume::Cast {
+            player: PlayerId(0),
+            pending: None,
+            chosen: vec![ObjectId(3)],
+            paused_at_index: 0,
+            destination: Zone::Hand,
+            completion: PendingCostMoveCompletion::FinishPending,
+            deferred_cost_events: vec![],
+            departure_record_indices: vec![4, 5],
+        };
+        let populated_json = serde_json::to_string(&populated).expect("serialize");
+        assert!(populated_json.contains("departure_record_indices"));
+        let restored: PendingCostMoveResume =
+            serde_json::from_str(&populated_json).expect("deserialize");
+        assert!(matches!(
+            restored,
+            PendingCostMoveResume::Cast {
+                departure_record_indices,
+                ..
+            } if departure_record_indices == vec![4, 5]
+        ));
+
+        // The pre-ledger shape (no ledger keys) still deserializes.
+        let legacy: PendingCostMoveResume =
+            serde_json::from_str(&json).expect("deserialize a root without ledger keys");
+        assert!(matches!(
+            legacy,
+            PendingCostMoveResume::Cast {
+                deferred_cost_events,
+                departure_record_indices,
+                ..
+            } if deferred_cost_events.is_empty() && departure_record_indices.is_empty()
+        ));
+    }
+
     /// N1 (P5b-1, C5b1.4): CR 104.4b + CR 608.2h: `normalize_for_loop` keeps
     /// the last-known copiable values an ability can still read as its own copy
     /// source, captured before the ability's identity is erased, and prunes
@@ -41830,6 +42252,7 @@ mod tests {
                 chosen_exiled: Vec::new(),
                 chosen_sacrificed_battlefield: Vec::new(),
                 cost_paid_object: None,
+                cost_removed_counters: None,
                 batch_siblings: Vec::new(),
             };
             let mut state = GameState::new_two_player(7);
@@ -44982,6 +45405,7 @@ mod tests {
                     chosen_exiled: Vec::new(),
                     chosen_sacrificed_battlefield: Vec::new(),
                     cost_paid_object: None,
+                    cost_removed_counters: None,
                     batch_siblings: Vec::new(),
                 }),
             },
@@ -45212,6 +45636,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         };
         let mut state = GameState::new_two_player(42);
@@ -48702,6 +49127,205 @@ mod shared_zone_storage_tests {
             dandan.loop_fingerprint(),
             stray.loop_fingerprint(),
             "the non-canonical seat's own container is hashed too"
+        );
+    }
+}
+
+/// CR 616.1g + CR 608.2c: a counter removal's replacement subtree boundary sees
+/// a child drain that nests into the enclosing post-replacement frame, which a
+/// stack-depth check alone cannot.
+#[cfg(test)]
+mod replacement_subtree_boundary_tests {
+    use super::{
+        GameState, PendingContinuation, PostReplacementDrain, PostReplacementDrainStack,
+        ReplacementSubtreeBoundary, ResidentDrainPolicy,
+    };
+    use crate::types::ability::{
+        AbilityDefinition, AbilityKind, Effect, PostReplacementContinuation, ResolvedAbility,
+        TargetFilter,
+    };
+    use crate::types::identifiers::ObjectId;
+    use crate::types::player::PlayerId;
+    use crate::types::resolution::AbilityContinuationFrame;
+
+    fn ready_drain(name: &str) -> PostReplacementDrain {
+        PostReplacementDrain::ready(PostReplacementContinuation::Template(Box::new(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::unimplemented(name, "subtree-boundary fixture"),
+            ),
+        )))
+    }
+
+    /// One post-replacement frame whose only drain is dispatched (stamping the
+    /// frame) and paused, as an outer post-effect waiting on a prompt is.
+    fn state_with_paused_enclosing_frame() -> GameState {
+        let mut state = GameState::new_two_player(42);
+        state.install_post_replacement_drain(ready_drain("outer"), ResidentDrainPolicy::Replace);
+        let (_, outer) = state
+            .begin_post_replacement_dispatch()
+            .expect("the outer drain dispatches");
+        assert!(state.pause_post_replacement_dispatch(outer));
+        state
+    }
+
+    #[test]
+    fn a_child_nested_into_the_enclosing_frame_keeps_the_subtree_live() {
+        let mut state = state_with_paused_enclosing_frame();
+        let boundary = ReplacementSubtreeBoundary::at(&state.resolution_stack);
+        assert!(
+            boundary
+                .enclosing
+                .is_some_and(|enclosing| enclosing.frame.is_some() && enclosing.drains == 1),
+            "reach: the boundary names the stamped enclosing frame: {boundary:?}"
+        );
+
+        state.install_post_replacement_drain(ready_drain("child"), ResidentDrainPolicy::Replace);
+        let (_, child) = state
+            .begin_post_replacement_dispatch()
+            .expect("the nested child drain dispatches");
+        assert_eq!(
+            state.resolution_stack.len(),
+            boundary.resolution_depth,
+            "the child nested into the frame without growing the stack"
+        );
+        assert!(
+            !boundary.is_retired(&state.resolution_stack),
+            "a nested child drain keeps the subtree live"
+        );
+
+        assert!(state.finish_post_replacement_dispatch(child).is_some());
+        assert!(
+            boundary.is_retired(&state.resolution_stack),
+            "the subtree retires with the nested child"
+        );
+    }
+
+    #[test]
+    fn a_nested_child_stays_live_after_the_frame_above_its_parent_is_consumed() {
+        let mut state = state_with_paused_enclosing_frame();
+        let chain = Box::new(ResolvedAbility::new(
+            Effect::TargetOnly {
+                target: TargetFilter::Any,
+            },
+            vec![],
+            ObjectId(70),
+            PlayerId(0),
+        ));
+        let pending = PendingContinuation::new(chain, &state);
+        state.push_ability_continuation(AbilityContinuationFrame {
+            pending,
+            choose_zone_trigger_context: None,
+        });
+        let boundary = ReplacementSubtreeBoundary::at(&state.resolution_stack);
+        assert!(
+            boundary
+                .enclosing
+                .is_some_and(|enclosing| enclosing.frame.is_some() && enclosing.drains == 1),
+            "reach: the frame below the continuation is the paired parent: {boundary:?}"
+        );
+
+        state.install_post_replacement_drain(ready_drain("child"), ResidentDrainPolicy::Replace);
+        let (_, child) = state
+            .begin_post_replacement_dispatch()
+            .expect("the nested child drain dispatches");
+        state
+            .take_active_ability_continuation()
+            .expect("the continuation is the top frame")
+            .expect("the continuation is present");
+        assert_eq!(
+            state.resolution_stack.len(),
+            boundary.resolution_depth - 1,
+            "reach: the frame above the parent was consumed first"
+        );
+        assert!(
+            !boundary.is_retired(&state.resolution_stack),
+            "the enclosing frame, found by identity, still holds the nested child"
+        );
+
+        assert!(state.finish_post_replacement_dispatch(child).is_some());
+        assert!(
+            boundary.is_retired(&state.resolution_stack),
+            "the subtree retires with the nested child"
+        );
+    }
+
+    /// A type-level contract fixture, not a claimed production shape: with the
+    /// frame above the parent consumed and a fresh, unstamped frame pushed in its
+    /// place, the stack is as deep as when the boundary was recorded and the
+    /// active frame holds one drain. Only the identity read sees that the
+    /// enclosing frame still holds the nested child.
+    #[test]
+    fn a_nested_child_is_read_in_its_own_frame_not_the_active_one() {
+        let mut state = state_with_paused_enclosing_frame();
+        let chain = Box::new(ResolvedAbility::new(
+            Effect::TargetOnly {
+                target: TargetFilter::Any,
+            },
+            vec![],
+            ObjectId(71),
+            PlayerId(0),
+        ));
+        let pending = PendingContinuation::new(chain, &state);
+        state.push_ability_continuation(AbilityContinuationFrame {
+            pending,
+            choose_zone_trigger_context: None,
+        });
+        let boundary = ReplacementSubtreeBoundary::at(&state.resolution_stack);
+        let enclosing = boundary
+            .enclosing
+            .expect("reach: the frame below the continuation is the paired parent");
+        let parent_id = enclosing
+            .frame
+            .expect("reach: the paused enclosing frame is stamped");
+        assert_eq!(enclosing.drains, 1);
+
+        state.install_post_replacement_drain(ready_drain("child"), ResidentDrainPolicy::Replace);
+        let (_, child) = state
+            .begin_post_replacement_dispatch()
+            .expect("the nested child drain dispatches");
+        state
+            .take_active_ability_continuation()
+            .expect("the continuation is the top frame")
+            .expect("the continuation is present");
+        let mut unrelated = PostReplacementDrainStack::default();
+        assert!(unrelated.install(ready_drain("unrelated"), ResidentDrainPolicy::Replace));
+        state.resolution_stack.push_post_replacement(unrelated);
+
+        assert_eq!(
+            state.resolution_stack.len(),
+            boundary.resolution_depth,
+            "reach: the stack is as deep as when the boundary was recorded"
+        );
+        assert_eq!(
+            state
+                .resolution_stack
+                .active_post_replacement_or_paired_parent()
+                .map(PostReplacementDrainStack::len),
+            Some(1),
+            "reach: the active frame is the unrelated one, holding one drain"
+        );
+        assert_eq!(
+            state
+                .resolution_stack
+                .post_replacement_frame_drain_count(parent_id),
+            Some(2),
+            "reach: the enclosing frame holds the nested child"
+        );
+        assert!(
+            !boundary.is_retired(&state.resolution_stack),
+            "the enclosing frame is read by identity, not as the active frame"
+        );
+
+        state
+            .resolution_stack
+            .take_active_post_replacement()
+            .expect("the unrelated frame is the top")
+            .expect("the unrelated frame is present");
+        assert!(state.finish_post_replacement_dispatch(child).is_some());
+        assert!(
+            boundary.is_retired(&state.resolution_stack),
+            "the subtree retires with the nested child"
         );
     }
 }

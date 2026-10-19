@@ -20502,6 +20502,17 @@ mod handshake_tests {
                 server: PROTOCOL_VERSION
             }
         );
+        // Every earlier Full version up to the current one is refused; only the
+        // exact current version is accepted.
+        for stale in BESTOW_PAYLOAD_PROTOCOL..PROTOCOL_VERSION {
+            assert_eq!(
+                classify(stale),
+                HelloGateOutcome::RejectProtocol {
+                    client: stale,
+                    server: PROTOCOL_VERSION
+                }
+            );
+        }
         assert_eq!(
             classify(PROTOCOL_VERSION),
             HelloGateOutcome::Accept(ClientHelloInfo {
