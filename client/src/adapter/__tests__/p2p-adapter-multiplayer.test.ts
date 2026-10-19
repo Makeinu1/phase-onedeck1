@@ -1897,6 +1897,13 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     expect(first.eliminatedSeats.has(1)).toBe(false);
     expect(first.disconnectedSeats.has(1)).toBe(true);
     expect(first.kickedTokens.has("native-guest-token")).toBe(true);
+    // The restored seat is away, so the run state pauses and submissions are refused.
+    // The persisted membership had no away seat when the run state was first chosen.
+    expect((staleEliminated.adapter as unknown as { gameRunState: string }).gameRunState)
+      .toBe("paused-disconnect");
+    await expect(staleEliminated.adapter.submitAction({ type: "PassPriority" } as GameAction, 0))
+      .rejects.toMatchObject({ code: "P2P_PAUSED" });
+    expect(nativeWebSocketMocks.sentActions).toHaveLength(0);
     const deniedReconnect = await joinGuest(staleEliminated.emitConnection, {
       type: "reconnect",
       playerToken: "native-guest-token",
@@ -1916,6 +1923,14 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     };
     expect(second.eliminatedSeats.has(1)).toBe(true);
     expect(second.disconnectedSeats.has(1)).toBe(false);
+    // The last stale away seat is gone, so the pause it caused is released and
+    // submissions are admitted again.
+    expect((staleLive.adapter as unknown as { gameRunState: string }).gameRunState).toBe("running");
+    await staleLive.adapter.submitAction({ type: "PassPriority" } as GameAction, 0);
+    expect(nativeWebSocketMocks.sentActions).toContainEqual(expect.objectContaining({
+      playerId: 0,
+      action: expect.objectContaining({ type: "PassPriority" }),
+    }));
     staleLive.adapter.dispose();
   });
 
