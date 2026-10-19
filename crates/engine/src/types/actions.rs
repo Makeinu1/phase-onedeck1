@@ -1153,10 +1153,12 @@ fn default_true() -> bool {
 /// can still be multiplied by ordinary token replacement effects.
 pub const MAX_DEBUG_CREATE_COUNT: u32 = 100;
 
-/// Maximum amount for one sandbox `GainLife` / `LoseLife` debug action. The
-/// ceiling leaves about 2^11 headroom under `i32::MAX` for doubling life-gain
-/// replacements, whose multiplication in `resolve_event_replacement_quantity`
-/// is unchecked.
+/// Maximum amount for one sandbox `GainLife` / `LoseLife` debug action. A sanity
+/// bound on the request, not the representability authority: it leaves about 2^11
+/// headroom under `i32::MAX` for doubling replacements, but a stack of replacements
+/// can still carry the result past what the engine represents. That result is never
+/// clamped: the checked quantity resolver and the checked `Times` / `Plus` appliers
+/// report it as an unrepresentable life change and the action is rejected unchanged.
 pub const MAX_DEBUG_LIFE_AMOUNT: u32 = 1_000_000;
 
 /// Serde default for debug create counts: legacy payloads create one object.

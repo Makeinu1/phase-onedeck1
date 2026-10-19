@@ -445,9 +445,9 @@ fn drain_substitution_continuation(
 /// CR 119.1: Settle a post-replacement `ProposedEvent::LifeGain`: the one
 /// place the final gain edit is made and its representability is decided.
 ///
-/// Order before anything observable: the amount must fit an `i32` delta, then
-/// the checked scalar edit (life total and gained-this-turn counter) must
-/// succeed. An unrepresentable result is handled per `policy`:
+/// Order before anything observable: a recorded replacement-quantity overflow,
+/// then the amount must fit an `i32` delta, then the checked scalar edit (life
+/// total and gained-this-turn counter) must succeed. An unrepresentable result is handled per `policy`:
 /// `Reject` returns the typed error; `IgnoreImpossible` skips this change
 /// (no mutation, no `LifeChanged`) and reports `Ok(0)`, recording the failure
 /// instead when an ingress window is open (the ingress caller then rejects).
@@ -469,6 +469,9 @@ fn settle_life_gain(
         );
         return Ok(0);
     };
+    if let Some(settled) = settle_quantity_overflow(state, pid, policy, "life gain") {
+        return settled;
+    }
     if ingress_window_has_failed(state) {
         return Ok(0);
     }
@@ -558,6 +561,28 @@ fn settle_unrepresentable(
             Ok(0)
         }
     }
+}
+
+/// Consumes a replacement-quantity overflow recorded while this life event was
+/// replaced. CR 101.3: the overflowed result is an impossible part of the
+/// instruction, so it takes the same failure branch as any other unrepresentable
+/// life change (`Reject` returns the error, `IgnoreImpossible` skips only this
+/// change). Taken first so the record is always cleared, even when an ingress
+/// window has already failed. `None` when nothing was recorded.
+fn settle_quantity_overflow(
+    state: &mut GameState,
+    pid: PlayerId,
+    policy: UnrepresentablePolicy,
+    site: &'static str,
+) -> Option<Result<u32, LifeChangeUnrepresentable>> {
+    state.take_replacement_quantity_overflow().map(|_| {
+        settle_unrepresentable(
+            state,
+            LifeChangeUnrepresentable { player: pid },
+            policy,
+            site,
+        )
+    })
 }
 
 /// Applies a post-replacement `ProposedEvent::LifeGain` to the game state under
@@ -677,6 +702,9 @@ fn settle_life_loss(
         );
         return Ok(0);
     };
+    if let Some(settled) = settle_quantity_overflow(state, pid, policy, "life loss") {
+        return settled;
+    }
     if ingress_window_has_failed(state) {
         return Ok(0);
     }

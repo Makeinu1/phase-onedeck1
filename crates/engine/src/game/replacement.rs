@@ -4281,72 +4281,126 @@ fn proliferate_applier(
     })
 }
 
+/// Why a replacement quantity expression has no `i32` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventQuantityError {
+    /// The expression is not statically resolvable from the event amount
+    /// (a `QuantityExpr::Ref` other than `EventContextAmount`).
+    NotStatic,
+    /// A step of the computation does not fit an `i32`. CR 101.3: the result
+    /// is unrepresentable, so it is reported, never clamped or wrapped.
+    Overflow,
+}
+
+/// The replacement's computed quantity overflowed (unit error of the checked
+/// life-gain entry; see `gain_life_replacement_amount`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EventQuantityOverflow;
+
+/// Lenient entry for the non-life count replacements (draw, scry, coin flip,
+/// dice, proliferate, mill): an overflow there falls back to the unchanged
+/// count, which is exactly what each caller already does for a
+/// not-statically-resolvable expression. There is no action-ingress rejection
+/// contract for a non-life count, and a count that large cannot arise from the
+/// ingress cap. The life appliers use `try_resolve_event_replacement_quantity`
+/// so an overflow is reported instead.
 fn resolve_event_replacement_quantity(expr: &QuantityExpr, event_count: u32) -> Option<i32> {
+    try_resolve_event_replacement_quantity(expr, event_count).ok()
+}
+
+/// Checked evaluation of a replacement quantity expression: no clamp, no wrap.
+fn try_resolve_event_replacement_quantity(
+    expr: &QuantityExpr,
+    event_count: u32,
+) -> Result<i32, EventQuantityError> {
+    use EventQuantityError::{NotStatic, Overflow};
     match expr {
         QuantityExpr::Ref {
             qty: crate::types::ability::QuantityRef::EventContextAmount,
-        } => Some(event_count as i32),
-        QuantityExpr::Fixed { value } => Some(*value),
+        } => i32::try_from(event_count).map_err(|_| Overflow),
+        QuantityExpr::Fixed { value } => Ok(*value),
         QuantityExpr::DivideRounded {
             inner,
             divisor,
             rounding,
         } => {
-            let value = resolve_event_replacement_quantity(inner, event_count)?;
-            let divisor = i32::try_from((*divisor).max(1)).ok()?;
-            Some(match rounding {
-                crate::types::ability::RoundingMode::Up => (value + divisor - 1) / divisor,
+            let value = try_resolve_event_replacement_quantity(inner, event_count)?;
+            // A divisor above i32::MAX is not an overflow of the quotient.
+            let divisor = i32::try_from((*divisor).max(1)).map_err(|_| NotStatic)?;
+            Ok(match rounding {
+                crate::types::ability::RoundingMode::Up => {
+                    // divisor >= 1, so `divisor - 1` cannot overflow.
+                    value.checked_add(divisor - 1).ok_or(Overflow)? / divisor
+                }
                 crate::types::ability::RoundingMode::Down => value / divisor,
             })
         }
         QuantityExpr::Offset { inner, offset } => {
-            Some(resolve_event_replacement_quantity(inner, event_count)? + offset)
+            try_resolve_event_replacement_quantity(inner, event_count)?
+                .checked_add(*offset)
+                .ok_or(Overflow)
         }
         QuantityExpr::ClampMin { inner, minimum } => {
-            Some(resolve_event_replacement_quantity(inner, event_count)?.max(*minimum))
+            Ok(try_resolve_event_replacement_quantity(inner, event_count)?.max(*minimum))
         }
-        QuantityExpr::Multiply { factor, inner } => {
-            Some(factor * resolve_event_replacement_quantity(inner, event_count)?)
-        }
+        QuantityExpr::Multiply { factor, inner } => (*factor)
+            .checked_mul(try_resolve_event_replacement_quantity(inner, event_count)?)
+            .ok_or(Overflow),
         QuantityExpr::Sum { exprs } => {
             let mut total = 0i32;
             for inner in exprs {
-                total += resolve_event_replacement_quantity(inner, event_count)?;
+                total = total
+                    .checked_add(try_resolve_event_replacement_quantity(inner, event_count)?)
+                    .ok_or(Overflow)?;
             }
-            Some(total)
+            Ok(total)
         }
         // CR 107.1: the maximum of the computed operand values; empty → 0.
         QuantityExpr::Max { exprs } => {
             let mut best: Option<i32> = None;
             for inner in exprs {
-                let value = resolve_event_replacement_quantity(inner, event_count)?;
+                let value = try_resolve_event_replacement_quantity(inner, event_count)?;
                 best = Some(best.map_or(value, |b| b.max(value)));
             }
-            Some(best.unwrap_or(0))
+            Ok(best.unwrap_or(0))
         }
         // CR 107.1c + CR 608.2d: For replacement quantity resolution, treat
         // `UpTo` transparently as its upper bound — the replacement-effect
         // pipeline does not honor "may pick fewer" semantics (the choice
         // already happened at effect resolution before the replacement fires).
-        QuantityExpr::UpTo { max } => resolve_event_replacement_quantity(max, event_count),
+        QuantityExpr::UpTo { max } => try_resolve_event_replacement_quantity(max, event_count),
         // CR 107.3: `base ^ exponent`. Negative exponents clamp to 0 per
-        // CR 107.1b; `saturating_pow` prevents overflow.
+        // CR 107.1b; `checked_pow` reports an overflow instead of saturating.
         QuantityExpr::Power { base, exponent } => {
-            let exp = resolve_event_replacement_quantity(exponent, event_count)?.max(0) as u32;
-            Some(base.saturating_pow(exp))
+            let exp = try_resolve_event_replacement_quantity(exponent, event_count)?.max(0) as u32;
+            base.checked_pow(exp).ok_or(Overflow)
         }
         // "The difference between A and B" being unsigned is an Oracle
         // templating convention with no dedicated CR number — resolves to the
         // absolute value of the gap. (CR 107.1b is distinct: it clamps a
         // negative result to zero, not the operand-order-independent magnitude
-        // taken here.)
+        // taken here.) The unsigned gap is computed without overflow; only a
+        // gap above i32::MAX is unrepresentable.
         QuantityExpr::Difference { left, right } => {
-            let l = resolve_event_replacement_quantity(left, event_count)?;
-            let r = resolve_event_replacement_quantity(right, event_count)?;
-            Some((l - r).abs())
+            let l = try_resolve_event_replacement_quantity(left, event_count)?;
+            let r = try_resolve_event_replacement_quantity(right, event_count)?;
+            i32::try_from(l.abs_diff(r)).map_err(|_| Overflow)
         }
-        QuantityExpr::Ref { .. } => None,
+        QuantityExpr::Ref { .. } => Err(NotStatic),
     }
+}
+
+/// CR 101.3: a replacement's computed life quantity is unrepresentable. Record
+/// it for the life settle step (which skips or rejects the impossible change)
+/// and leave the event unchanged: the pipeline stops at the loop head, so the
+/// unchanged event is never the final amount.
+fn record_life_quantity_overflow(
+    state: &mut GameState,
+    rid: ReplacementId,
+    event: ProposedEvent,
+) -> ApplyResult {
+    state.record_replacement_quantity_overflow(rid.source);
+    ApplyResult::Modified(event)
 }
 
 // --- 5. GainLife ---
@@ -4381,16 +4435,30 @@ fn gain_life_applier(
             applied,
         } = event
         {
-            let new_amount = match modification {
-                QuantityModification::Times { factor } => amount.saturating_mul(factor),
-                QuantityModification::Half => amount / 2,
-                QuantityModification::Plus { value } => amount.saturating_add(value),
-                QuantityModification::Minus { value } => amount.saturating_sub(value),
+            // CR 101.3: a `Times` / `Plus` result past `u32` is unrepresentable,
+            // so it is recorded for the settle step instead of clamped.
+            // `Minus` floors at zero, which is not an overflow.
+            let checked = match modification {
+                QuantityModification::Times { factor } => amount.checked_mul(factor),
+                QuantityModification::Half => Some(amount / 2),
+                QuantityModification::Plus { value } => amount.checked_add(value),
+                QuantityModification::Minus { value } => Some(amount.saturating_sub(value)),
                 // CR 614.6 + CR 614.7: No life-gain replacement uses Prevent
                 // today (Tainted Remedy converts gain → loss via execute chain),
                 // but the variant composes here for symmetry — fully suppress
                 // the gain event.
                 QuantityModification::Prevent => return ApplyResult::Prevented,
+            };
+            let Some(new_amount) = checked else {
+                return record_life_quantity_overflow(
+                    state,
+                    rid,
+                    ProposedEvent::LifeGain {
+                        player_id,
+                        amount,
+                        applied,
+                    },
+                );
             };
             return ApplyResult::Modified(ProposedEvent::LifeGain {
                 player_id,
@@ -4409,18 +4477,23 @@ fn gain_life_applier(
     // `Offset { inner: EventContextAmount, offset: 1 }` for "you gain that
     // much life plus 1 instead". CR 614.1a: the replacement substitutes a
     // new event (the replaced amount), not an additive delta.
-    if let Some(new_amount) = gain_life_replacement_amount(state, rid, &event) {
-        if let ProposedEvent::LifeGain {
-            player_id, applied, ..
-        } = event
-        {
-            return ApplyResult::Modified(ProposedEvent::LifeGain {
-                player_id,
-                amount: new_amount,
-                applied,
-            });
+    match gain_life_replacement_amount(state, rid, &event) {
+        Ok(Some(new_amount)) => {
+            if let ProposedEvent::LifeGain {
+                player_id, applied, ..
+            } = event
+            {
+                return ApplyResult::Modified(ProposedEvent::LifeGain {
+                    player_id,
+                    amount: new_amount,
+                    applied,
+                });
+            }
+            return ApplyResult::Modified(event);
         }
-        return ApplyResult::Modified(event);
+        // CR 101.3: the computed quantity is unrepresentable.
+        Err(EventQuantityOverflow) => return record_life_quantity_overflow(state, rid, event),
+        Ok(None) => {}
     }
 
     // Branch 3: Cross-event-type substitution — "If you would gain life,
@@ -4473,29 +4546,35 @@ fn gain_life_replacement_amount(
     state: &GameState,
     rid: ReplacementId,
     event: &ProposedEvent,
-) -> Option<u32> {
+) -> Result<Option<u32>, EventQuantityOverflow> {
     let ProposedEvent::LifeGain { amount, .. } = event else {
-        return None;
+        return Ok(None);
     };
 
-    let execute = state
+    let Some(execute) = state
         .objects
-        .get(&rid.source)?
-        .replacement_definitions
-        .get(rid.index)?
-        .execute
-        .as_deref()?;
+        .get(&rid.source)
+        .and_then(|obj| obj.replacement_definitions.get(rid.index))
+        .and_then(|def| def.execute.as_deref())
+    else {
+        return Ok(None);
+    };
 
     if execute.sub_ability.is_some() {
-        return None;
+        return Ok(None);
     }
 
     match &*execute.effect {
         Effect::GainLife { amount: qty, .. } => {
-            let resolved = resolve_event_replacement_quantity(qty, *amount)?;
-            Some(resolved.max(0) as u32)
+            match try_resolve_event_replacement_quantity(qty, *amount) {
+                // A negative result floors at 0 = no gain, which the settle
+                // step already treats as no change.
+                Ok(resolved) => Ok(Some(resolved.max(0) as u32)),
+                Err(EventQuantityError::NotStatic) => Ok(None),
+                Err(EventQuantityError::Overflow) => Err(EventQuantityOverflow),
+            }
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -4542,16 +4621,30 @@ fn lose_life_applier(
         else {
             return ApplyResult::Modified(event);
         };
-        let amount = match modification {
-            QuantityModification::Times { factor } => amount.saturating_mul(factor),
-            QuantityModification::Half => amount / 2,
-            QuantityModification::Plus { value } => amount.saturating_add(value),
-            QuantityModification::Minus { value } => amount.saturating_sub(value),
+        // CR 101.3: a `Times` / `Plus` result past `u32` is unrepresentable,
+        // so it is recorded for the settle step instead of clamped. `Minus`
+        // floors at zero, which is not an overflow.
+        let checked = match modification {
+            QuantityModification::Times { factor } => amount.checked_mul(factor),
+            QuantityModification::Half => Some(amount / 2),
+            QuantityModification::Plus { value } => amount.checked_add(value),
+            QuantityModification::Minus { value } => Some(amount.saturating_sub(value)),
             QuantityModification::Prevent => return ApplyResult::Prevented,
+        };
+        let Some(new_amount) = checked else {
+            return record_life_quantity_overflow(
+                state,
+                rid,
+                ProposedEvent::LifeLoss {
+                    player_id,
+                    amount,
+                    applied,
+                },
+            );
         };
         return ApplyResult::Modified(ProposedEvent::LifeLoss {
             player_id,
-            amount,
+            amount: new_amount,
             applied,
         });
     }
@@ -4572,13 +4665,21 @@ fn lose_life_applier(
             },
         ) = (&event, &*execute.effect)
         {
-            if let Some(resolved) = resolve_event_replacement_quantity(replacement_amount, *amount)
-            {
-                return ApplyResult::Modified(ProposedEvent::LifeLoss {
-                    player_id: *player_id,
-                    amount: resolved.max(0) as u32,
-                    applied: applied.clone(),
-                });
+            match try_resolve_event_replacement_quantity(replacement_amount, *amount) {
+                Ok(resolved) => {
+                    return ApplyResult::Modified(ProposedEvent::LifeLoss {
+                        player_id: *player_id,
+                        amount: resolved.max(0) as u32,
+                        applied: applied.clone(),
+                    });
+                }
+                // CR 101.3: the computed quantity is unrepresentable. Return
+                // explicitly so this arm never depends on the later
+                // fall-through checks.
+                Err(EventQuantityError::Overflow) => {
+                    return record_life_quantity_overflow(state, rid, event);
+                }
+                Err(EventQuantityError::NotStatic) => {}
             }
         }
     }
@@ -10029,7 +10130,10 @@ fn apply_single_replacement(
                         //      `QuantityRef::EventContextAmount`, so
                         //      `resolve_event_replacement_quantity` never returns
                         //      `None` for it. A count form that is NOT statically
-                        //      resolvable must re-check this arm.
+                        //      resolvable must re-check this arm. (`None` now also
+                        //      covers an `i32` overflow, which folds to the unchanged
+                        //      count: the same silent no-op as an unresolvable count,
+                        //      and unreachable from printed cards.)
                         //   2. `mill_applier` IGNORES the execute's `target` and
                         //      `destination` — it passes the EVENT's `player_id` and
                         //      `destination` through. Every production Mill execute
@@ -11888,6 +11992,17 @@ fn pipeline_loop(
     record_proposed_event(&proposed);
 
     loop {
+        // CR 101.3 (CR 614.6: the modified event's impossible instruction is
+        // ignored): an applier recorded that the modified life event is
+        // unrepresentable. The engine cuts the CR 616.1f repetition short here:
+        // no further replacement can make an unrepresentable event meaningful,
+        // and no further ordering prompt is asked. The life settle step takes the
+        // record. This also covers the choice-resumed path, which re-enters this
+        // loop through `pipeline_loop`.
+        if state.replacement_quantity_overflow.is_some() {
+            break;
+        }
+
         if depth >= MAX_REPLACEMENT_DEPTH {
             break;
         }

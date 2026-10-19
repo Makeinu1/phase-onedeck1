@@ -21574,6 +21574,12 @@ declare_game_state! {
     /// here and the ingress caller rejects. Transient — never serialized.
     #[serde(skip)]
     pub(crate) ingress_life_window: Option<IngressLifeWindow>,
+    /// A replacement's computed life quantity overflowed while the current life
+    /// event was being replaced (see `ReplacementQuantityOverflow`). Recorded by
+    /// the life appliers, taken by the life settle step of the same event inside
+    /// one synchronous action. Transient — never serialized.
+    #[serde(skip)]
+    pub(crate) replacement_quantity_overflow: Option<ReplacementQuantityOverflow>,
     /// CR 601.2g + CR 605.3b: the row policy of the automatic mana payment that
     /// is executing (see `casting_costs::AutoTapRowPolicy`). Set while a
     /// payment activates its selected sources, and to `AllRows` while a
@@ -25952,6 +25958,36 @@ pub(crate) struct IngressLifeWindow {
     pub(crate) failed_player: Option<PlayerId>,
 }
 
+/// A replacement's computed life quantity overflowed the engine's numeric
+/// range, so the modified event cannot be represented. CR 101.3: that result is
+/// an impossible part of the instruction and is ignored rather than clamped
+/// (CR 119.3 would otherwise adjust the life total by a made-up amount). The
+/// applier records the overflowing replacement's source (diagnostic) and the
+/// life settle step takes the record and routes it through the existing
+/// unrepresentable-life-change authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplacementQuantityOverflow {
+    pub(crate) source: ObjectId,
+}
+
+impl GameState {
+    /// Record that a replacement's computed life quantity overflowed. The first
+    /// writer wins: the loop stops at the first overflow, so a later record can
+    /// only be the same event.
+    pub(crate) fn record_replacement_quantity_overflow(&mut self, source: ObjectId) {
+        if self.replacement_quantity_overflow.is_none() {
+            self.replacement_quantity_overflow = Some(ReplacementQuantityOverflow { source });
+        }
+    }
+
+    /// Take (and clear) the recorded overflow, if any.
+    pub(crate) fn take_replacement_quantity_overflow(
+        &mut self,
+    ) -> Option<ReplacementQuantityOverflow> {
+        self.replacement_quantity_overflow.take()
+    }
+}
+
 impl PendingReplacement {
     /// CR 616.1f: a record re-parked while its predecessor (stamped with
     /// `predecessor_policy`) was being answered keeps the ingress stamp. Copies
@@ -29757,6 +29793,7 @@ impl GameState {
             active_paid_resolution_offer_tail: None,
             active_spend_only_on_x_count: None,
             ingress_life_window: None,
+            replacement_quantity_overflow: None,
             active_auto_tap_row_policy: None,
             battlefield: im::Vector::new(),
             stack: im::Vector::new(),
@@ -31424,6 +31461,7 @@ impl GameState {
         self.die_result_this_resolution = None;
         self.consumed_before_priority_trigger_events.clear();
         self.ingress_life_window = None;
+        self.replacement_quantity_overflow = None;
     }
 
     /// The policy a life event parked right now must be stamped with: `Reject`
@@ -32770,6 +32808,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         active_paid_resolution_offer_tail: _,
         active_spend_only_on_x_count: _,
         ingress_life_window: _,
+        replacement_quantity_overflow: _,
         active_auto_tap_row_policy: _,
         battlefield: _,
         stack: _,
