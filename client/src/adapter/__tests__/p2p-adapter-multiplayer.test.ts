@@ -9724,12 +9724,12 @@ describe("P2PHostAdapter — contest input", () => {
     });
 
     /** A started two-seat native game whose guest is attached on its own loopback. */
-    async function startedNativeHostWithGuest() {
+    async function startedNativeHostWithGuest(fullKey?: { game_code: string; generation: number }) {
       const { adapter, emitConnection } = makeNativeHost(2);
       nativeWebSocketMocks.waitForPlayerSlots.mockResolvedValue([]);
       nativeWebSocketMocks.initializePregame
-        .mockResolvedValueOnce(NATIVE_HOST_ATTACHMENT)
-        .mockResolvedValueOnce(NATIVE_GUEST_ATTACHMENT);
+        .mockResolvedValueOnce(fullKey ? { ...NATIVE_HOST_ATTACHMENT, fullKey } : NATIVE_HOST_ATTACHMENT)
+        .mockResolvedValueOnce(fullKey ? { ...NATIVE_GUEST_ATTACHMENT, fullKey } : NATIVE_GUEST_ATTACHMENT);
       await adapter.initialize();
       const guest = await joinGuest(emitConnection, {
         type: "guest_deck",
@@ -9826,6 +9826,111 @@ describe("P2PHostAdapter — contest input", () => {
         expect.objectContaining({ type: "reconnect_rejected" }),
       );
       expect(nativeWebSocketMocks.openSockets.has(1)).toBe(false);
+      adapter.dispose();
+    });
+
+    /**
+     * A started native game whose guest really dropped (its loopback seat is
+     * suspended, so the revision barrier no longer waits on it and its cached
+     * view stays at revision 1) and whose host then conceded at revision 2. The
+     * Full session is retired once it ends: any further loopback attachment is
+     * refused by the server, and the guest's recipient-bound final view is
+     * reachable only through its terminal delivery.
+     */
+    async function nativeTerminalOverSuspendedGuest() {
+      const fullKey = { game_code: "native-game", generation: 4 };
+      const { adapter, emitConnection, guest } = await startedNativeHostWithGuest(fullKey);
+      const events: P2PAdapterEvent[] = [];
+      adapter.onEvent((event) => events.push(event));
+      const setup = (await guest.getSentMessages()).find(
+        (message): message is { type: "game_setup"; playerToken: string } =>
+          (message as { type?: string }).type === "game_setup",
+      );
+      expect(setup).toBeDefined();
+
+      guest.simulateClose();
+      await flushPromises(20);
+      expect(nativeWebSocketMocks.openSockets.has(1)).toBe(false);
+
+      const finalView = (playerId: number) => ({
+        ...remoteState(`suspended seat terminal ${playerId}`),
+        waiting_for: { type: "GameOver", data: { winner: 1 } },
+        eliminated_players: [0],
+        filteredFor: playerId,
+      }) as unknown as GameState;
+      const hostFinal = finalView(0);
+      const guestFinal = finalView(1);
+      const delivery = (deliveryId: string, view: GameState): FullTerminalDelivery => ({
+        key: fullKey,
+        terminalRevision: 2,
+        deliveryId,
+        credential: `${deliveryId}-credential`,
+        display: { winner: 1, reason: "Full terminal reason" },
+        finalView: view,
+      });
+      const deliveries = new Map<string, FullTerminalDelivery>([
+        ["native-host-token", delivery("host-delivery", hostFinal)],
+        ["native-guest-token", delivery("guest-delivery", guestFinal)],
+      ]);
+      nativeTerminalMocks.bootstrap.mockImplementation(async (_url, _key, playerToken) =>
+        deliveries.get(playerToken ?? "") ?? null);
+      // The terminal Concede retired the Full session: the server refuses every
+      // reconnect for its identities, exactly as it does for a retired seat.
+      nativeWebSocketMocks.initializePregame.mockRejectedValue(new Error("Full session retired"));
+
+      await adapter.sendConcede();
+      expect(nativeWebSocketMocks.sentActions).toContainEqual(expect.objectContaining({
+        playerId: 0,
+        action: expect.objectContaining({ type: "Concede" }),
+      }));
+      (nativeWebSocketMocks.onEvent.mock.calls[0][0] as (event: WsAdapterEvent) => void)({
+        type: "stateChanged",
+        snapshot: { state: hostFinal, legalResult: { actions: [], autoPassRecommended: false }, seq: 3 },
+        events: [],
+        serverRevision: 2,
+      });
+      // The terminal commit settles one way or the other: committed, or reported unavailable.
+      await vi.waitFor(() => expect(events.some((event) =>
+        event.type === "terminalResult" || event.type === "terminalUnavailable")).toBe(true));
+      await flushPromises(20);
+      return { adapter, emitConnection, events, playerToken: setup!.playerToken, guestFinal };
+    }
+
+    it("commits a terminal Concede over a suspended guest and hands it over on a refused retired-session reconnect", async () => {
+      const { adapter, emitConnection, events, playerToken, guestFinal } = await nativeTerminalOverSuspendedGuest();
+      const host = adapter as unknown as {
+        terminalResult: { revision: number } | null;
+        nativeBridge: { clients: Map<number, unknown>; latestViews: Map<number, { revision: number }> };
+      };
+
+      // The host terminal is committed even though the suspended seat never reported revision 2.
+      expect(events).not.toContainEqual(expect.objectContaining({ type: "terminalUnavailable" }));
+      expect(host.terminalResult?.revision).toBe(2);
+      expect(events).toContainEqual(expect.objectContaining({ type: "terminalResult" }));
+      expect(host.nativeBridge.clients.has(1)).toBe(false);
+      expect(host.nativeBridge.latestViews.get(1)?.revision).toBe(2);
+
+      // The returning seat is handed its recipient-bound Full final view without
+      // a loopback attachment, which the retired session would refuse.
+      const attachments = nativeWebSocketMocks.initializePregame.mock.calls.length;
+      const reconnect = await joinGuest(emitConnection, { type: "reconnect", playerToken });
+      await vi.waitFor(async () => {
+        expect(await reconnect.getSentMessages()).toContainEqual(expect.objectContaining({ type: "terminal_result" }));
+      });
+      const frames = await reconnect.getSentMessages() as P2PMessage[];
+      const ack = frames.find((message): message is Extract<P2PMessage, { type: "reconnect_ack" }> =>
+        message.type === "reconnect_ack");
+      const terminal = frames.find((message): message is Extract<P2PMessage, { type: "terminal_result" }> =>
+        message.type === "terminal_result");
+      expect(ack?.revision).toBe(2);
+      expect(ack?.state).toEqual(guestFinal);
+      expect(terminal?.result.recipient).toBe(1);
+      expect(terminal?.result.finalStateCommitment).toBe(await p2pFinalStateCommitment(guestFinal));
+      expect(frames.findIndex((m) => m.type === "reconnect_ack"))
+        .toBeLessThan(frames.findIndex((m) => m.type === "terminal_result"));
+      expect(nativeWebSocketMocks.initializePregame.mock.calls.length).toBe(attachments);
+      expect(frames.some((message) => message.type === "reconnect_rejected")).toBe(false);
+      await vi.waitFor(() => expect(nativeTerminalMocks.acknowledge).toHaveBeenCalledTimes(2));
       adapter.dispose();
     });
 
