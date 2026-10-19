@@ -3861,7 +3861,8 @@ mod tests {
         #[test]
         fn debug_lose_final_overflow_after_a_parsed_doubler_is_rejected_unchanged() {
             // (case, P1 life, P1 lost-this-turn counter, accepted result)
-            let cases: [(&str, i32, u32, Option<(i32, u32)>); 4] = [
+            type LossCase = (&'static str, i32, u32, Option<(i32, u32)>);
+            let cases: [LossCase; 4] = [
                 ("life total, accepted", i32::MIN + 4, 0, Some((i32::MIN, 4))),
                 ("life total, rejected", i32::MIN + 3, 0, None),
                 ("counter, accepted", 20, u32::MAX - 4, Some((16, u32::MAX))),
