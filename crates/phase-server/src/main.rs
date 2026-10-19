@@ -20481,7 +20481,7 @@ mod handshake_tests {
         // incompatible full GameState reader.
         const BESTOW_PAYLOAD_PROTOCOL: u32 = 151;
         const PRE_BESTOW_PROTOCOL: u32 = BESTOW_PAYLOAD_PROTOCOL - 1;
-        assert!(PROTOCOL_VERSION >= BESTOW_PAYLOAD_PROTOCOL);
+        const _: () = assert!(PROTOCOL_VERSION >= BESTOW_PAYLOAD_PROTOCOL);
         let classify = |protocol_version| {
             classify_hello_gate(
                 false,
