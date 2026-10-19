@@ -3939,17 +3939,20 @@ mod tests {
         /// The substitute can also be chosen at the ordering prompt. Tainted
         /// Remedy and Boon Reflection ("If you would gain life, you gain twice
         /// that much life instead.") both apply to P0's gain, so the player
-        /// orders them (CR 616.1). At `i32::MIN` both orders end in an
-        /// unrepresentable loss (lose 1, or gain 2 then lose 2); whichever
-        /// answer delivers it is rejected and the prompt stays answerable. At
-        /// `i32::MIN + 2` both orders apply.
+        /// orders them (CR 616.1). The overflow is in the lost-this-turn counter
+        /// (`u32::MAX`), never the life total: a life total at or below 0 would
+        /// make the action boundary's state-based actions end the game before
+        /// the prompt could be observed (CR 704.5a), so P0 stays at 20 life.
+        /// At `u32::MAX` both orders end in an unrepresentable loss (lose 1, or
+        /// gain 2 then lose 2); whichever answer delivers it is rejected and the
+        /// prompt stays answerable. At `u32::MAX - 2` both orders apply.
         #[test]
         fn debug_gain_resumed_substitute_loss_overflow_is_rejected_and_answerable() {
             let mut scenario = scenario();
-            scenario.with_life(P0, i32::MIN + 2);
             add_card(&mut scenario, P0, "Boon Reflection");
             add_card(&mut scenario, P1, "Tainted Remedy");
             let mut runner = debug_runner(scenario);
+            runner.state_mut().players[0].life_lost_this_turn = u32::MAX - 2;
             act_ok(&mut runner, gain(P0, 1));
             assert!(
                 replacement_prompt_open(&runner),
@@ -3957,18 +3960,22 @@ mod tests {
                 runner.state().waiting_for
             );
             answer_to_completion(&mut runner);
-            let accepted_life = life(&runner, P0);
+            let player = &runner.state().players[0];
             assert!(
-                accepted_life == i32::MIN + 1 || accepted_life == i32::MIN,
-                "Tainted first loses 1 (MIN + 1); Boon first gains 2 then loses 2 (MIN); got {accepted_life}"
+                (player.life, player.life_lost_this_turn) == (19, u32::MAX - 1)
+                    || (player.life, player.life_lost_this_turn) == (18, u32::MAX),
+                "Tainted first loses 1 (19, MAX - 1); Boon first gains 2 then loses 2 (18, MAX); \
+                 got ({}, {})",
+                player.life,
+                player.life_lost_this_turn
             );
 
             let mut scenario = self::scenario();
-            scenario.with_life(P0, i32::MIN);
             let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
             add_card(&mut scenario, P0, "Boon Reflection");
             add_card(&mut scenario, P1, "Tainted Remedy");
             let mut runner = debug_runner(scenario);
+            runner.state_mut().players[0].life_lost_this_turn = u32::MAX;
             act_ok(&mut runner, gain(P0, 1));
             assert!(
                 replacement_prompt_open(&runner),
@@ -3981,7 +3988,8 @@ mod tests {
                 "reach guard: a debug gain's parked proposal is stamped for rejection"
             );
             assert_choice_rejected_and_still_answerable(&mut runner, mate);
-            assert_eq!(life(&runner, P0), i32::MIN);
+            let player = &runner.state().players[0];
+            assert_eq!((player.life, player.life_lost_this_turn), (20, u32::MAX));
         }
 
         /// The sandbox audit log describes both actions (engine-owned wording).

@@ -2604,7 +2604,20 @@ mod tests {
             scenario.with_mana_pool(P0, vec![mana(ManaType::Black), mana(ManaType::Black)]);
             let mut runner = scenario.build();
             let outcome = runner.cast(sign).target_player(P1).resolve();
-            outcome.assert_hand_drawn(P1, 2);
+            // CR 800.4a: the lethal loss eliminates P1 at the boundary and their
+            // hand leaves the game with them, so the draw is read from its events
+            // (the final hand size is 0 either way). Draw precedes the loss.
+            let drawn = outcome
+                .events()
+                .iter()
+                .filter(|event| {
+                    matches!(event, GameEvent::CardDrawn { player_id, .. } if *player_id == P1)
+                })
+                .count();
+            assert_eq!(
+                drawn, 2,
+                "reach guard: the draw half must run before the loss"
+            );
             outcome.assert_life_delta(P1, -2);
             assert_eq!(runner.life(P1), 0);
             assert!(
