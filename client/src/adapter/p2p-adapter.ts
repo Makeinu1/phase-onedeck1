@@ -1780,6 +1780,17 @@ export class P2PHostAdapter implements EngineAdapter {
         this.armResumeGrace(pid);
       }
     }
+    // The run state was chosen from the persisted membership, before this
+    // correction. Bring it in step with the corrected one: an away seat pauses
+    // the game, and the last stale one leaving releases the pause it caused.
+    // Submissions enforce this value, so a stale pause would refuse every
+    // action indefinitely and a stale "running" would admit actions while a
+    // seat is away. A terminal or manually paused game is never touched.
+    if (this.disconnectedSeats.size > 0) {
+      if (this.gameRunState === "running") this.gameRunState = "paused-disconnect";
+    } else if (this.gameRunState === "paused-disconnect") {
+      this.resumeIfUnblocked();
+    }
   }
 
   /**
