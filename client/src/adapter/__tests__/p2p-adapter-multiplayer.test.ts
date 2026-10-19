@@ -9844,6 +9844,44 @@ describe("P2PHostAdapter — contest input", () => {
       adapter.dispose();
     });
 
+    it("keeps a dropped seat suspended when a reconciled Concede did not commit", async () => {
+      const { adapter, guest } = await startedNativeHostWithGuest();
+      const host = adapter as unknown as {
+        nativeBridge: { isGuestAttached: (playerId: number) => boolean };
+        disconnectedSeats: Map<number, unknown>;
+        eliminatedSeats: Set<number>;
+        concedingSeats: Set<number>;
+        gameRunState: string;
+      };
+      expect(host.nativeBridge.isGuestAttached(1)).toBe(true);
+
+      // A real drop: the host suspends the seat's loopback so the engine sees it gone.
+      guest.simulateClose();
+      await flushPromises(20);
+      expect(host.disconnectedSeats.has(1)).toBe(true);
+      expect(host.nativeBridge.isGuestAttached(1)).toBe(false);
+
+      // "Continue without them" reattaches the seat to send the Concede, whose
+      // response is lost; the fresh reconnect then proves it did not commit.
+      nativeWebSocketMocks.initializePregame
+        .mockResolvedValueOnce(NATIVE_GUEST_ATTACHMENT)
+        .mockResolvedValueOnce(NATIVE_GUEST_ATTACHMENT);
+      nativeWebSocketMocks.submitAction.mockRejectedValueOnce(new Error("response lost after send"));
+      const attachments = nativeWebSocketMocks.initializePregame.mock.calls.length;
+      await adapter.concedeDisconnected(1);
+
+      // Both the send and the reconciliation really reattached the seat ...
+      expect(nativeWebSocketMocks.initializePregame.mock.calls.length).toBe(attachments + 2);
+      expect(host.eliminatedSeats.has(1)).toBe(false);
+      expect(host.concedingSeats.has(1)).toBe(false);
+      // ... and, since the seat is still away, the engine authority sees it gone again.
+      expect(host.disconnectedSeats.has(1)).toBe(true);
+      expect(host.nativeBridge.isGuestAttached(1)).toBe(false);
+      expect(host.nativeBridge.isGuestAttached(0)).toBe(true);
+      expect(host.gameRunState).toBe("paused-disconnect");
+      adapter.dispose();
+    });
+
     /**
      * A started native game whose guest really dropped (its loopback seat is
      * suspended, so the revision barrier no longer waits on it and its cached

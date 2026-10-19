@@ -4958,13 +4958,23 @@ export class P2PHostAdapter implements EngineAdapter {
       }
       return { authoritative, views, fanoutAlreadyCompleted };
     };
+    // A dropped seat is reattached to the engine authority only to send or
+    // reconcile this Concede. When the Concede did not commit it is still away,
+    // so the authority must keep seeing it gone: its presence is read from the
+    // seat's own socket (contest clock and reconnect grace).
+    const suspendIfStillAway = () => {
+      if (this.disconnectedSeats.has(pid)) this.nativeBridge?.suspendGuest(pid);
+    };
     const settleFromAuthority = async (
       reconciliation: Awaited<ReturnType<typeof readAuthoritativeSeat>>,
     ): Promise<"committed" | "definite_non_commit"> => {
       const { authoritative, views, fanoutAlreadyCompleted } = reconciliation;
       const eliminated = (authoritative.snapshot.state.eliminated_players ?? []).includes(pid);
       const terminal = authoritative.snapshot.state.waiting_for.type === "GameOver";
-      if (!eliminated && !terminal) return "definite_non_commit";
+      if (!eliminated && !terminal) {
+        suspendIfStillAway();
+        return "definite_non_commit";
+      }
 
       if (eliminated) {
         committed = true;
@@ -4999,8 +5009,12 @@ export class P2PHostAdapter implements EngineAdapter {
           });
         }
       }
-      if (eliminated) void this.persistAuthoritativeState();
-      return eliminated ? "committed" : "definite_non_commit";
+      if (eliminated) {
+        void this.persistAuthoritativeState();
+        return "committed";
+      }
+      suspendIfStillAway();
+      return "definite_non_commit";
     };
     let committed = false;
     let keepFence = false;
@@ -5064,8 +5078,7 @@ export class P2PHostAdapter implements EngineAdapter {
             || isActionRejection(err.rejection)
           )
         ) {
-          // A dropped seat that was reattached only to send this Concede is still away.
-          if (this.disconnectedSeats.has(pid)) this.nativeBridge?.suspendGuest(pid);
+          suspendIfStillAway();
           this.resumeIfUnblocked();
           return "definite_non_commit";
         }
