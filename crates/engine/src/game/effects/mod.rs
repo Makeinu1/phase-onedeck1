@@ -1207,6 +1207,12 @@ pub(crate) fn settle_empty_forwarded_zone_result(state: &mut GameState, producer
 }
 
 pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
+    // replacement subtree has retired resumes before any further resolution
+    // work; every frame left on top of it is outer work.
+    if state.counter_cost_root_is_due() {
+        return;
+    }
     counters::drain_pending_counter_moves(state, events);
     counters::drain_pending_counter_removals(state, events);
     counters::drain_pending_counter_additions(state, events);
@@ -1387,7 +1393,12 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
             drain_pending_continuation(state, events);
             resume_resolution_frames(state, events);
         }
-        if !waits_for_resolution_choice(&state.waiting_for) {
+        // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
+        // replacement subtree has retired resumes before any further resolution
+        // work; every frame left on top of it is outer work. Once the subtree
+        // retired with the continuation that just ran, the paused dispatch on top
+        // belongs to an outer owner and stays paused.
+        if !waits_for_resolution_choice(&state.waiting_for) && !state.counter_cost_root_is_due() {
             // CR 615.5: a resumed continuation completes its own paused
             // resident drain only after it has not raised another choice.
             state.finish_active_paused_post_replacement_dispatch();
@@ -1400,6 +1411,12 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
                 drain_pending_continuation(state, events);
             }
         }
+    }
+    // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
+    // replacement subtree has retired resumes before any further resolution
+    // work; every frame left on top of it is outer work.
+    if state.counter_cost_root_is_due() {
+        return;
     }
     // CR 701.38d: Resume per-ballot vote iteration after an interactive
     // choice resolves. Must run after change_zone_iteration (which may be
@@ -1657,6 +1674,12 @@ pub(crate) fn resume_resolution_frames(state: &mut GameState, events: &mut Vec<G
         if waits_for_resolution_choice(&state.waiting_for) {
             state.resolution_stack.note_repeat_until_descendant_choice();
         }
+        return;
+    }
+    // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
+    // replacement subtree has retired resumes before any further resolution
+    // work; every frame left on top of it is outer work.
+    if state.counter_cost_root_is_due() {
         return;
     }
 
@@ -2508,7 +2531,15 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
         // landed us back at Priority (no further replacement choice), B1-drain the
         // deferred observer triggers parked during earlier pause segments plus the
         // ones this resume produced; otherwise leave them parked for the next drain.
-        let trigger_events: Vec<GameEvent> = events[events_before_drain..]
+        //
+        // CR 601.2h + CR 603.3: a live announcement takes custody of the span it
+        // owns; only the rest is collected here.
+        let owned = crate::game::announcement_triggers::take_inline_trigger_span(
+            state,
+            events,
+            events_before_drain,
+        );
+        let trigger_events: Vec<GameEvent> = events[owned]
             .iter()
             .filter(|ev| {
                 !matches!(
@@ -13088,6 +13119,18 @@ fn optional_effect_is_infeasible(state: &GameState, ability: &ResolvedAbility) -
             }
             false
         }
+        // CR 115.10a + CR 608.2d: "you may have it deal 2 damage to another
+        // creature you control. If you do, draw a card" names its recipient with
+        // no "target", so it is chosen as the damage is applied — and "The player
+        // can't choose an option that's illegal or impossible". With no creature
+        // or player to choose, accepting would record a performed effect for a
+        // no-op and run the "If you do" rider anyway (Wicked Guardian drawing a
+        // card with no other creature), which the targeted reading never allowed:
+        // with no legal target the ability was not put on the stack at all.
+        Effect::DealDamage { .. } => {
+            deal_damage::awaits_resolution_recipient_choice(ability)
+                && deal_damage::resolution_recipient_candidates(state, ability).is_empty()
+        }
         _ => false,
     }
 }
@@ -16240,9 +16283,17 @@ pub(crate) fn resolve_ability_chain_step(
     // before it begins a new resolution; nested producers replace the context
     // after this node's effect completes.
     let root_context_owned;
-    let ability = if depth == 0 && ability.context.forwarded_result_context.is_some() {
+    let mut cost_removed_seed = None;
+    let ability = if depth == 0
+        && (ability.context.forwarded_result_context.is_some()
+            || ability.context.cost_removed_counter_amount.is_some())
+    {
         let mut owned = ability.clone();
         owned.context.forwarded_result_context = None;
+        // CR 602.2b + CR 601.2h + CR 608.2h: the cost-removed count is a
+        // root-only input; take it off the root so no hand-off or handler-local
+        // context clone carries it into a continuation that could reseed.
+        cost_removed_seed = owned.context.cost_removed_counter_amount.take();
         root_context_owned = owned;
         &root_context_owned
     } else {
@@ -16257,6 +16308,12 @@ pub(crate) fn resolve_ability_chain_step(
     // across unrelated ability resolutions.
     if depth == 0 {
         reset_top_level_resolution_state(state);
+        // CR 602.2b + CR 601.2h + CR 608.2h: counters removed to pay this
+        // activation's cost are the preceding "this way" amount its instructions
+        // read; a later producer re-stamps per CR 608.2c.
+        if let Some(n) = cost_removed_seed {
+            state.last_effect_amount = Some(crate::game::arithmetic::u32_to_i32_saturating(n));
+        }
     }
 
     // CR 700.2 ("each of those options is a mode") + CR 608.2c (instructions in
@@ -18428,6 +18485,51 @@ fn resolve_chain_body(
                         return Ok(ResolutionProgress::Waiting);
                     }
                 }
+            }
+        }
+    }
+
+    // CR 115.10a + CR 608.2d + CR 609.3: an untargeted described damage
+    // recipient ("a creature or player", "another creature you control" — no
+    // literal "target") is chosen while the damage is APPLIED, at THIS
+    // instruction's own resolution, not announced when the ability went on the
+    // stack. `target_choice_timing_for_clause` (parser) marks such a clause
+    // `Resolution` by the same `names_resolution_chosen_recipient` shape
+    // `awaits_resolution_recipient_choice` reads here, so the two cannot drift.
+    // Mirrors the untargeted `PutCounter` block above: zero candidates is a
+    // silent no-op ("The player can't choose an option that's illegal or
+    // impossible"), a single candidate is forced and binds without a prompt, and
+    // several raise the controller's prompt, parking this node as the
+    // continuation the answer binds. The amount is read once, when the damage is
+    // applied after the pick (CR 608.2h), before any later clause of the chain
+    // (CR 608.2c). Candidates are a plain scan of the live population, never
+    // targeting legality — hexproof, shroud and protection restrict neither the
+    // prompt nor the choice (CR 115.10a); protection only prevents the damage
+    // (CR 702.16e).
+    if deal_damage::awaits_resolution_recipient_choice(ability) {
+        let candidates = deal_damage::resolution_recipient_candidates(state, ability);
+        match candidates.len() {
+            0 => {}
+            1 => {
+                // Re-enter the body, not the chain entry: the depth-0 prelude
+                // (the per-ability resolution counter among it) already ran for
+                // this resolution and must not run twice.
+                let mut bound = ability.clone();
+                bound.set_unpinned_targets(candidates);
+                return resolve_chain_body(state, &bound, events, depth);
+            }
+            _ => {
+                let mut parked = ability.clone();
+                deal_damage::bind_recipient_pool(&mut parked, &candidates);
+                state.park_ability_continuation(PendingContinuation::new(Box::new(parked), state));
+                state.waiting_for = WaitingFor::ChooseObjectsSelection {
+                    player: ability.controller,
+                    eligible: candidates,
+                    min: 1,
+                    max: Some(1),
+                    trigger_event: state.current_trigger_event.clone(),
+                };
+                return Ok(ResolutionProgress::Waiting);
             }
         }
     }

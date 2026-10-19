@@ -2702,15 +2702,21 @@ fn try_parse_lose_control_delayed_trigger(
     ))
 }
 
-/// CR 122.1 + CR 608.2c: "it enters with an additional +1/+1 counter on it" rider
-/// after a zone-change-this-way gate (Winter Soldier, Reborn Avenger). Valid only
-/// under its battlefield-mover producer: reached solely through
-/// `entry_counter_rider_clause`, so its `ParentTarget` always names the object
-/// the preceding `ChangeZone` moved (and is folded into that move).
+/// CR 122.1 + CR 608.2c + CR 614.12: an additional entry-counter rider bound to
+/// its battlefield-mover producer. `entry_counter_rider_clause` reads a gated
+/// rider (Winter Soldier, Reborn Avenger), whose `ParentTarget` is folded into
+/// the move by `lower::fold_enters_this_way_counter_rider`.
+/// `sequence::parse_moved_object_entry_counters_continuation` reads an unconditional
+/// rider after a battlefield mover, using only its counter type and count to
+/// modify how each moved object enters.
 fn try_parse_enters_this_way_additional_counter(lower: &str) -> Option<Effect> {
     let (rest, _) = alt((
         tag::<_, _, OracleError<'_>>("that creature enters with "),
         tag("it enters with "),
+        // CR 608.2c: the distributive plural anaphor after a multi-object mover
+        // ("Each of them enters with …" — Aberrant Return) names every object that
+        // mover put onto the battlefield.
+        tag("each of them enters with "),
     ))
     .parse(lower.trim())
     .ok()?;
@@ -4378,6 +4384,11 @@ fn try_parse_cast_this_way_enters_rider(lower: &str) -> Option<ParsedEffectClaus
 /// 2. a battlefield mover whose rider is gated on an object entering this way
 ///    (Heroic Return, Recommission) — `lower::entry_rider_folds_into`, the
 ///    predicate the fold into `ChangeZone.conditional_enter_with_counters` uses.
+/// 3. (not dispatched here) an UNCONDITIONAL rider directly after a battlefield
+///    `ChangeZone` is read as a followup continuation
+///    (`sequence::parse_moved_object_entry_counters_continuation` →
+///    `TokenEntersWithCounters`), patching the mover's `enter_with_counters`;
+///    this function returns `None` for it (no condition).
 ///
 /// The first arm whose producer holds owns the clause; when its recognizer
 /// declines, the clause falls to the generic path rather than to a later arm
@@ -17140,6 +17151,15 @@ fn clause_is_additional_land_permission(clause: &ParsedEffectClause) -> bool {
     )
 }
 
+/// CR 606.3 + CR 101.1: "You may activate [recipient]'s loyalty ability N more
+/// times this turn" grants the permission to make the activations later. Its
+/// "may" is that later activation (CR 608.2d), not a choice made while the grant
+/// resolves, so the grant lowers as mandatory. The parsed effect is the detector,
+/// so no clause text is inspected.
+fn clause_is_extra_loyalty_activation_grant(clause: &ParsedEffectClause) -> bool {
+    matches!(&clause.effect, Effect::GrantExtraLoyaltyActivations { .. })
+}
+
 /// CR 116.2c: no longer the PRIMARY path for the mana-cost shape — that clause is
 /// now absorbed into `Effect::GenericEffect.end_cost` by the `EndEffectCost`
 /// continuation. Kept as defense-in-depth for the non-mana shape (a hypothetical
@@ -22432,6 +22452,7 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
         sub_text,
         continuation_ctx.declared_target_choice_timing,
         sub_clause.multi_target.is_some(),
+        continuation_ctx.target_selection_mode,
     );
     let mut sub_ability = AbilityDefinition::new(AbilityKind::Spell, sub_clause.effect);
     sub_ability.target_choice_timing = continuation_timing;
@@ -46189,6 +46210,11 @@ fn parse_effect_chain_ir_body(
         // CR 601.3: a granted graveyard cast permission ("you may cast <type>
         // spells from your graveyard this turn") lets the player cast later; its
         // "may" is that later cast, not a choice made at resolution (CR 608.2d).
+        //
+        // CR 606.3 + CR 101.1: the same holds for an extra loyalty-activation
+        // grant ("you may activate ~'s loyalty ability two more times this turn"):
+        // the "may" is the later activation, and the grant itself is mandatory
+        // (`clause_is_extra_loyalty_activation_grant`).
         let is_optional = if matches!(&clause.effect, Effect::FreeCastFromZones { .. })
             || crate::parser::oracle_ir::ast::is_graveyard_permission_grant(&clause.effect)
             || matches!(
@@ -46207,6 +46233,7 @@ fn parse_effect_chain_ir_body(
                 }
             )
             || clause_is_additional_land_permission(&clause)
+            || clause_is_extra_loyalty_activation_grant(&clause)
             || clause_is_pay_to_end_effect_termination(normalized_text)
         {
             false

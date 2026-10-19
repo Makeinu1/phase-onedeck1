@@ -3473,14 +3473,27 @@ mod tests {
         }
     }
 
-    /// v153: `DebugAction` gains `GainLife` / `LoseLife` (Sandbox life changes
-    /// through the CR 119.3 events), carried in `GameAction::Debug`; a v152 peer
+    /// v155: `DebugAction` gains `GainLife` / `LoseLife` (Sandbox life changes
+    /// through the CR 119.3 events), carried in `GameAction::Debug`; a v154 peer
     /// cannot parse the tags, so it must be refused before it can receive or
     /// send one. A parked replacement also records whether its life event came
     /// from such an action (`PendingReplacement.unrepresentable_life_change`,
     /// `"Reject"`, omitted when ordinary), so its resumed delivery rejects an
-    /// unrepresentable result. P2P moves in lockstep (wire 135); lobby messages
+    /// unrepresentable result. P2P moves in lockstep (wire 137); lobby messages
     /// unchanged.
+    ///
+    /// v154: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
+    /// counter-removal cost paused on a CR 616.1 replacement choice, whose
+    /// settled count the activation reads, CR 118.11) and
+    /// `ManaAbilityCostCursor` gains `counter_removal`, both carried in
+    /// `GameState::pending_cost_move_resume`; a v153 peer cannot parse the new
+    /// tag, so it must be refused before it receives v154 state;
+    /// `PausedCounterCostRemoval` carries its `replacement_subtree` boundary.
+    ///
+    /// v153: `GrantAllActivatedAbilitiesOf` gains the optional `kind` selector
+    /// and the loyalty-grant sibling variant is removed. A v152 peer
+    /// drops the defaulted field silently and over-grants, so it must be
+    /// refused before it receives v153 state.
     ///
     /// v152: `ShortcutDecisionSchema` gains `suggested_declaration` and
     /// `leading_aims`, and `ShortcutProposal` gains `leading_aims`; a v151 peer
@@ -3726,8 +3739,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_153_for_sandbox_life_debug_actions() {
-        assert_eq!(PROTOCOL_VERSION, 153);
+    fn protocol_version_is_155_for_sandbox_life_debug_actions() {
+        assert_eq!(PROTOCOL_VERSION, 155);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3738,7 +3751,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_153_for_sandbox_life_debug_actions` stays
+    /// `protocol_version_is_155_for_sandbox_life_debug_actions` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

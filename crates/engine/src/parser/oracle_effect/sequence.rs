@@ -2844,6 +2844,15 @@ fn starts_clause_text_lower(s: &str) -> bool {
         return false;
     }
 
+    // CR 608.2c + CR 107.7: a loyalty symbol written in effect text ("[−2]") is an
+    // instruction of its own — "..., then [−2]." puts or removes loyalty counters
+    // after the instruction before it (Comet, Stellar Pup's face-4/5 row) — so it
+    // starts a clause, and the ", then" before it is a clause boundary. The symbol
+    // combinator is the detector: the verb lexicon below holds words, not notation.
+    if nom_primitives::parse_loyalty_symbol_delta(s).is_ok() {
+        return true;
+    }
+
     // CR 708.7 + CR 708.8: "turn <object> face up|down" face-toggle clause-starter
     // (Yarus, Roar of the Old Gods). A complete toggle shape is always its own
     // clause ("..., then turn it face up"), so it must split off to reach the
@@ -6323,8 +6332,15 @@ pub(super) fn apply_clause_continuation(
             let Some(previous) = defs.last_mut() else {
                 return;
             };
-            // CR 122.6a: Patch the preceding Token effect to enter with counters.
+            // CR 122.6 + CR 614.12: an entry-counter rider patches the preceding
+            // producer's entry counters — a created token (CR 122.6a), or every object a
+            // battlefield mover puts onto the battlefield.
             if let Effect::Token {
+                enter_with_counters,
+                ..
+            }
+            | Effect::ChangeZone {
+                destination: Zone::Battlefield,
                 enter_with_counters,
                 ..
             } = &mut *previous.effect
@@ -8270,6 +8286,32 @@ fn parse_change_zone_enters_tapped_attacking(
     })
 }
 
+/// CR 614.12 + CR 122.6 + CR 608.2c: an UNCONDITIONAL entry-counter rider after a
+/// battlefield mover — "<it | that creature | each of them> enters with <an
+/// additional | N additional> <+1/+1 | -1/-1> counter(s) on it" (Aberrant Return).
+/// The rider modifies how each object the mover puts onto the battlefield enters
+/// (a replacement effect from another source, CR 614.12), so it lowers onto the
+/// mover's `enter_with_counters`, which the resolver applies to every moved object
+/// at move time. The grammar is the single rider authority
+/// (`try_parse_enters_this_way_additional_counter`): anchored at the subject and
+/// required to consume the whole sentence, so a gated rider ("If a Hero enters
+/// this way, …", "… if it's a creature") or a trailing quantity ("… for each …")
+/// declines here and keeps its existing handling.
+fn parse_moved_object_entry_counters_continuation(lower: &str) -> Option<ContinuationAst> {
+    let Effect::PutCounter {
+        counter_type,
+        count,
+        ..
+    } = super::try_parse_enters_this_way_additional_counter(lower)?
+    else {
+        return None;
+    };
+    Some(ContinuationAst::TokenEntersWithCounters {
+        counter_type,
+        count,
+    })
+}
+
 /// CR 614.12: returns true when `sentence` is a moved-object type-conditional
 /// enters-modifier clause — a leading "if that card is a/an <type>" (or
 /// "it's/it is a/an <type>") gating an "enters tapped and attacking" tail
@@ -9198,6 +9240,14 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
         } if matches_put_rest_on_bottom_line(&lower) =>
         {
             Some(ContinuationAst::PutChoiceRemainderOnBottom)
+        }
+        // CR 614.12 + CR 122.6: an unconditional "… enters with … counter(s) on it"
+        // rider after a battlefield mover becomes that mover's own entry counters.
+        Effect::ChangeZone {
+            destination: Zone::Battlefield,
+            ..
+        } if let Some(continuation) = parse_moved_object_entry_counters_continuation(&lower) => {
+            Some(continuation)
         }
         // CR 708.2a + CR 205.1a: "They're N/M [types] [subtypes] creatures." (plural,
         // Cyber-Controller) or "It's a/an [types] [subtype] <core-type>." (singular,
@@ -16810,5 +16860,85 @@ mod leading_duration_guard_tests_7923 {
             1,
             "a serial-list subject is one clause"
         );
+    }
+}
+
+/// CR 608.2c + CR 107.7: a loyalty symbol written in effect text ("[−2]") starts a
+/// clause of its own, so "..., then [−2]." splits into the instruction and the
+/// symbol and the instruction's amount is read before the counters are removed.
+#[cfg(test)]
+mod loyalty_symbol_clause_start_tests {
+    use super::super::parse_effect_chain;
+    use super::*;
+
+    /// The face-4/5 row of Comet, Stellar Pup with the name normalized.
+    const DAMAGE_THEN_SYMBOL: &str = "~ deals damage equal to the number of loyalty counters on him to a creature or player, then [\u{2212}2].";
+
+    /// The symbol starts a clause; the notation that is not the symbol does not.
+    /// The first assertion is the reach-guard: the verb lexicon still answers.
+    #[test]
+    fn a_loyalty_symbol_starts_a_clause_and_only_the_symbol_does() {
+        assert!(starts_clause_text("create a token"), "reach-guard");
+        for symbol in [
+            "[\u{2212}2]",
+            "[\u{2212}2].",
+            "[+1], and you may activate ~'s loyalty ability two more times this turn.",
+            "[-1]",
+        ] {
+            assert!(starts_clause_text(symbol), "{symbol:?}");
+        }
+        for not_a_clause in [
+            "[0]",
+            "[1]",
+            "[+x]",
+            "[",
+            "[]",
+            "plus [\u{2212}2]",
+            "(\u{2212}2)",
+        ] {
+            assert!(!starts_clause_text(not_a_clause), "{not_a_clause:?}");
+        }
+    }
+
+    /// ", then [−2]" is a clause boundary: the damage clause and the symbol are two
+    /// chunks. The paired positive is the same sentence ending in a verb clause,
+    /// which splits the same way, so the symbol is no special case of the splitter.
+    #[test]
+    fn then_a_loyalty_symbol_is_its_own_chunk() {
+        let verb = split_clause_sequence(
+            "~ deals damage equal to the number of loyalty counters on him to a creature or player, then draw a card.",
+        );
+        assert_eq!(verb.len(), 2, "reach-guard: {verb:?}");
+
+        let symbol = split_clause_sequence(DAMAGE_THEN_SYMBOL);
+        assert_eq!(symbol.len(), 2, "{symbol:?}");
+    }
+
+    /// The face-4/5 chain: the damage reads Comet's loyalty when it is applied and
+    /// the `[−2]` that follows is the next node (CR 608.2c + CR 608.2h), removing
+    /// exactly two (never the "remove all" sentinel).
+    #[test]
+    fn the_damage_clause_is_followed_by_the_symbol_as_its_sub_ability() {
+        let def = parse_effect_chain(DAMAGE_THEN_SYMBOL, AbilityKind::Spell);
+        assert!(
+            matches!(&*def.effect, Effect::DealDamage { .. }),
+            "{def:#?}"
+        );
+        let removal = def
+            .sub_ability
+            .as_deref()
+            .expect("the symbol is its own clause");
+        assert!(
+            matches!(
+                &*removal.effect,
+                Effect::RemoveCounter {
+                    counter_type: Some(CounterType::Loyalty),
+                    count: QuantityExpr::Fixed { value: 2 },
+                    target: TargetFilter::SelfRef,
+                }
+            ),
+            "{def:#?}"
+        );
+        assert!(removal.sub_ability.is_none(), "{def:#?}");
     }
 }
