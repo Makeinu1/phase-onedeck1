@@ -67,7 +67,9 @@ pub struct TournamentRequestId(pub u64);
 ///      `ClientMessage::Action`. A v154 peer cannot parse either tag — a
 ///      conditional PARSE bump like 76/79, breaking only while one of these
 ///      actions is actually sent. A parked replacement records whether its
-///      life event came from such an action, so its resumed delivery rejects
+///      life event came from an action-ingress life change (a Sandbox life
+///      action, paying life, or a loop shortcut's life axis), so its resumed
+///      delivery rejects
 ///      an unrepresentable result: `GameState` gains one optional key inside
 ///      `pending_replacement` (`unrepresentable_life_change`, `"Reject"`,
 ///      omitted when ordinary). Full-game peers and P2P move in lockstep

@@ -3477,7 +3477,8 @@ mod tests {
     /// through the CR 119.3 events), carried in `GameAction::Debug`; a v154 peer
     /// cannot parse the tags, so it must be refused before it can receive or
     /// send one. A parked replacement also records whether its life event came
-    /// from such an action (`PendingReplacement.unrepresentable_life_change`,
+    /// from an action-ingress life change (a Sandbox life action, paying life, or
+    /// a loop shortcut's life axis) (`PendingReplacement.unrepresentable_life_change`,
     /// `"Reject"`, omitted when ordinary), so its resumed delivery rejects an
     /// unrepresentable result. P2P moves in lockstep (wire 137); lobby messages
     /// unchanged.

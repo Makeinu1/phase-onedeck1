@@ -109,7 +109,8 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  *  137 — action and preview_mana_payment carry GameAction, whose Debug payload
  *       gains DebugAction GainLife / LoseLife, and game_setup / state_update
  *       carry a parked replacement that records whether its life event came
- *       from such an action (pending_replacement.unrepresentable_life_change,
+ *       from an action-ingress life change (a Sandbox life action, paying life,
+ *       or a loop shortcut's life axis) (pending_replacement.unrepresentable_life_change,
  *       "Reject", omitted when ordinary). A v136 peer cannot parse the new
  *       tags, so first contact rejects the skew. Bumped in lockstep with
  *       full-game protocol 155.

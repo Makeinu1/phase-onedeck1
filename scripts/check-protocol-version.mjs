@@ -96,7 +96,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // v152 adds `ShortcutDecisionSchema.suggested_declaration` and `.leading_aims`, and
 // `ShortcutProposal.leading_aims`.
 // v155 adds the DebugAction GainLife / LoseLife sandbox action tags, and a parked
-// replacement records whether its life event came from such an action
+// replacement records whether its life event came from an action-ingress life
+// change (a Sandbox life action, paying life, or a loop shortcut's life axis)
 // (`PendingReplacement.unrepresentable_life_change`, "Reject", omitted when
 // ordinary), so its resumed delivery rejects an unrepresentable result.
 // Keep the measured base so a future merge cannot collapse independent wire
@@ -202,8 +203,9 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +83: v154 adds `PendingCostMoveResume::CounterCostRemovalPayment` and
 //      `ManaAbilityCostCursor.counter_removal` to GameState.
 // +84: v155 adds the DebugAction GainLife / LoseLife action tags, and a parked
-//      replacement records whether its life event came from such an action
-//      (`PendingReplacement.unrepresentable_life_change`, "Reject", omitted when
+//      replacement records whether its life event came from an action-ingress
+//      life change (a Sandbox life action, paying life, or a loop shortcut's life
+//      axis) (`PendingReplacement.unrepresentable_life_change`, "Reject", omitted when
 //      ordinary), so its resumed delivery rejects an unrepresentable result.
 const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 84;
 // The LOBBY message-set version, not derived from the full-game number above.
