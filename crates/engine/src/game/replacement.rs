@@ -16169,6 +16169,414 @@ mod tests {
         }
     }
 
+    /// `Ref { EventContextAmount }`: the replaced event's amount.
+    fn event_amount_expr() -> QuantityExpr {
+        QuantityExpr::Ref {
+            qty: QuantityRef::EventContextAmount,
+        }
+    }
+
+    fn life_gain_event(amount: u32) -> ProposedEvent {
+        ProposedEvent::LifeGain {
+            player_id: PlayerId(0),
+            amount,
+            applied: HashSet::new(),
+        }
+    }
+
+    fn life_loss_event(amount: u32) -> ProposedEvent {
+        ProposedEvent::LifeLoss {
+            player_id: PlayerId(1),
+            amount,
+            applied: HashSet::new(),
+        }
+    }
+
+    /// A `quantity_modification` life replacement applying to every player.
+    fn life_qmod_def(
+        event: ReplacementEvent,
+        modification: QuantityModification,
+    ) -> ReplacementDefinition {
+        let mut repl = ReplacementDefinition::new(event).quantity_modification(modification);
+        repl.valid_player = Some(ReplacementPlayerScope::AnyPlayer);
+        repl
+    }
+
+    /// Runs `event` through `replace_event` over one source (`ObjectId(10)`)
+    /// carrying `defs`; returns the resulting amount and the overflow record.
+    fn replace_life_amount(
+        defs: Vec<ReplacementDefinition>,
+        event: ProposedEvent,
+    ) -> (
+        u32,
+        Option<crate::types::game_state::ReplacementQuantityOverflow>,
+    ) {
+        let mut state = test_state_with_object(ObjectId(10), Zone::Battlefield, defs);
+        let mut events = Vec::new();
+        let result = replace_event(&mut state, event, &mut events);
+        let (ReplacementResult::Execute(ProposedEvent::LifeGain { amount, .. })
+        | ReplacementResult::Execute(ProposedEvent::LifeLoss { amount, .. })) = result
+        else {
+            panic!("expected Execute of a life event, got {result:?}");
+        };
+        (amount, state.replacement_quantity_overflow)
+    }
+
+    fn overflow_from(
+        source: ObjectId,
+    ) -> Option<crate::types::game_state::ReplacementQuantityOverflow> {
+        Some(crate::types::game_state::ReplacementQuantityOverflow { source })
+    }
+
+    /// CR 101.3: a `Times` / `Plus` or computed gain that does not fit is
+    /// recorded for the settle step and the event is left unchanged (never
+    /// clamped to `u32::MAX` or wrapped through `i32`).
+    #[test]
+    fn gain_life_applier_overflow_sets_the_carrier_and_leaves_the_event_unchanged() {
+        let times = || life_qmod_def(ReplacementEvent::GainLife, QuantityModification::DOUBLE);
+        let plus = || {
+            life_qmod_def(
+                ReplacementEvent::GainLife,
+                QuantityModification::Plus { value: 1 },
+            )
+        };
+        let branch2 = || {
+            ReplacementDefinition::new(ReplacementEvent::GainLife).execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GainLife {
+                    amount: QuantityExpr::Multiply {
+                        factor: 2,
+                        inner: Box::new(event_amount_expr()),
+                    },
+                    player: TargetFilter::Controller,
+                },
+            ))
+        };
+        let src = ObjectId(10);
+
+        // Branch 1, Times: 2^31 x 2 does not fit a u32.
+        assert_eq!(
+            replace_life_amount(vec![times()], life_gain_event(2_147_483_648)),
+            (2_147_483_648, overflow_from(src))
+        );
+        // A u32 above i32::MAX is representable in the applier; the settle
+        // step, not the applier, decides.
+        assert_eq!(
+            replace_life_amount(vec![times()], life_gain_event(2_000_000_000)),
+            (4_000_000_000, None)
+        );
+        // Branch 1, Plus.
+        assert_eq!(
+            replace_life_amount(vec![plus()], life_gain_event(u32::MAX)),
+            (u32::MAX, overflow_from(src))
+        );
+        assert_eq!(
+            replace_life_amount(vec![plus()], life_gain_event(u32::MAX - 1)),
+            (u32::MAX, None)
+        );
+        // Branch 2 (parsed `Multiply { 2, EventContextAmount }`): 2.4e9 > i32::MAX.
+        assert_eq!(
+            replace_life_amount(vec![branch2()], life_gain_event(1_200_000_000)),
+            (1_200_000_000, overflow_from(src))
+        );
+        assert_eq!(
+            replace_life_amount(vec![branch2()], life_gain_event(1_000_000_000)),
+            (2_000_000_000, None)
+        );
+        // Branch 2 on an event amount that is itself above i32::MAX: the old
+        // `as i32` wrapped it into a silent 0 gain.
+        assert_eq!(
+            replace_life_amount(vec![branch2()], life_gain_event(3_000_000_000)),
+            (3_000_000_000, overflow_from(src))
+        );
+        // Siblings: `Half` and `Minus` never record.
+        for modification in [
+            QuantityModification::Half,
+            QuantityModification::Minus { value: 5 },
+        ] {
+            let (_, carrier) = replace_life_amount(
+                vec![life_qmod_def(ReplacementEvent::GainLife, modification)],
+                life_gain_event(3),
+            );
+            assert_eq!(carrier, None);
+        }
+        // A def whose quantity is not statically resolvable passes through.
+        let not_static =
+            ReplacementDefinition::new(ReplacementEvent::GainLife).execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GainLife {
+                    amount: QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCount {
+                            filter: TargetFilter::Any,
+                        },
+                    },
+                    player: TargetFilter::Controller,
+                },
+            ));
+        assert_eq!(
+            replace_life_amount(vec![not_static], life_gain_event(7)),
+            (7, None)
+        );
+    }
+
+    /// Loss twin of the gain row, including Branch 3 (`LoseLife { Multiply }`).
+    #[test]
+    fn lose_life_applier_overflow_sets_the_carrier_and_leaves_the_event_unchanged() {
+        let times = || life_qmod_def(ReplacementEvent::LoseLife, QuantityModification::DOUBLE);
+        let plus = || {
+            life_qmod_def(
+                ReplacementEvent::LoseLife,
+                QuantityModification::Plus { value: 1 },
+            )
+        };
+        let branch3 = || {
+            let mut repl = ReplacementDefinition::new(ReplacementEvent::LoseLife).execute(
+                AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::LoseLife {
+                        amount: QuantityExpr::Multiply {
+                            factor: 2,
+                            inner: Box::new(event_amount_expr()),
+                        },
+                        target: None,
+                    },
+                ),
+            );
+            repl.valid_player = Some(ReplacementPlayerScope::AnyPlayer);
+            repl
+        };
+        let src = ObjectId(10);
+
+        assert_eq!(
+            replace_life_amount(vec![times()], life_loss_event(2_147_483_648)),
+            (2_147_483_648, overflow_from(src))
+        );
+        assert_eq!(
+            replace_life_amount(vec![times()], life_loss_event(2_000_000_000)),
+            (4_000_000_000, None)
+        );
+        assert_eq!(
+            replace_life_amount(vec![plus()], life_loss_event(u32::MAX)),
+            (u32::MAX, overflow_from(src))
+        );
+        assert_eq!(
+            replace_life_amount(vec![plus()], life_loss_event(u32::MAX - 1)),
+            (u32::MAX, None)
+        );
+        assert_eq!(
+            replace_life_amount(vec![branch3()], life_loss_event(1_200_000_000)),
+            (1_200_000_000, overflow_from(src))
+        );
+        assert_eq!(
+            replace_life_amount(vec![branch3()], life_loss_event(1_000_000_000)),
+            (2_000_000_000, None)
+        );
+    }
+
+    /// The checked resolver reports an overflow per arm, never clamping or
+    /// wrapping; representable boundaries and non-static refs are unchanged.
+    #[test]
+    fn try_resolve_event_replacement_quantity_reports_overflow_per_arm() {
+        use crate::types::ability::RoundingMode;
+        let fixed = |value: i32| QuantityExpr::Fixed { value };
+        let event = Box::new(event_amount_expr());
+        let overflow = Err(EventQuantityError::Overflow);
+
+        // EventContextAmount above i32::MAX (base: `as i32` wrapped).
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&event_amount_expr(), 3_000_000_000),
+            overflow
+        );
+        // Offset.
+        let offset = QuantityExpr::Offset {
+            inner: event.clone(),
+            offset: 1,
+        };
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&offset, i32::MAX as u32),
+            overflow
+        );
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&offset, i32::MAX as u32 - 1),
+            Ok(i32::MAX)
+        );
+        // Multiply.
+        let multiply = QuantityExpr::Multiply {
+            factor: 2,
+            inner: event.clone(),
+        };
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&multiply, 1_100_000_000),
+            overflow
+        );
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&multiply, 1_000_000_000),
+            Ok(2_000_000_000)
+        );
+        // Sum.
+        let sum = QuantityExpr::Sum {
+            exprs: vec![event_amount_expr(), fixed(1)],
+        };
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&sum, i32::MAX as u32),
+            overflow
+        );
+        // DivideRounded Up: `value + divisor - 1` overflowed in the base.
+        let divide_up = QuantityExpr::DivideRounded {
+            inner: Box::new(fixed(i32::MAX)),
+            divisor: 2,
+            rounding: RoundingMode::Up,
+        };
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&divide_up, 0),
+            overflow
+        );
+        let divide_up_ok = QuantityExpr::DivideRounded {
+            inner: Box::new(fixed(7)),
+            divisor: 2,
+            rounding: RoundingMode::Up,
+        };
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&divide_up_ok, 0),
+            Ok(4)
+        );
+        // A divisor above i32::MAX is not an overflow of the quotient.
+        let huge_divisor = QuantityExpr::DivideRounded {
+            inner: Box::new(fixed(7)),
+            divisor: u32::MAX,
+            rounding: RoundingMode::Down,
+        };
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&huge_divisor, 0),
+            Err(EventQuantityError::NotStatic)
+        );
+        // Power: 2^31 overflows (base clamped to i32::MAX); 2^30 fits.
+        let power = |exponent: i32| QuantityExpr::Power {
+            base: 2,
+            exponent: Box::new(fixed(exponent)),
+        };
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&power(31), 0),
+            overflow
+        );
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&power(30), 0),
+            Ok(1_073_741_824)
+        );
+        // Difference: `i32::MIN - 1` overflowed; the gap of 5 and 9 is 4.
+        let difference = |l: i32, r: i32| QuantityExpr::Difference {
+            left: Box::new(fixed(l)),
+            right: Box::new(fixed(r)),
+        };
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&difference(i32::MIN, 1), 0),
+            overflow
+        );
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&difference(5, 9), 0),
+            Ok(4)
+        );
+        // A non-static ref stays NotStatic.
+        let not_static = QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Any,
+            },
+        };
+        assert_eq!(
+            try_resolve_event_replacement_quantity(&not_static, 0),
+            Err(EventQuantityError::NotStatic)
+        );
+
+        // The lenient wrapper (non-life count replacements) folds an overflow
+        // to `None`, i.e. "count unchanged" for every caller.
+        assert_eq!(
+            resolve_event_replacement_quantity(&multiply, 1_100_000_000),
+            None
+        );
+        assert_eq!(
+            resolve_event_replacement_quantity(&multiply, 1_000_000_000),
+            Some(2_000_000_000)
+        );
+    }
+
+    /// Non-life count replacements keep the lenient fallback: an overflowing
+    /// mill count stays unchanged (no ingress contract for a non-life count).
+    #[test]
+    fn mill_applier_overflow_falls_back_to_the_unchanged_count() {
+        let repl =
+            ReplacementDefinition::new(ReplacementEvent::Mill).execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Mill {
+                    count: QuantityExpr::Multiply {
+                        factor: 2,
+                        inner: Box::new(event_amount_expr()),
+                    },
+                    target: TargetFilter::Controller,
+                    destination: Zone::Graveyard,
+                },
+            ));
+        let mut state = test_state_with_object(ObjectId(10), Zone::Battlefield, vec![repl]);
+        let mut events = Vec::new();
+        let rid = ReplacementId {
+            source: ObjectId(10),
+            index: 0,
+        };
+        for (count, expected) in [(1_500_000_000u32, 1_500_000_000u32), (1_000_000, 2_000_000)] {
+            let ApplyResult::Modified(ProposedEvent::Mill {
+                count: new_count, ..
+            }) = mill_applier(
+                ProposedEvent::Mill {
+                    player_id: PlayerId(0),
+                    count,
+                    destination: Zone::Graveyard,
+                    applied: HashSet::new(),
+                },
+                rid,
+                &mut state,
+                &mut events,
+            )
+            else {
+                panic!("expected a modified Mill");
+            };
+            assert_eq!(new_count, expected);
+        }
+        assert_eq!(state.replacement_quantity_overflow, None);
+    }
+
+    /// CR 101.3 + CR 616.1f: the loop stops at the replacement whose result is
+    /// unrepresentable. One source carries fourteen `Times { 2 }` loss doublers;
+    /// twelve applications take 1,000,000 to 4,096,000,000 (fits a `u32`), the
+    /// thirteenth overflows and is the last one applied (it is marked applied
+    /// before its applier runs); the fourteenth never applies.
+    #[test]
+    fn lose_life_times_overflow_stops_the_loop_at_the_overflowing_replacement() {
+        let defs: Vec<_> = (0..14)
+            .map(|_| life_qmod_def(ReplacementEvent::LoseLife, QuantityModification::DOUBLE))
+            .collect();
+        let mut state = test_state_with_object(ObjectId(10), Zone::Battlefield, defs);
+        let mut events = Vec::new();
+        let result = replace_event(&mut state, life_loss_event(1_000_000), &mut events);
+        let ReplacementResult::Execute(ProposedEvent::LifeLoss {
+            amount, applied, ..
+        }) = result
+        else {
+            panic!("expected Execute of the unchanged LifeLoss, got {result:?}");
+        };
+        assert_eq!(
+            amount, 4_096_000_000,
+            "the event as left by twelve applications"
+        );
+        assert_eq!(
+            applied.len(),
+            13,
+            "the thirteenth is marked applied, the fourteenth never is"
+        );
+        assert_eq!(
+            state.replacement_quantity_overflow,
+            overflow_from(ObjectId(10))
+        );
+    }
+
     #[test]
     fn draw_replacement_uses_event_context_amount_with_offset() {
         let repl = ReplacementDefinition::new(ReplacementEvent::Draw)

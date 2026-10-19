@@ -49056,6 +49056,49 @@ mod tests {
         );
     }
 
+    /// The replacement-quantity overflow record lives only inside one synchronous
+    /// action: it is never serialized, and the per-action reset clears it.
+    #[test]
+    fn replacement_quantity_overflow_is_skipped_by_serde_and_cleared_per_action() {
+        let mut state = GameState::new_two_player(7);
+        state.record_replacement_quantity_overflow(ObjectId(5));
+        state.record_replacement_quantity_overflow(ObjectId(6));
+        assert_eq!(
+            state.replacement_quantity_overflow,
+            Some(ReplacementQuantityOverflow {
+                source: ObjectId(5)
+            }),
+            "reach guard: the first recorded source wins"
+        );
+
+        let serialized = serde_json::to_string(&state).expect("state must serialize");
+        assert!(
+            !serialized.contains("replacement_quantity_overflow"),
+            "replacement_quantity_overflow must be skipped by serde: {serialized}"
+        );
+        let deserialized: GameState =
+            serde_json::from_str(&serialized).expect("state must deserialize");
+        assert_eq!(
+            deserialized.replacement_quantity_overflow, None,
+            "deserialized replacement_quantity_overflow must be None"
+        );
+
+        state.clear_player_action_transients();
+        assert_eq!(
+            state.replacement_quantity_overflow, None,
+            "the per-action reset must clear the record"
+        );
+
+        state.record_replacement_quantity_overflow(ObjectId(7));
+        assert_eq!(
+            state.take_replacement_quantity_overflow(),
+            Some(ReplacementQuantityOverflow {
+                source: ObjectId(7)
+            })
+        );
+        assert_eq!(state.take_replacement_quantity_overflow(), None);
+    }
+
     fn pending_life_gain_replacement(policy: UnrepresentablePolicy) -> PendingReplacement {
         PendingReplacement {
             proposed: ProposedEvent::LifeGain {

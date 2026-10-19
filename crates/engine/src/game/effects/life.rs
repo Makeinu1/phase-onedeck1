@@ -2557,7 +2557,6 @@ mod tests {
         #[test]
         fn ordinary_parked_gain_is_skipped_on_resume_not_rejected() {
             let doublers = ["Rhox Faithmender", "Boon Reflection"];
-            let mut flows = Vec::new();
             for (start_life, applies) in [(i32::MAX - 4, true), (i32::MAX - 3, false)] {
                 let (mut runner, mut events, hand_before) =
                     activate_serpent_gain(start_life, &doublers);
@@ -2599,19 +2598,246 @@ mod tests {
                     hand_before + 1,
                     "the draw after the gain must run (start life {start_life})"
                 );
+                // Lochmere Serpent: "You gain 1 life and draw a card." Skipping the
+                // impossible gain changes only the gain: in both runs the rest of the
+                // instruction ran, so P0 drew exactly one card.
+                let cards_drawn = events
+                    .iter()
+                    .filter(|event| {
+                        matches!(event, GameEvent::CardDrawn { player_id, .. } if *player_id == P0)
+                    })
+                    .count();
+                assert_eq!(
+                    cards_drawn, 1,
+                    "the draw after the gain must run once (start life {start_life})"
+                );
                 if applies {
                     assert_eq!(runner.life(P0), i32::MAX, "1 doubled twice is 4");
+                    assert_eq!(life_changed_count(&events), 1);
                 } else {
                     assert_eq!(runner.life(P0), start_life);
                     assert_eq!(runner.state().players[0].life_gained_this_turn, 0);
                     assert_eq!(life_changed_count(&events), 0);
                 }
-                flows.push(gain_life_effect_resolved(&events));
             }
-            assert_eq!(
-                flows[0], flows[1],
-                "skipping the impossible gain changes only the gain, not the ability's resolution"
+        }
+
+        /// Casts Dazzling Reflection ("You gain life equal to target creature's
+        /// power. The next time that creature would deal damage this turn,
+        /// prevent that damage.") on a P0 creature of `power` with `doublers` in
+        /// play; any ordering prompt is answered with index 0 and must be
+        /// accepted. Returns the runner, the cast's events and the spell.
+        fn cast_dazzling_reflection(
+            power: i32,
+            doublers: &[&str],
+        ) -> (GameRunner, Vec<GameEvent>, ObjectId) {
+            let mut scenario = scenario();
+            for doubler in doublers {
+                add_card(&mut scenario, P0, doubler);
+            }
+            let creature = scenario.add_creature(P0, "Test Behemoth", power, 1).id();
+            let spell = scenario.add_real_card(
+                P0,
+                "Dazzling Reflection",
+                Zone::Hand,
+                crate::test_support::shared_card_db(),
             );
+            scenario.with_mana_pool(P0, vec![mana(ManaType::White), mana(ManaType::White)]);
+            let mut runner = scenario.build();
+            let outcome = runner
+                .cast(spell)
+                .target_object(creature)
+                .replacement_choice(0)
+                .resolve();
+            let events = outcome.events().to_vec();
+            (runner, events, spell)
+        }
+
+        fn prevent_damage_resolved(events: &[GameEvent]) -> bool {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    GameEvent::EffectResolved {
+                        kind: EffectKind::PreventDamage,
+                        ..
+                    }
+                )
+            })
+        }
+
+        /// CR 101.3 + CR 119.3: in ordinary play a replacement-quantity overflow
+        /// (Boon Reflection doubling 1,100,000,000 to 2,200,000,000, past
+        /// `i32::MAX`) skips only the impossible gain; the rest of the ability
+        /// ("The next time that creature would deal damage ... prevent") runs.
+        /// The carrier does not leak into the next action.
+        #[test]
+        fn ordinary_replacement_quantity_overflow_skips_only_the_gain_and_the_ability_resolves() {
+            // Control A: no doubler — the whole power is gained.
+            let (runner, events, _) = cast_dazzling_reflection(1_100_000_000, &[]);
+            assert_eq!(runner.life(P0), 1_100_000_020);
+            assert!(prevent_damage_resolved(&events));
+
+            // Control B: Boon Reflection is live and applies when representable.
+            let (runner, events, _) = cast_dazzling_reflection(500_000_000, &["Boon Reflection"]);
+            assert_eq!(runner.life(P0), 1_000_000_020);
+            assert!(prevent_damage_resolved(&events));
+
+            // The overflow: the gain is skipped, the ability still resolves.
+            let (mut runner, events, spell) =
+                cast_dazzling_reflection(1_100_000_000, &["Boon Reflection"]);
+            assert!(
+                matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+                "reach guard: the cast must settle, got {:?}",
+                runner.state().waiting_for
+            );
+            assert_eq!(runner.life(P0), 20);
+            assert_eq!(runner.state().players[0].life_gained_this_turn, 0);
+            assert_eq!(life_changed_count(&events), 0);
+            assert!(
+                prevent_damage_resolved(&events),
+                "the rest of the ability must still resolve"
+            );
+            assert!(runner.state().players[0].graveyard.contains(&spell));
+            assert_eq!(
+                runner.state().replacement_quantity_overflow,
+                None,
+                "the settle step takes the record"
+            );
+
+            // No leak: the next action's gain is doubled normally (a leaked record
+            // would stop the pipeline at its head and the gain would be 1).
+            runner.state_mut().debug_mode = true;
+            runner
+                .act(GameAction::Debug(
+                    crate::types::actions::DebugAction::GainLife {
+                        player_id: P0,
+                        amount: 1,
+                    },
+                ))
+                .expect("a later debug gain must apply");
+            assert_eq!(runner.life(P0), 22);
+        }
+
+        /// A choice-resumed ordinary delivery whose later answer overflows is
+        /// still ordinary: every answer is accepted (never rejected) and the
+        /// spell resolves with the gain skipped.
+        #[test]
+        fn choice_resumed_ordinary_quantity_overflow_is_skipped_not_rejected() {
+            // 600,000,000 doubled is 1,200,000,000; doubled again overflows i32.
+            let (runner, events, spell) =
+                cast_dazzling_reflection(600_000_000, &["Rhox Faithmender", "Boon Reflection"]);
+            assert_eq!(runner.life(P0), 20);
+            assert_eq!(life_changed_count(&events), 0);
+            assert!(prevent_damage_resolved(&events));
+            assert!(runner.state().players[0].graveyard.contains(&spell));
+            assert_eq!(runner.state().replacement_quantity_overflow, None);
+        }
+
+        /// The settle steps take a recorded overflow under each policy.
+        #[test]
+        fn settle_takes_the_replacement_quantity_overflow_under_each_policy() {
+            let player = PlayerId(0);
+            let source = ObjectId(1);
+            let gain_event = || ProposedEvent::LifeGain {
+                player_id: player,
+                amount: 3,
+                applied: HashSet::new(),
+            };
+            let loss_event = || ProposedEvent::LifeLoss {
+                player_id: player,
+                amount: 3,
+                applied: HashSet::new(),
+            };
+            let mut events = Vec::new();
+
+            // Ordinary entries: the impossible change is skipped (CR 101.3).
+            let mut state = GameState::new_two_player(42);
+            state.record_replacement_quantity_overflow(source);
+            assert_eq!(apply_life_gain(&mut state, player, 3, &mut events), Ok(0));
+            assert_eq!(state.replacement_quantity_overflow, None);
+            state.record_replacement_quantity_overflow(source);
+            assert_eq!(apply_life_loss(&mut state, player, 3, &mut events), Ok(0));
+            assert_eq!(state.replacement_quantity_overflow, None);
+            assert_eq!(state.players[0].life, 20);
+            assert_eq!(state.players[0].life_gained_this_turn, 0);
+            assert_eq!(state.players[0].life_lost_this_turn, 0);
+            assert_eq!(life_changed_count(&events), 0);
+
+            // Reject policy, through the ingress entries: the loop head stops at
+            // the pre-set record and the settle step reports the error.
+            state.record_replacement_quantity_overflow(source);
+            assert_eq!(
+                try_apply_life_gain(&mut state, player, 3, &mut events),
+                Err(unrepresentable(player))
+            );
+            assert_eq!(state.replacement_quantity_overflow, None);
+            state.record_replacement_quantity_overflow(source);
+            assert_eq!(
+                try_apply_life_loss(&mut state, player, 3, &mut events),
+                Err(unrepresentable(player))
+            );
+            assert_eq!(state.replacement_quantity_overflow, None);
+
+            // Reject policy, resume path.
+            state.record_replacement_quantity_overflow(source);
+            assert_eq!(
+                settle_life_gain_after_choice(
+                    &mut state,
+                    gain_event(),
+                    UnrepresentablePolicy::Reject,
+                    &mut events
+                ),
+                Err(LifeChangeUnrepresentable { player })
+            );
+            assert_eq!(state.replacement_quantity_overflow, None);
+            state.record_replacement_quantity_overflow(source);
+            assert_eq!(
+                settle_life_loss_after_choice(
+                    &mut state,
+                    loss_event(),
+                    UnrepresentablePolicy::Reject,
+                    &mut events
+                ),
+                Err(LifeChangeUnrepresentable { player })
+            );
+            assert_eq!(state.replacement_quantity_overflow, None);
+
+            // Inside an open window an ordinary entry records the failure.
+            state.record_replacement_quantity_overflow(source);
+            let (result, window) = within_ingress_life_window(&mut state, |state| {
+                apply_life_gain(state, player, 3, &mut events)
+            });
+            assert_eq!(result, Ok(0));
+            assert_eq!(window.failed_player, Some(player));
+            assert_eq!(state.replacement_quantity_overflow, None);
+            state.record_replacement_quantity_overflow(source);
+            let (result, window) = within_ingress_life_window(&mut state, |state| {
+                apply_life_loss(state, player, 3, &mut events)
+            });
+            assert_eq!(result, Ok(0));
+            assert_eq!(window.failed_player, Some(player));
+            assert_eq!(state.replacement_quantity_overflow, None);
+
+            // A window that already failed still has the record taken.
+            state.ingress_life_window = Some(IngressLifeWindow {
+                failed_player: Some(PlayerId(1)),
+            });
+            state.record_replacement_quantity_overflow(source);
+            assert_eq!(apply_life_gain(&mut state, player, 3, &mut events), Ok(0));
+            assert_eq!(state.replacement_quantity_overflow, None);
+            state.record_replacement_quantity_overflow(source);
+            assert_eq!(apply_life_loss(&mut state, player, 3, &mut events), Ok(0));
+            assert_eq!(state.replacement_quantity_overflow, None);
+            state.ingress_life_window = None;
+
+            // An amount of 0 never runs the pipeline: the record is untouched.
+            state.record_replacement_quantity_overflow(source);
+            assert_eq!(apply_life_gain(&mut state, player, 0, &mut events), Ok(0));
+            assert_eq!(
+                state.replacement_quantity_overflow,
+                Some(crate::types::game_state::ReplacementQuantityOverflow { source })
+            );
+            assert_eq!(life_changed_count(&events), 0);
         }
 
         /// CR 119.3: an ordinary change that is representable still applies in

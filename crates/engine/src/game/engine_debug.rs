@@ -3069,13 +3069,13 @@ mod tests {
         }
 
         /// Answers the open replacement-order prompts with index 0 until one
-        /// answer is rejected; returns the rollback set taken just before that
-        /// answer and its error.
+        /// answer is rejected; returns the number of answers accepted before it,
+        /// the rollback set taken just before the rejected answer, and its error.
         fn answer_until_rejected(
             runner: &mut GameRunner,
             pridemate: ObjectId,
-        ) -> (RollbackSet, EngineError) {
-            for _ in 0..16 {
+        ) -> (usize, RollbackSet, EngineError) {
+            for accepted in 0..16 {
                 assert!(
                     replacement_prompt_open(runner),
                     "reach guard: an ordering prompt must be open, got {:?}",
@@ -3084,7 +3084,7 @@ mod tests {
                 let before = rollback_set(runner, pridemate);
                 match runner.act(GameAction::ChooseReplacement { index: 0 }) {
                     Ok(_) => {}
-                    Err(error) => return (before, error),
+                    Err(error) => return (accepted, before, error),
                 }
             }
             panic!("no replacement answer was rejected");
@@ -3096,8 +3096,8 @@ mod tests {
         fn assert_choice_rejected_and_still_answerable(
             runner: &mut GameRunner,
             pridemate: ObjectId,
-        ) {
-            let (before, error) = answer_until_rejected(runner, pridemate);
+        ) -> usize {
+            let (accepted, before, error) = answer_until_rejected(runner, pridemate);
             assert_not_representable(&error);
             assert_eq!(
                 rollback_set(runner, pridemate),
@@ -3110,6 +3110,7 @@ mod tests {
                 .expect_err("the restored prompt must reject the same answer again");
             assert_not_representable(&again);
             assert_eq!(rollback_set(runner, pridemate), before);
+            accepted
         }
 
         /// Answers any open ordering prompts with index 0 until none remains.
@@ -3143,7 +3144,9 @@ mod tests {
                         "the rejected action must leave the state unchanged"
                     );
                 }
-                Ok(_) => assert_choice_rejected_and_still_answerable(runner, pridemate),
+                Ok(_) => {
+                    assert_choice_rejected_and_still_answerable(runner, pridemate);
+                }
             }
         }
 
@@ -3824,6 +3827,82 @@ mod tests {
             assert_eq!(life(&runner, P0), i32::MAX - 7);
         }
 
+        /// CR 101.3 + CR 616.1: twelve doublers (Boon Reflection, "If you would
+        /// gain life, you gain twice that much life instead.") turn a requested
+        /// 1,000,000 into 1,000,000 x 2^11 = 2,048,000,000 after eleven
+        /// doublings (accepted control, 20 + that fits an `i32`). The twelfth
+        /// doubling is 4,096,000,000: the checked replacement multiply reports
+        /// it as unrepresentable, so the answer that applies it is rejected
+        /// unchanged and the prompt stays answerable, with no later prompt asked.
+        #[test]
+        fn debug_gain_twelve_parsed_doublers_reject_the_twelfth_doubling() {
+            // Accepted control: eleven Boon Reflections.
+            let mut scenario = scenario();
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            for _ in 0..11 {
+                add_card(&mut scenario, P0, "Boon Reflection");
+            }
+            let mut runner = debug_runner(scenario);
+            act_ok(&mut runner, gain(P0, MAX_DEBUG_LIFE_AMOUNT));
+            assert!(
+                replacement_prompt_open(&runner),
+                "reach guard: eleven doublers park an ordering prompt, got {:?}",
+                runner.state().waiting_for
+            );
+            answer_to_completion(&mut runner);
+            assert_eq!(life(&runner, P0), 20 + 2_048_000_000);
+            assert_eq!(
+                runner.state().players[0].life_gained_this_turn,
+                2_048_000_000
+            );
+            runner.advance_until_stack_empty();
+            assert_eq!(p1p1(&runner, mate), 1);
+
+            // (Boon Reflection copies, Rhox Faithmender copies): the same parsed
+            // execute from distinct cards.
+            for (boons, rhoxes) in [(12usize, 0usize), (6, 6)] {
+                let mut scenario = self::scenario();
+                let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+                for _ in 0..boons {
+                    add_card(&mut scenario, P0, "Boon Reflection");
+                }
+                for _ in 0..rhoxes {
+                    add_card(&mut scenario, P0, "Rhox Faithmender");
+                }
+                let mut runner = debug_runner(scenario);
+                act_ok(&mut runner, gain(P0, MAX_DEBUG_LIFE_AMOUNT));
+                assert!(
+                    replacement_prompt_open(&runner),
+                    "reach guard: twelve doublers park an ordering prompt, got {:?}",
+                    runner.state().waiting_for
+                );
+                assert_eq!(
+                    parked_policy(&runner),
+                    Some(UnrepresentablePolicy::Reject),
+                    "reach guard: a debug gain's parked proposal is stamped for rejection"
+                );
+                let accepted = assert_choice_rejected_and_still_answerable(&mut runner, mate);
+                // Prompts are asked while two or more candidates remain, so by
+                // derivation ten answers are accepted and the eleventh (which
+                // applies the eleventh doubling, then auto-applies the twelfth and
+                // overflows) is rejected. The exact integer is UNPROBED (tests are
+                // only compiled locally); the invariant asserted is that some
+                // answers were accepted first, the rejection is the exact
+                // unrepresentable error (checked above), and it lands before the
+                // prompts run out.
+                assert!(
+                    (1..=11).contains(&accepted),
+                    "({boons}, {rhoxes}): accepted {accepted} answers before the rejection"
+                );
+                assert_eq!(life(&runner, P0), 20);
+                assert_eq!(
+                    runner.state().replacement_quantity_overflow,
+                    None,
+                    "({boons}, {rhoxes}): the rejected action's snapshot restore clears the record"
+                );
+            }
+        }
+
         /// Bloodletter of Aclazotz ("If an opponent would lose life during your
         /// turn, they lose twice that much life instead.") parsed from its
         /// Oracle text: eleven copies turn a requested 1,000,000 into
@@ -3852,6 +3931,22 @@ mod tests {
             add_bloodletters(&mut runner, 12);
             submit_expecting_rejection(&mut runner, mate, lose(P1, MAX_DEBUG_LIFE_AMOUNT));
             assert_eq!(life(&runner, P1), 20);
+        }
+
+        /// CR 101.3: a thirteenth doubler takes 4,096,000,000 to 8,192,000,000,
+        /// which does not even fit a `u32`; the loss is rejected unchanged.
+        /// Guard row: the twelfth-copy row above is rejected by the final edit
+        /// already; the loop-stop discrimination is in the `replacement` unit
+        /// row `lose_life_times_overflow_stops_the_loop_at_the_overflowing_replacement`.
+        #[test]
+        fn debug_lose_thirteen_parsed_doublers_are_rejected_unchanged() {
+            let mut scenario = scenario();
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            let mut runner = debug_runner(scenario);
+            add_bloodletters(&mut runner, 13);
+            submit_expecting_rejection(&mut runner, mate, lose(P1, MAX_DEBUG_LIFE_AMOUNT));
+            assert_eq!(life(&runner, P1), 20);
+            assert_eq!(runner.state().replacement_quantity_overflow, None);
         }
 
         /// One parsed doubler: the final loss overflows the life total
