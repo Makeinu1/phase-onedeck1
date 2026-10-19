@@ -19233,16 +19233,40 @@ mod game_submission_tests {
             let (game_code, player_token, full_key) =
                 create_started_ai_game(&mut socket_a, None, DeckData::default(), None).await;
             // Empty libraries skip the mulligan (`start_game_with_starting_player`),
-            // so the started game is in a Priority window where PassPriority is a
-            // legal action, not a MulliganDecision that would refuse it.
+            // but whether seat 0 or the AI seat holds the first priority window
+            // depends on who won the starting-player roll. A PassPriority from seat
+            // 0 is only legal, and only the cause of the next revision, once seat 0
+            // holds priority; until then the AI's own moves advance the revision.
+            // Wait for that window and take the baseline revision under the same
+            // guard: while seat 0 holds priority nothing else can advance the
+            // game, so any later advance is this Action's.
             //
             // Observe through the awaited lock: `try_session` answers `None`
             // whenever a transition holds the session lease, which the executor
             // does while it runs the Action asynchronously.
-            let before_revision = lock_session(&app_state.sessions, &game_code)
-                .await
-                .expect("started Full session")
-                .state_revision;
+            let before_revision = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    {
+                        let session = lock_session(&app_state.sessions, &game_code)
+                            .await
+                            .expect("started Full session");
+                        match &session.state.waiting_for {
+                            engine::types::game_state::WaitingFor::Priority { player }
+                                if *player == PlayerId(0) =>
+                            {
+                                break session.state_revision;
+                            }
+                            engine::types::game_state::WaitingFor::GameOver { .. } => {
+                                panic!("game ended before seat 0 held priority")
+                            }
+                            _ => {}
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("seat 0 must receive a priority window for the Action");
 
             socket_a
                 .send(WsMessage::Text(
