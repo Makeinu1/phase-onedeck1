@@ -2646,6 +2646,10 @@ mod tests {
             let mut runner = scenario.build();
             let outcome = runner
                 .cast(spell)
+                // Both of the spell's target slots name the same creature; with
+                // Rhox Faithmender also on the battlefield the second slot has two
+                // legal creatures, so it must be declared explicitly.
+                .target_object(creature)
                 .target_object(creature)
                 .replacement_choice(0)
                 .resolve();
