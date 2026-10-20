@@ -799,14 +799,14 @@ fn handle_replacement_choice_inner(
                         return Ok(state.waiting_for.clone());
                     }
                 }
-                // CR 119.1: Life gain accepted after replacement choice. The
+                // CR 119.3: Life gain accepted after replacement choice. The
                 // parked record's policy decides an unrepresentable final edit:
                 // `Reject` fails the answer (the boundary restores the record and
                 // its prompt), `IgnoreImpossible` skips the change and resumes.
                 gain @ ProposedEvent::LifeGain { .. } => {
                     settle_life_gain_after_choice(state, gain, parked_life_policy, events)?;
                 }
-                // CR 120.3: Life loss accepted after replacement choice.
+                // CR 119.3: Life loss accepted after replacement choice.
                 loss @ ProposedEvent::LifeLoss { player_id, .. } => {
                     // An empty-pool loss that deferred here never returns to
                     // the phase-transition drain, so this is the only place
