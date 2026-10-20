@@ -1905,6 +1905,30 @@ pub(crate) fn terminal_battlefield_departure_row(
         .then(|| &state.zone_changes_this_turn[index])
 }
 
+impl GameState {
+    /// CR 603.10 + CR 400.7: the settled observation of the battlefield entry `record` describes,
+    /// or `None`. Exact: this turn's row at this record's ledger index, naming this record's object
+    /// at its post-entry incarnation; a later entry reusing the storage id is a different object
+    /// (CR 400.7) and never answers for this one. Self-validating, so a restored row answers only
+    /// for the identical (turn, index, object, incarnation) entry.
+    pub(crate) fn battlefield_entry_observation(
+        &self,
+        record: &ZoneChangeRecord,
+    ) -> Option<&TriggerSourceContext> {
+        if record.to_zone != Zone::Battlefield || record.recorded_turn_number != self.turn_number {
+            return None;
+        }
+        self.battlefield_entry_observations
+            .get(&record.turn_zone_change_index)
+            .filter(|row| {
+                row.identity.reference.object_id == record.object_id
+                    && record
+                        .entered_incarnation
+                        .is_none_or(|incarnation| row.identity.reference.incarnation == incarnation)
+            })
+    }
+}
+
 /// CR 506.4 / CR 508.1k / CR 509.1g / CR 509.1h: Combat role snapshot for an
 /// object leaving its current zone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -4282,7 +4306,9 @@ impl PendingZoneChangeDelivery {
 /// chooses two shock lands; only the first ever entered the battlefield).
 ///
 /// The struct stashes the per-iteration context (`ChangeZoneIterationCtx`)
-/// plus the unprocessed object ids; `drain_pending_change_zone_iteration`
+/// plus the unprocessed members, each carrying the entry modifications it was
+/// resolved to before the event's first member moved (`ChangeZoneMemberEntry`),
+/// not the raw gate spec; `drain_pending_change_zone_iteration`
 /// (in `effects/mod.rs`) re-enters the loop after each `ReplacementChoice`
 /// resolves. Drained before the repeat-for frame because the outer
 /// `repeat_for` loop may have stashed a chain that contains this inner
@@ -4301,18 +4327,14 @@ pub struct PendingChangeZoneIteration {
     /// The chosen member that is currently completing outside the ordinary
     /// `remaining` loop. Required even when the tail is empty.
     pub paused_current: Option<PendingZoneChangeDelivery>,
-    pub remaining: Vec<ObjectId>,
+    /// The unprocessed members with their pre-event entry modifications
+    /// (CR 603.6a).
+    pub remaining: Vec<ChangeZoneMemberEntry>,
     pub source_id: ObjectId,
     pub controller: PlayerId,
     pub origin: Option<crate::types::zones::Zone>,
     pub destination: crate::types::zones::Zone,
     pub enter_transformed: bool,
-    #[serde(
-        default,
-        with = "crate::types::zones::etb_tap_bool_compat",
-        skip_serializing_if = "EtbTapState::is_unspecified"
-    )]
-    pub enter_tapped: EtbTapState,
     /// CR 110.2a: Resolved-once controller override on ETB. `Some(pid)`
     /// routes the object to `pid`. `None` leaves the object under its
     /// owner's control. Resolved from `Effect::ChangeZone.enters_under`
@@ -4320,18 +4342,6 @@ pub struct PendingChangeZoneIteration {
     /// across an interactive pause.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enters_under_player: Option<PlayerId>,
-    pub enters_attacking: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub enter_with_counters: Vec<(crate::types::counter::CounterType, u32)>,
-    /// Conditional entry-counter specs carried across a pause so each remaining
-    /// object can be re-evaluated per-object on resume (Winter Soldier Hero
-    /// rider through `EffectZoneChoice`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub conditional_enter_with_counters: Vec<(
-        crate::types::ability::TargetFilter,
-        crate::types::counter::CounterType,
-        crate::types::ability::QuantityExpr,
-    )>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration: Option<crate::types::ability::Duration>,
     pub track_exiled_by_source: bool,
@@ -4350,8 +4360,8 @@ pub struct PendingChangeZoneIteration {
     /// replacement-ordering / as-enters pause so a paused-then-resumed
     /// face-down return (Yedora's dying creatures → face-down Forest lands)
     /// still applies the profile on resume. `None` = normal face-up entry.
-    /// Mirrors the `enter_tapped`/`enter_transformed`/`enters_under_player`
-    /// carry-through pattern on this same struct.
+    /// Mirrors the `enter_transformed`/`enters_under_player` carry-through
+    /// pattern on this same struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub face_down_profile: Option<crate::types::ability::FaceDownProfile>,
     /// CR 401.4 + CR 701.24a: Library placement override carried across a
@@ -4359,18 +4369,26 @@ pub struct PendingChangeZoneIteration {
     /// library" still suppresses auto-shuffle on resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library_placement: Option<crate::types::ability::LibraryPosition>,
-    /// CR 614.12: gates the `enter_tapped`/`enters_attacking` riders on the
-    /// moved object's type, carried across a replacement-ordering / as-enters
-    /// pause so a paused-then-resumed gated move (Summoner's Grimoire) still
-    /// applies the riders only to a matching object on resume. `None` = apply
-    /// unconditionally. Mirrors the `enter_tapped`/`face_down_profile`
-    /// carry-through pattern on this same struct.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enters_modified_if: Option<crate::types::ability::TargetFilter>,
     /// CR 303.4f: Pre-resolved Aura host carried across a paused ChangeZone loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enter_attached_to: Option<AttachTarget>,
     pub effect_kind: crate::types::ability::EffectKind,
+}
+
+/// CR 603.6a + CR 614.12: one member of a ChangeZone event with the
+/// effect-carried modifications it enters with — its gated entry counters and
+/// gated tapped/attacking riders — resolved against the board as it was before
+/// the event's first member moved. A co-entrant is not on the battlefield then,
+/// so neither its statics nor its presence affect another member's gates
+/// (Heliod, Sun-Crowned ruling 2020-01-24).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeZoneMemberEntry {
+    pub object_id: ObjectId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enter_with_counters: Vec<(CounterType, u32)>,
+    #[serde(default, skip_serializing_if = "EtbTapState::is_unspecified")]
+    pub enter_tapped: EtbTapState,
+    pub enters_attacking: bool,
 }
 
 /// CR 707.2 + CR 614.1a + CR 616.1: Resume state for `CopyTokenOf` when a
@@ -21568,6 +21586,18 @@ declare_game_state! {
     /// inside that synchronous window; it is never serialized.
     #[serde(skip)]
     pub active_spend_only_on_x_count: Option<(ObjectId, u32)>,
+    /// Open while an action-ingress life change settles synchronously (a `try_*`
+    /// entry's whole call, or the replacement-choice handler resuming a `Reject`
+    /// record). Any life settlement inside it that is unrepresentable is recorded
+    /// here and the ingress caller rejects. Transient — never serialized.
+    #[serde(skip)]
+    pub(crate) ingress_life_window: Option<IngressLifeWindow>,
+    /// A replacement's computed life quantity overflowed while the current life
+    /// event was being replaced (see `ReplacementQuantityOverflow`). Recorded by
+    /// the life appliers, taken by the life settle step of the same event inside
+    /// one synchronous action. Transient — never serialized.
+    #[serde(skip)]
+    pub(crate) replacement_quantity_overflow: Option<ReplacementQuantityOverflow>,
     /// CR 601.2g + CR 605.3b: the row policy of the automatic mana payment that
     /// is executing (see `casting_costs::AutoTapRowPolicy`). Set while a
     /// payment activates its selected sources, and to `AllRows` while a
@@ -23086,6 +23116,16 @@ declare_game_state! {
     /// CR 400.7: Zone-change snapshots this turn, enabling data-driven condition queries.
     #[serde(default, skip_serializing_if = "im::Vector::is_empty")]
     pub zone_changes_this_turn: im::Vector<ZoneChangeRecord>,
+    /// CR 603.10 + CR 603.6a + CR 611.3c: each battlefield entry's entrant as it existed
+    /// immediately after its entry event — continuous effects applied, later instructions of the
+    /// same resolution (CR 608.2c) not yet applied. Keyed by the entry's
+    /// `ZoneChangeRecord::turn_zone_change_index` (the `zone_changes_this_turn` index space;
+    /// cleared with it). Written only by `zones::settle_battlefield_entry_observations`; read only
+    /// through `GameState::battlefield_entry_observation`. An entry with no row was never settled,
+    /// and enter observers read the live entrant (or its record). Engine-internal: stripped from
+    /// every viewer projection.
+    #[serde(default, skip_serializing_if = "im::OrdMap::is_empty")]
+    pub battlefield_entry_observations: im::OrdMap<usize, TriggerSourceContext>,
     /// CR 603.2c: Batched zone-change triggers already collected for
     /// `(definition_ref, recorded_turn_number, turn_zone_change_index)`. Prevents a second
     /// `process_triggers` pass over the same `ZoneChanged` events from
@@ -25120,6 +25160,11 @@ impl PostReplacementDrainStack {
         self.drains.len()
     }
 
+    /// Every drain in this frame, outermost first. Read-only.
+    pub(crate) fn drains(&self) -> impl Iterator<Item = &PostReplacementDrain> {
+        self.drains.iter()
+    }
+
     /// Is there a continuation that has not run yet?
     ///
     /// A `Dispatching` drain does NOT count: its continuation is already running,
@@ -25904,9 +25949,92 @@ pub struct PendingReplacement {
     /// boundary methods below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_boundary: Option<Box<ProposedEvent>>,
+    /// Whether an unrepresentable final life edit on resume rejects the answer
+    /// (the event came from an action-ingress `try_*` entry) or is skipped as
+    /// impossible (ordinary resolution). Absent in older payloads.
+    #[serde(
+        default,
+        skip_serializing_if = "UnrepresentablePolicy::is_ignore_impossible"
+    )]
+    pub unrepresentable_life_change: UnrepresentablePolicy,
+}
+
+/// Who owns a life change whose final result the engine cannot represent
+/// (final amount beyond an `i32` delta, life total overflow, or per-turn
+/// gained/lost counter overflow).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnrepresentablePolicy {
+    /// Action ingress: return the typed error so the caller rejects the
+    /// action through the boundary snapshot restore (nothing settles).
+    Reject,
+    /// Ordinary resolution. Engine representability limit, not a rule: the
+    /// change cannot be recorded, so it is skipped the way CR 101.3 treats an
+    /// impossible part of an instruction ("Any part of an instruction that's
+    /// impossible to perform is ignored."). Log once, skip this change, and
+    /// continue the instruction as if it applied with amount 0.
+    #[default]
+    IgnoreImpossible,
+}
+
+impl UnrepresentablePolicy {
+    /// Serde skip predicate: the ordinary policy is the wire default.
+    pub fn is_ignore_impossible(&self) -> bool {
+        matches!(self, Self::IgnoreImpossible)
+    }
+}
+
+/// State of the transient action-ingress life window (see
+/// `GameState::ingress_life_window`): the first player whose life settlement
+/// inside the window proved unrepresentable, if any.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct IngressLifeWindow {
+    pub(crate) failed_player: Option<PlayerId>,
+}
+
+/// A replacement's computed life quantity overflowed the engine's numeric
+/// range, so the modified event cannot be represented. CR 101.3: that result is
+/// an impossible part of the instruction and is ignored rather than clamped
+/// (CR 119.3 would otherwise adjust the life total by a made-up amount). The
+/// applier records the overflowing replacement's source (diagnostic) and the
+/// life settle step takes the record and routes it through the existing
+/// unrepresentable-life-change authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplacementQuantityOverflow {
+    pub(crate) source: ObjectId,
+}
+
+impl GameState {
+    /// Record that a replacement's computed life quantity overflowed. The first
+    /// writer wins: the loop stops at the first overflow, so a later record can
+    /// only be the same event.
+    pub(crate) fn record_replacement_quantity_overflow(&mut self, source: ObjectId) {
+        if self.replacement_quantity_overflow.is_none() {
+            self.replacement_quantity_overflow = Some(ReplacementQuantityOverflow { source });
+        }
+    }
+
+    /// Take (and clear) the recorded overflow, if any.
+    pub(crate) fn take_replacement_quantity_overflow(
+        &mut self,
+    ) -> Option<ReplacementQuantityOverflow> {
+        self.replacement_quantity_overflow.take()
+    }
 }
 
 impl PendingReplacement {
+    /// CR 616.1f: a record re-parked while its predecessor (stamped with
+    /// `predecessor_policy`) was being answered keeps the ingress stamp. Copies
+    /// `Reject` onto a record still at the default and never downgrades a
+    /// `Reject` already on it.
+    pub(crate) fn inherit_unrepresentable_life_change(
+        &mut self,
+        predecessor_policy: UnrepresentablePolicy,
+    ) {
+        if predecessor_policy == UnrepresentablePolicy::Reject {
+            self.unrepresentable_life_change = UnrepresentablePolicy::Reject;
+        }
+    }
+
     /// The event the logical owner of this paused zone-change delivery parked
     /// on. The single authority every owner match reads — capture
     /// (`GameState::pending_zone_change_delivery_from_replacement`),
@@ -29697,6 +29825,8 @@ impl GameState {
             active_casting_permission_index: None,
             active_paid_resolution_offer_tail: None,
             active_spend_only_on_x_count: None,
+            ingress_life_window: None,
+            replacement_quantity_overflow: None,
             active_auto_tap_row_policy: None,
             battlefield: im::Vector::new(),
             stack: im::Vector::new(),
@@ -29871,6 +30001,7 @@ impl GameState {
             players_who_sacrificed_artifact_this_turn: HashSet::new(),
             sacrificed_permanents_this_turn: im::Vector::new(),
             zone_changes_this_turn: im::Vector::new(),
+            battlefield_entry_observations: im::OrdMap::new(),
             batched_zone_change_trigger_fired: im::HashSet::new(),
             battlefield_entries_this_turn: im::Vector::new(),
             damage_dealt_this_turn: im::Vector::new(),
@@ -31363,6 +31494,19 @@ impl GameState {
         self.exiled_from_hand_this_resolution = 0;
         self.die_result_this_resolution = None;
         self.consumed_before_priority_trigger_events.clear();
+        self.ingress_life_window = None;
+        self.replacement_quantity_overflow = None;
+    }
+
+    /// The policy a life event parked right now must be stamped with: `Reject`
+    /// while an action-ingress window is open (the event belongs to that
+    /// ingress action), otherwise ordinary resolution.
+    pub(crate) fn ingress_life_policy(&self) -> UnrepresentablePolicy {
+        if self.ingress_life_window.is_some() {
+            UnrepresentablePolicy::Reject
+        } else {
+            UnrepresentablePolicy::IgnoreImpossible
+        }
     }
 
     pub(crate) fn retain_carrier_referenced_lki(&mut self) {
@@ -32697,6 +32841,8 @@ fn _gamestate_partition_is_total(s: &GameState) {
         active_casting_permission_index: _,
         active_paid_resolution_offer_tail: _,
         active_spend_only_on_x_count: _,
+        ingress_life_window: _,
+        replacement_quantity_overflow: _,
         active_auto_tap_row_policy: _,
         battlefield: _,
         stack: _,
@@ -32904,6 +33050,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         players_who_sacrificed_artifact_this_turn: _,
         sacrificed_permanents_this_turn: _,
         zone_changes_this_turn: _,
+        battlefield_entry_observations: _,
         batched_zone_change_trigger_fired: _,
         battlefield_entries_this_turn: _,
         damage_dealt_this_turn: _,
@@ -33265,6 +33412,7 @@ impl PartialEq for GameState {
                 == other.players_who_sacrificed_artifact_this_turn
             && self.sacrificed_permanents_this_turn == other.sacrificed_permanents_this_turn
             && self.zone_changes_this_turn == other.zone_changes_this_turn
+            && self.battlefield_entry_observations == other.battlefield_entry_observations
             && self.batched_zone_change_trigger_fired == other.batched_zone_change_trigger_fired
             && self.battlefield_entries_this_turn == other.battlefield_entries_this_turn
             && self.damage_dealt_this_turn == other.damage_dealt_this_turn
@@ -36012,18 +36160,13 @@ mod tests {
             origin: Some(Zone::Battlefield),
             destination: Zone::Exile,
             enter_transformed: false,
-            enter_tapped: EtbTapState::Unspecified,
             enters_under_player: None,
-            enters_attacking: false,
-            enter_with_counters: Vec::new(),
-            conditional_enter_with_counters: Vec::new(),
             duration: None,
             track_exiled_by_source: false,
             face_down_in_exile: crate::types::ability::ExileConcealment::FaceDown,
             moved_count: None,
             face_down_profile: None,
             library_placement: None,
-            enters_modified_if: None,
             enter_attached_to: None,
             effect_kind: EffectKind::ChangeZone,
         });
@@ -46079,17 +46222,20 @@ mod tests {
             pending_return_result_producer: None,
             logical_zone_change_group,
             paused_current: None,
-            remaining: vec![],
+            // CR 603.6a + CR 614.12: a member carries the entry modifications
+            // resolved before the event's first member moved.
+            remaining: vec![ChangeZoneMemberEntry {
+                object_id: ObjectId(9),
+                enter_with_counters: vec![(CounterType::Plus1Plus1, 2)],
+                enter_tapped: EtbTapState::Tapped,
+                enters_attacking: true,
+            }],
             source_id: ObjectId(7),
             controller: PlayerId(0),
             origin: None,
             destination: Zone::Battlefield,
             enter_transformed: false,
-            enter_tapped: EtbTapState::Unspecified,
             enters_under_player: Some(PlayerId(1)),
-            enters_attacking: false,
-            enter_with_counters: vec![],
-            conditional_enter_with_counters: vec![],
             duration: None,
             track_exiled_by_source: false,
             face_down_in_exile: crate::types::ability::ExileConcealment::Public,
@@ -46108,10 +46254,24 @@ mod tests {
             }),
             library_placement: None,
             effect_kind: crate::types::ability::EffectKind::ChangeZone,
-            enters_modified_if: None,
             enter_attached_to: None,
         };
         let json = serde_json::to_string(&original).expect("serialize");
+        // The resolved members are the only entry-modification authority: the
+        // raw gate spec is no longer carried.
+        let carrier = serde_json::to_value(&original).expect("serialize carrier");
+        for removed in [
+            "enter_tapped",
+            "enters_attacking",
+            "enter_with_counters",
+            "conditional_enter_with_counters",
+            "enters_modified_if",
+        ] {
+            assert!(
+                carrier.get(removed).is_none(),
+                "carrier must not emit the removed `{removed}` field: {json}"
+            );
+        }
         // Modern shape must be emitted, NOT the legacy bool field.
         assert!(
             json.contains("\"enters_under_player\""),
@@ -46148,6 +46308,23 @@ mod tests {
         assert!(
             error.to_string().contains("immediately_before_latched"),
             "missing latch rejection must name the missing authority: {error}"
+        );
+
+        // The carrier itself never accepts bare-id members. A persisted v1–v6
+        // carrier is migrated or refused before this decode by
+        // `migrate_legacy_change_zone_carrier` (`types/resolution.rs`), reached
+        // from the v1 reader arm and from
+        // `migrate_legacy_change_zone_member_entries` for v2–v6.
+        let mut bare_ids = serde_json::to_value(&original).expect("serialize modern carrier");
+        bare_ids
+            .as_object_mut()
+            .expect("pending carrier serializes as an object")
+            .insert("remaining".to_string(), serde_json::json!([7]));
+        let error = serde_json::from_value::<PendingChangeZoneIteration>(bare_ids)
+            .expect_err("legacy bare-id members must reject");
+        assert!(
+            error.to_string().contains("ChangeZoneMemberEntry"),
+            "bare-id member rejection must name the member carrier: {error}"
         );
 
         // A same-kind child is a distinct operation. It must not absorb the
@@ -48904,6 +49081,169 @@ mod tests {
         assert_eq!(
             deserialized.active_auto_tap_row_policy, None,
             "deserialized active_auto_tap_row_policy must be None"
+        );
+    }
+
+    /// The ingress life window lives only inside one synchronous action: it is
+    /// never serialized, and the per-action reset closes it.
+    #[test]
+    fn ingress_life_window_is_skipped_by_serde_and_cleared_per_action() {
+        let mut state = GameState::new_two_player(7);
+        state.ingress_life_window = Some(IngressLifeWindow {
+            failed_player: Some(PlayerId(1)),
+        });
+        assert_eq!(
+            state.ingress_life_policy(),
+            UnrepresentablePolicy::Reject,
+            "reach guard: an open window selects the rejecting stamp"
+        );
+
+        let serialized = serde_json::to_string(&state).expect("state must serialize");
+        assert!(
+            !serialized.contains("ingress_life_window"),
+            "ingress_life_window must be skipped by serde: {serialized}"
+        );
+        let deserialized: GameState =
+            serde_json::from_str(&serialized).expect("state must deserialize");
+        assert_eq!(
+            deserialized.ingress_life_window, None,
+            "deserialized ingress_life_window must be None"
+        );
+
+        state.clear_player_action_transients();
+        assert_eq!(
+            state.ingress_life_window, None,
+            "the per-action reset must close the window"
+        );
+        assert_eq!(
+            state.ingress_life_policy(),
+            UnrepresentablePolicy::IgnoreImpossible
+        );
+    }
+
+    /// The replacement-quantity overflow record lives only inside one synchronous
+    /// action: it is never serialized, and the per-action reset clears it.
+    #[test]
+    fn replacement_quantity_overflow_is_skipped_by_serde_and_cleared_per_action() {
+        let mut state = GameState::new_two_player(7);
+        state.record_replacement_quantity_overflow(ObjectId(5));
+        state.record_replacement_quantity_overflow(ObjectId(6));
+        assert_eq!(
+            state.replacement_quantity_overflow,
+            Some(ReplacementQuantityOverflow {
+                source: ObjectId(5)
+            }),
+            "reach guard: the first recorded source wins"
+        );
+
+        let serialized = serde_json::to_string(&state).expect("state must serialize");
+        assert!(
+            !serialized.contains("replacement_quantity_overflow"),
+            "replacement_quantity_overflow must be skipped by serde: {serialized}"
+        );
+        let deserialized: GameState =
+            serde_json::from_str(&serialized).expect("state must deserialize");
+        assert_eq!(
+            deserialized.replacement_quantity_overflow, None,
+            "deserialized replacement_quantity_overflow must be None"
+        );
+
+        state.clear_player_action_transients();
+        assert_eq!(
+            state.replacement_quantity_overflow, None,
+            "the per-action reset must clear the record"
+        );
+
+        state.record_replacement_quantity_overflow(ObjectId(7));
+        assert_eq!(
+            state.take_replacement_quantity_overflow(),
+            Some(ReplacementQuantityOverflow {
+                source: ObjectId(7)
+            })
+        );
+        assert_eq!(state.take_replacement_quantity_overflow(), None);
+    }
+
+    fn pending_life_gain_replacement(policy: UnrepresentablePolicy) -> PendingReplacement {
+        PendingReplacement {
+            proposed: ProposedEvent::LifeGain {
+                player_id: PlayerId(0),
+                amount: 1,
+                applied: HashSet::new(),
+            },
+            sacrifice_provenance: None,
+            candidates: Vec::new(),
+            search_found_candidates: Vec::new(),
+            depth: 0,
+            is_optional: false,
+            choice_player: None,
+            library_placement: None,
+            exile_controller: None,
+            exile_duration: None,
+            exile_tracking: ZoneDeliveryExileTracking::None,
+            excess_recipient: None,
+            lifelink_bonus: 0,
+            may_cost_paid: false,
+            may_cost_remaining: None,
+            delivery_boundary: None,
+            unrepresentable_life_change: policy,
+        }
+    }
+
+    /// Wire shape of the parked-record policy: present as `"Reject"` and
+    /// round-trips; omitted for the ordinary policy; absent in older payloads.
+    #[test]
+    fn pending_replacement_unrepresentable_life_change_wire_shape() {
+        let reject = pending_life_gain_replacement(UnrepresentablePolicy::Reject);
+        let json = serde_json::to_value(&reject).expect("record must serialize");
+        assert_eq!(
+            json.get("unrepresentable_life_change"),
+            Some(&serde_json::json!("Reject"))
+        );
+        let round_trip: PendingReplacement =
+            serde_json::from_value(json).expect("record must deserialize");
+        assert_eq!(round_trip, reject);
+
+        let ordinary = pending_life_gain_replacement(UnrepresentablePolicy::IgnoreImpossible);
+        let mut json = serde_json::to_value(&ordinary).expect("record must serialize");
+        assert!(
+            json.get("unrepresentable_life_change").is_none(),
+            "the ordinary policy must be omitted from the wire: {json}"
+        );
+        // An older payload (no key) deserializes to the ordinary policy.
+        json.as_object_mut()
+            .expect("record serializes as an object")
+            .remove("unrepresentable_life_change");
+        let legacy: PendingReplacement =
+            serde_json::from_value(json).expect("legacy record must deserialize");
+        assert_eq!(
+            legacy.unrepresentable_life_change,
+            UnrepresentablePolicy::IgnoreImpossible
+        );
+    }
+
+    /// CR 616.1f: a re-parked record copies a `Reject` stamp from its
+    /// predecessor and never downgrades one it already carries.
+    #[test]
+    fn inherit_unrepresentable_life_change_copies_reject_and_never_downgrades() {
+        let mut reparked = pending_life_gain_replacement(UnrepresentablePolicy::IgnoreImpossible);
+        reparked.inherit_unrepresentable_life_change(UnrepresentablePolicy::IgnoreImpossible);
+        assert_eq!(
+            reparked.unrepresentable_life_change,
+            UnrepresentablePolicy::IgnoreImpossible,
+            "an ordinary predecessor leaves the default record ordinary"
+        );
+        reparked.inherit_unrepresentable_life_change(UnrepresentablePolicy::Reject);
+        assert_eq!(
+            reparked.unrepresentable_life_change,
+            UnrepresentablePolicy::Reject,
+            "a rejecting predecessor stamps the default record"
+        );
+        reparked.inherit_unrepresentable_life_change(UnrepresentablePolicy::IgnoreImpossible);
+        assert_eq!(
+            reparked.unrepresentable_life_change,
+            UnrepresentablePolicy::Reject,
+            "an ordinary predecessor must not downgrade a rejecting record"
         );
     }
 }

@@ -215,6 +215,17 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 156 — DebugAction gains GainLife / LoseLife (Sandbox life changes through the
+ *      CR 119.3 events), carried in GameAction.Debug — see PROTOCOL_VERSION's
+ *      own `/// 156` entry in crates/lobby-broker/src/protocol.rs. A v155 peer
+ *      cannot parse the tags; the exact-match version check at connect refuses
+ *      the pairing. Wire 138 moves with it.
+ * 155 — PendingChangeZoneIteration members carry their pre-event entry modifications
+ *      (ChangeZoneMemberEntry, CR 603.6a + CR 614.12), and the persisted resolution
+ *      state moves from version 6 to 7 — see PROTOCOL_VERSION's own `/// 155` entry
+ *      in crates/lobby-broker/src/protocol.rs. A v154 peer cannot parse a parked
+ *      ChangeZone frame and refuses the version-7 resolution state. Wire 137 moves
+ *      with it.
  * 154 — PendingCostMoveResume gains CounterCostRemovalPayment (a counter-removal
  *       cost paused on a CR 616.1 replacement choice; the activation reads the
  *       settled count, CR 118.11) and ManaAbilityCostCursor gains
@@ -938,7 +949,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 154;
+export const PROTOCOL_VERSION = 156;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
