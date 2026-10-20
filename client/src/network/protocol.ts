@@ -106,14 +106,19 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  137 — action and preview_mana_payment carry GameAction, whose Debug payload
+ *  138 — action and preview_mana_payment carry GameAction, whose Debug payload
  *       gains DebugAction GainLife / LoseLife, and game_setup / state_update
  *       carry a parked replacement that records whether its life event came
  *       from an action-ingress life change (a Sandbox life action, paying life,
  *       or a loop shortcut's life axis) (pending_replacement.unrepresentable_life_change,
- *       "Reject", omitted when ordinary). A v136 peer cannot parse the new
+ *       "Reject", omitted when ordinary). A v137 peer cannot parse the new
  *       tags, so first contact rejects the skew. Bumped in lockstep with
- *       full-game protocol 155.
+ *       full-game protocol 156.
+ *  137 — game_setup and state_update carry GameState whose parked ChangeZone
+ *       frame stores each remaining member with its pre-event entry
+ *       modifications (CR 603.6a + CR 614.12) and whose resolution state moves
+ *       from version 6 to 7; a v136 peer cannot parse it. Bumped in lockstep
+ *       with full-game protocol 155.
  *  136 — game_setup and state_update carry GameState whose
  *       pending_cost_move_resume may hold PendingCostMoveResume
  *       CounterCostRemovalPayment (a counter-removal cost paused on a CR 616.1
@@ -735,7 +740,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 137 as const;
+export const WIRE_PROTOCOL_VERSION = 138 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

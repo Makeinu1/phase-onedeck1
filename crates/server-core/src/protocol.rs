@@ -3473,15 +3473,21 @@ mod tests {
         }
     }
 
-    /// v155: `DebugAction` gains `GainLife` / `LoseLife` (Sandbox life changes
-    /// through the CR 119.3 events), carried in `GameAction::Debug`; a v154 peer
+    /// v156: `DebugAction` gains `GainLife` / `LoseLife` (Sandbox life changes
+    /// through the CR 119.3 events), carried in `GameAction::Debug`; a v155 peer
     /// cannot parse the tags, so it must be refused before it can receive or
     /// send one. A parked replacement also records whether its life event came
     /// from an action-ingress life change (a Sandbox life action, paying life, or
     /// a loop shortcut's life axis) (`PendingReplacement.unrepresentable_life_change`,
     /// `"Reject"`, omitted when ordinary), so its resumed delivery rejects an
-    /// unrepresentable result. P2P moves in lockstep (wire 137); lobby messages
+    /// unrepresentable result. P2P moves in lockstep (wire 138); lobby messages
     /// unchanged.
+    ///
+    /// v155: `PendingChangeZoneIteration.remaining` carries each member's
+    /// pre-event entry modifications (`ChangeZoneMemberEntry`, CR 603.6a +
+    /// CR 614.12) and drops the raw gate fields, and the persisted resolution
+    /// state moves from version 6 to 7; a v154 peer cannot parse a parked
+    /// ChangeZone frame, so it must be refused before it receives v155 state.
     ///
     /// v154: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
     /// counter-removal cost paused on a CR 616.1 replacement choice, whose
@@ -3740,8 +3746,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_155_for_sandbox_life_debug_actions() {
-        assert_eq!(PROTOCOL_VERSION, 155);
+    fn protocol_version_is_156_for_sandbox_life_debug_actions() {
+        assert_eq!(PROTOCOL_VERSION, 156);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3752,7 +3758,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_155_for_sandbox_life_debug_actions` stays
+    /// `protocol_version_is_156_for_sandbox_life_debug_actions` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

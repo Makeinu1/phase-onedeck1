@@ -12345,7 +12345,7 @@ fn player_scope_unbound_at_fire_time(scope: &PlayerScope) -> bool {
         PlayerScope::ScopedPlayer
         | PlayerScope::Target
         | PlayerScope::RecipientController
-        | PlayerScope::ParentObjectTargetController => true,
+        | PlayerScope::ParentObjectTarget { .. } => true,
         PlayerScope::AllPlayers { exclude, .. } => exclude
             .as_deref()
             .is_some_and(player_scope_unbound_at_fire_time),
