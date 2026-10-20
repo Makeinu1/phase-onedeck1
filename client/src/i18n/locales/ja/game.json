@@ -206,13 +206,13 @@
     }
   },
   "actionButton": {
-    "clearAttackers": "攻撃クリーチャーを解除",
+    "clearAttackers": "攻撃解除",
     "attackWithAll": "すべてで攻撃",
-    "confirmAttackers": "攻撃クリーチャーを確定（{{count}}）",
+    "confirmAttackers": "攻撃確定（{{count}}）",
     "attackWithNone": "攻撃なし",
     "attackWithNoneConfirm": "もう一度タップ: 攻撃なし",
-    "confirmBlockers": "ブロッカーを確定（{{count}}）",
-    "resetBlocks": "ブロックをリセット",
+    "confirmBlockers": "ブロック確定（{{count}}）",
+    "resetBlocks": "ブロック解除",
     "blockWithNone": "ブロックなし",
     "blockWithNoneConfirm": "もう一度タップ: ブロックなし",
     "selectAttackerForBlocker": "このブロッカーが防御する攻撃クリーチャーを選択",
@@ -223,7 +223,7 @@
     "resolveAll": "すべて解決",
     "resolveAllTooltip": "スタックが解決される間、優先権をパスし続けます。必須の選択や停止で中断されることがあります。",
     "priorityTooltip": "優先権をパスします。スタックが空なら、現在の優先権ウィンドウを進めます。ショートカット: Space。",
-    "pass": "パス",
+    "pass": "終了まで",
     "passToEndTooltip": "選択、停止、フルコントロールで中断されない限り、終了ステップまで自動的にパスします。ショートカット: Enter。",
     "autoPassing": "終了ステップまで自動パス中…",
     "resolvingStack": "スタック解決中…"
@@ -816,8 +816,8 @@
     "banded": "バンド済み ✓",
     "attackAll": "すべてで攻撃",
     "skip": "スキップ",
-    "confirmAttackers": "攻撃クリーチャーを確定（{{count}}）",
-    "confirmBlockers": "ブロッカーを確定（{{count}}）",
+    "confirmAttackers": "攻撃確定（{{count}}）",
+    "confirmBlockers": "ブロック確定（{{count}}）",
     "clickAttackerToAssignBlocker": "攻撃クリーチャーをクリックしてブロッカーを割り当て",
     "menaceRequirement": "{{count}}体以上でブロックするか、まったくブロックしない",
     "blockNeedsBadge": "必要数 {{required}}",
@@ -2524,7 +2524,7 @@
   },
   "advance": {
     "resolve": "解決",
-    "passPriority": "優先権をパス",
+    "passPriority": "パス",
     "toPhase": "{{phase}}へ"
   },
   "outsideGame": {
