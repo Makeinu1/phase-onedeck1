@@ -2631,6 +2631,16 @@ mod tests {
             power: i32,
             doublers: &[&str],
         ) -> (GameRunner, Vec<GameEvent>, ObjectId) {
+            cast_dazzling_reflection_answering(power, doublers, Some(0))
+        }
+
+        /// As [`cast_dazzling_reflection`], with the ordering answer chosen by the
+        /// caller: `None` halts the cast at the CR 616.1 prompt instead.
+        fn cast_dazzling_reflection_answering(
+            power: i32,
+            doublers: &[&str],
+            replacement_choice: Option<usize>,
+        ) -> (GameRunner, Vec<GameEvent>, ObjectId) {
             let mut scenario = scenario();
             for doubler in doublers {
                 add_card(&mut scenario, P0, doubler);
@@ -2644,15 +2654,18 @@ mod tests {
             );
             scenario.with_mana_pool(P0, vec![mana(ManaType::White), mana(ManaType::White)]);
             let mut runner = scenario.build();
-            let outcome = runner
+            let cast = runner
                 .cast(spell)
                 // Both of the spell's target slots name the same creature; with
                 // Rhox Faithmender also on the battlefield the second slot has two
                 // legal creatures, so it must be declared explicitly.
                 .target_object(creature)
-                .target_object(creature)
-                .replacement_choice(0)
-                .resolve();
+                .target_object(creature);
+            let outcome = match replacement_choice {
+                Some(index) => cast.replacement_choice(index),
+                None => cast,
+            }
+            .resolve();
             let events = outcome.events().to_vec();
             (runner, events, spell)
         }
@@ -2727,6 +2740,26 @@ mod tests {
         /// spell resolves with the gain skipped.
         #[test]
         fn choice_resumed_ordinary_quantity_overflow_is_skipped_not_rejected() {
+            // Reach guard: the same setup, left unanswered, halts at the CR 616.1
+            // ordering prompt for the two doublers, so the answer below is a real
+            // prompt answer rather than a no-prompt degenerate path.
+            let (prompted, _, _) = cast_dazzling_reflection_answering(
+                600_000_000,
+                &["Rhox Faithmender", "Boon Reflection"],
+                None,
+            );
+            assert!(
+                matches!(
+                    prompted.state().waiting_for,
+                    WaitingFor::ReplacementChoice {
+                        candidate_count: 2,
+                        ..
+                    }
+                ),
+                "reach guard: two doublers must park an ordering prompt, got {:?}",
+                prompted.state().waiting_for
+            );
+
             // 600,000,000 doubled is 1,200,000,000; doubled again overflows i32.
             let (runner, events, spell) =
                 cast_dazzling_reflection(600_000_000, &["Rhox Faithmender", "Boon Reflection"]);

@@ -3870,26 +3870,30 @@ mod tests {
             }
         }
 
-        /// CR 101.3 + CR 616.1: three multipliers (x10, x10, x1,000) would take a
-        /// requested 1,000,000 to 100,000,000,000, past an `i32`. Prompts are asked
-        /// while two or more candidates remain (three, then two): the first answer
-        /// applies one multiplier (at most 1,000,000,000, which fits), and the
-        /// second applies another and then auto-applies the last, whose checked
-        /// multiply reports the result as unrepresentable. That answer is
-        /// rejected unchanged, the prompt stays answerable, and no later prompt is
-        /// asked. The accepted control (x10, x10, x20 = 2,000,000,000) fits and
-        /// applies in full.
+        /// CR 101.3 + CR 616.1: a parsed Boon Reflection ("If you would gain life,
+        /// you gain twice that much life instead.") and two hand-built x1,000
+        /// multipliers would take a requested 1,000,000 to 2,000,000,000,000, past
+        /// an `i32`. Prompts are asked while two or more candidates remain (three,
+        /// then two): the first answer applies one candidate (at most
+        /// 1,000,000 x 1,000 = 1,000,000,000, which fits), and the second applies
+        /// another (at most 2,000,000,000, which fits) and then auto-applies the
+        /// last, whose checked multiply reports the result as unrepresentable in
+        /// any order. That answer is rejected unchanged, the prompt stays
+        /// answerable, and no later prompt is asked. The accepted control (Boon
+        /// Reflection with x10 and x100 = 2 x 10 x 100 x 1,000,000 =
+        /// 2,000,000,000) fits and applies in full.
         #[test]
         fn debug_gain_large_multipliers_reject_the_overflowing_application() {
             // Accepted control: the product 2,000 x 1,000,000 fits an i32.
             let mut scenario = scenario();
             let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            add_card(&mut scenario, P0, "Boon Reflection");
             let mut runner = debug_runner(scenario);
-            add_life_multipliers(&mut runner, ReplacementEvent::GainLife, &[10, 10, 20]);
+            add_life_multipliers(&mut runner, ReplacementEvent::GainLife, &[10, 100]);
             act_ok(&mut runner, gain(P0, MAX_DEBUG_LIFE_AMOUNT));
             assert!(
                 replacement_prompt_open(&runner),
-                "reach guard: three multipliers park an ordering prompt, got {:?}",
+                "reach guard: three doublers park an ordering prompt, got {:?}",
                 runner.state().waiting_for
             );
             answer_to_completion(&mut runner);
@@ -3901,15 +3905,16 @@ mod tests {
             runner.advance_until_stack_empty();
             assert_eq!(p1p1(&runner, mate), 1);
 
-            // Overflow: the product 100,000 x 1,000,000 does not fit.
+            // Overflow: the product 2,000,000 x 1,000,000 does not fit.
             let mut scenario = self::scenario();
             let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            add_card(&mut scenario, P0, "Boon Reflection");
             let mut runner = debug_runner(scenario);
-            add_life_multipliers(&mut runner, ReplacementEvent::GainLife, &[10, 10, 1_000]);
+            add_life_multipliers(&mut runner, ReplacementEvent::GainLife, &[1_000, 1_000]);
             act_ok(&mut runner, gain(P0, MAX_DEBUG_LIFE_AMOUNT));
             assert!(
                 replacement_prompt_open(&runner),
-                "reach guard: three multipliers park an ordering prompt, got {:?}",
+                "reach guard: three doublers park an ordering prompt, got {:?}",
                 runner.state().waiting_for
             );
             assert_eq!(
@@ -3919,10 +3924,11 @@ mod tests {
             );
             let accepted = assert_choice_rejected_and_still_answerable(&mut runner, mate);
             // Prompts are asked while two or more candidates remain: the first
-            // answer applies one multiplier (at most x1,000 = 1,000,000,000, which
-            // fits) and leaves two, the second answer applies another and then
-            // auto-applies the last, which overflows. The exact count is not
-            // load-bearing; some answer was accepted before the rejection.
+            // answer applies one candidate (fits) and leaves two, the second
+            // answer applies another (fits) and then auto-applies the last, which
+            // overflows. The exact count is not load-bearing here (the
+            // loop-head stop is pinned by the next row); some answer was
+            // accepted before the rejection.
             assert!(
                 (1..=2).contains(&accepted),
                 "accepted {accepted} answers before the rejection"
@@ -3933,6 +3939,46 @@ mod tests {
                 None,
                 "the rejected action's snapshot restore clears the record"
             );
+        }
+
+        /// CR 101.3 + CR 616.1f: the loop-head stop, through the production
+        /// action. Four x100 multipliers on 1,000,000: the first application
+        /// gives 100,000,000 (fits) and the second 10,000,000,000, which
+        /// overflows an `i32` in any order. Prompts are asked only while two or
+        /// more applicable replacements remain: the first prompt (four
+        /// candidates) is answered and accepted, leaving three; the second
+        /// answer applies the overflowing multiplier, and the repetition stops
+        /// there, so the answer is rejected. Exactly one answer is accepted. If
+        /// the loop kept going after the overflow, two candidates would remain,
+        /// the second answer would re-park a prompt and be accepted, and the
+        /// rejection would only come with the third answer (`accepted == 2`).
+        #[test]
+        fn debug_gain_overflow_stops_the_repetition_before_the_remaining_multipliers() {
+            let mut scenario = scenario();
+            let mate = add_card(&mut scenario, P0, "Ajani's Pridemate");
+            let mut runner = debug_runner(scenario);
+            add_life_multipliers(
+                &mut runner,
+                ReplacementEvent::GainLife,
+                &[100, 100, 100, 100],
+            );
+            act_ok(&mut runner, gain(P0, MAX_DEBUG_LIFE_AMOUNT));
+            assert_eq!(
+                runner
+                    .state()
+                    .pending_replacement
+                    .as_ref()
+                    .map(|pending| pending.candidates.len()),
+                Some(4),
+                "reach guard: all four multipliers are ordered at the first prompt"
+            );
+            let accepted = assert_choice_rejected_and_still_answerable(&mut runner, mate);
+            assert_eq!(
+                accepted, 1,
+                "the overflow on the second application ends the repetition"
+            );
+            assert_eq!(life(&runner, P0), 20);
+            assert_eq!(runner.state().replacement_quantity_overflow, None);
         }
 
         /// Bloodletter of Aclazotz ("If an opponent would lose life during your
