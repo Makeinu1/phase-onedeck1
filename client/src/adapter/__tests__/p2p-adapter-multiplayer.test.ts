@@ -1057,7 +1057,8 @@ async function joinGuest(
   const conn = new FakeOpenableConnection();
   emitConnection(conn as unknown as DataConnection);
   conn.fireOpen();
-  await conn.simulateData({ ...msg, wireProtocolVersion: msg.wireProtocolVersion ?? WIRE_PROTOCOL_VERSION });
+  // Explicit undefined exercises a missing-version frame; omitted fixture fields default to current.
+  await conn.simulateData({ ...msg, wireProtocolVersion: "wireProtocolVersion" in msg ? msg.wireProtocolVersion : WIRE_PROTOCOL_VERSION });
   return conn;
 }
 
@@ -6809,7 +6810,7 @@ describe("P2P wire-protocol version gate", () => {
     },
   } as unknown as GameState);
 
-  const setupFrameAt = (wireProtocolVersion: number) => ({
+  const setupFrameAt = (wireProtocolVersion: number | undefined) => ({
     type: "game_setup" as const,
     wireProtocolVersion,
     assignedPlayerId: 1,
@@ -6852,7 +6853,7 @@ describe("P2P wire-protocol version gate", () => {
   // check back into the transport would surface here as the refusing half
   // never emitting.
   //
-  it.each([115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131])("refuses independent earlier wire history v%s", async (version) => {
+  it.each([115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138])("refuses independent earlier wire history v%s", async (version) => {
     const refusing = makeGuest();
     await refusing.adapter.initialize();
     await refusing.conn.simulateData(setupFrameAt(version));
@@ -6866,22 +6867,12 @@ describe("P2P wire-protocol version gate", () => {
     );
   });
 
-  // Both halves stamp LITERALS. A frame built from WIRE_PROTOCOL_VERSION
-  // cannot tell a bumped client from an unbumped one, which is why every
-  // other handshake fixture in the suite is useless as an instrument for a
-  // bump. Reverting WIRE_PROTOCOL_VERSION itself (133 → 132) breaks both
-  // halves' premise: the v132 frame now equals the reverted constant and is
-  // admitted instead of refused — this test would fail at that first
-  // assertion ("promise resolved … instead of rejecting") — and the v133
-  // frame no longer equals it and would be refused instead of admitted,
-  // though this single synchronous test body never reaches that second
-  // assertion once the first has thrown. The admitting half is still the
-  // reach-guard — without it "refuses v132" is also satisfied by a client
-  // that refuses everything.
-  it("refuses the previous wire protocol (v132) and admits its own (v133)", async () => {
+  // Admission stays exact-current as registry records advance the wire version.
+  // Every refusal has a populated current-frame positive reach guard.
+  it.each([WIRE_PROTOCOL_VERSION - 1, WIRE_PROTOCOL_VERSION + 1, undefined])("refuses skewed wire protocol %s and admits its own", async (version) => {
     const refusing = makeGuest();
     await refusing.adapter.initialize();
-    await refusing.conn.simulateData(setupFrameAt(132));
+    await refusing.conn.simulateData(setupFrameAt(version));
 
     await expect(refusing.adapter.initializeGame()).rejects.toMatchObject({
       code: "P2P_REJECTED",
@@ -6893,7 +6884,7 @@ describe("P2P wire-protocol version gate", () => {
 
     const admitting = makeGuest();
     await admitting.adapter.initialize();
-    await admitting.conn.simulateData(setupFrameAt(133));
+    await admitting.conn.simulateData(setupFrameAt(WIRE_PROTOCOL_VERSION));
 
     await expect(admitting.adapter.initializeGame()).resolves.toBeDefined();
     expect((await admitting.adapter.getState()).objects["42"]).toMatchObject({
@@ -6907,10 +6898,10 @@ describe("P2P wire-protocol version gate", () => {
     );
   });
 
-  it("refuses old reconnect acknowledgement before adopting populated Bestow state", async () => {
+  it.each([132, 133, 134, 135, 136, 137, 138, 139, 140, WIRE_PROTOCOL_VERSION - 1, WIRE_PROTOCOL_VERSION + 1, undefined])("refuses incompatible reconnect acknowledgement %s before adopting populated Bestow state", async (version) => {
     const refusing = makeGuest(new FakeDataConnection(), undefined, "prior-token");
     await refusing.adapter.initialize();
-    await refusing.conn.simulateData({ ...setupFrameAt(132), type: "reconnect_ack" });
+    await refusing.conn.simulateData({ ...setupFrameAt(version), type: "reconnect_ack" });
     await expect(refusing.adapter.initializeGame()).rejects.toMatchObject({
       code: "P2P_REJECTED", message: expect.stringContaining("Wire protocol mismatch"),
     });
@@ -6920,7 +6911,7 @@ describe("P2P wire-protocol version gate", () => {
 
     const admitting = makeGuest(new FakeDataConnection(), undefined, "prior-token");
     await admitting.adapter.initialize();
-    await admitting.conn.simulateData({ ...setupFrameAt(133), type: "reconnect_ack" });
+    await admitting.conn.simulateData({ ...setupFrameAt(WIRE_PROTOCOL_VERSION), type: "reconnect_ack" });
     await expect(admitting.adapter.initializeGame()).resolves.toBeDefined();
     expect((await admitting.adapter.getState()).objects["42"]).toMatchObject({
       id: 42, bestow_form: { removed_creature_subtypes: ["Insect", "Monk"] },
@@ -6930,12 +6921,12 @@ describe("P2P wire-protocol version gate", () => {
     admitting.adapter.dispose();
   });
 
-  it("host rejects previous Bestow peers before seat or reconnect adoption", async () => {
+  it.each([132, 133, 134, 135, 136, 137, 138, 139, 140, WIRE_PROTOCOL_VERSION - 1, WIRE_PROTOCOL_VERSION + 1, undefined])("host rejects incompatible peers %s before seat or reconnect adoption", async (version) => {
     const { adapter, emitConnection } = makeHost(2);
     await adapter.initialize();
     const oldJoin = await joinGuest(emitConnection, {
       type: "guest_deck", deckData: { player: { main_deck: [], sideboard: [] } },
-      wireProtocolVersion: 132,
+      wireProtocolVersion: version,
     });
     expect(await sentOfType(oldJoin, "reconnect_rejected")).toBeDefined();
     expect(oldJoin.open).toBe(false);
@@ -6943,7 +6934,7 @@ describe("P2P wire-protocol version gate", () => {
 
     const current = await joinGuest(emitConnection, {
       type: "guest_deck", deckData: { player: { main_deck: [], sideboard: [] } },
-      wireProtocolVersion: 133,
+      wireProtocolVersion: WIRE_PROTOCOL_VERSION,
     });
     await adapter.initializeGame();
     const setup = (await current.getSentMessages()).find(
@@ -6955,13 +6946,13 @@ describe("P2P wire-protocol version gate", () => {
     expect(await sentOfType(current, "reconnect_rejected")).toBeUndefined();
     current.simulateClose();
     const oldReconnect = await joinGuest(emitConnection, {
-      type: "reconnect", playerToken: setup!.playerToken, wireProtocolVersion: 132,
+      type: "reconnect", playerToken: setup!.playerToken, wireProtocolVersion: version,
     });
     expect(await sentOfType(oldReconnect, "reconnect_rejected")).toBeDefined();
     expect(oldReconnect.open).toBe(false);
     expect(await sentOfType(oldReconnect, "reconnect_ack")).toBeUndefined();
     const currentReconnect = await joinGuest(emitConnection, {
-      type: "reconnect", playerToken: setup!.playerToken, wireProtocolVersion: 133,
+      type: "reconnect", playerToken: setup!.playerToken, wireProtocolVersion: WIRE_PROTOCOL_VERSION,
     });
     expect(await sentOfType(currentReconnect, "reconnect_ack")).toBeDefined();
     expect(await sentOfType(currentReconnect, "reconnect_rejected")).toBeUndefined();
