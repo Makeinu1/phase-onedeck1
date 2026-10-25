@@ -15,7 +15,7 @@ use tracing::{error, info};
 /// How the game-session store bounds retention of `game_sessions` rows.
 ///
 /// This is a property of the deployment, not of any individual save call, so it
-/// lives on the store and `save_session` is its single enforcement point.
+/// lives on the store and governs both save-time pruning and stale cleanup.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionRetention {
     /// Online server: every `game_code` persists independently. Many games run
@@ -25,10 +25,14 @@ pub enum SessionRetention {
     /// The client tracks a single active-game pointer, so starting a new game
     /// orphans the previous session server-side. Saving a new `game_code`
     /// prunes every other game session, keeping the store bounded to one row
-    /// without relying on the stale-age purge (which single-user disables so a
-    /// suspended game never expires).
+    /// without relying on stale-age pruning of gameplay sessions (which
+    /// single-user disables so a suspended game never expires). Terminal
+    /// delivery payloads still expire after the shared retention window.
     SingleUser,
 }
+
+/// Gameplay session and terminal delivery payload retention window.
+pub const PERSISTED_SESSION_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
 /// SQLite-backed persistence for active game sessions.
 ///
@@ -276,28 +280,46 @@ impl GameDb {
         Ok(())
     }
 
-    /// Delete persisted sessions older than `max_age_secs` seconds across every
-    /// session table — `game_sessions`, `draft_sessions`, and
-    /// `p2p_draft_backups` — and return the total number of rows removed.
+    /// Delete Multiplayer session rows older than `max_age_secs` seconds and
+    /// expire recipient final-view payloads for older terminal results in both
+    /// retention modes. SingleUser gameplay sessions remain resumable.
     ///
-    /// Previously only `game_sessions` was pruned, so stale `draft_sessions`
-    /// and `p2p_draft_backups` rows (abandoned drafts, hosts that never cleanly
-    /// tore down a P2P pod) accumulated indefinitely and leaked database
-    /// storage on long-running servers.
+    /// The returned count includes only deleted session rows, not expired
+    /// terminal payloads. Terminal result metadata, credentials, delivery IDs,
+    /// and acknowledgement state are retained.
     pub fn delete_stale(&self, max_age_secs: u64) -> rusqlite::Result<usize> {
-        let cutoff = now_epoch().saturating_sub(max_age_secs);
+        self.delete_stale_at(now_epoch(), max_age_secs)
+    }
+
+    fn delete_stale_at(&self, now: u64, max_age_secs: u64) -> rusqlite::Result<usize> {
+        let cutoff = now.saturating_sub(max_age_secs);
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let mut deleted = tx.execute(
-            "DELETE FROM game_sessions WHERE retired = 0 AND updated_at < ?1",
-            params![cutoff],
-        )?;
-        deleted += tx.execute(
-            "DELETE FROM draft_sessions WHERE updated_at < ?1",
-            params![cutoff],
-        )?;
-        deleted += tx.execute(
-            "DELETE FROM p2p_draft_backups WHERE updated_at < ?1",
+        let mut deleted = 0;
+        if self.retention == SessionRetention::Multiplayer {
+            deleted += tx.execute(
+                "DELETE FROM game_sessions WHERE retired = 0 AND updated_at < ?1",
+                params![cutoff],
+            )?;
+            deleted += tx.execute(
+                "DELETE FROM draft_sessions WHERE updated_at < ?1",
+                params![cutoff],
+            )?;
+            deleted += tx.execute(
+                "DELETE FROM p2p_draft_backups WHERE updated_at < ?1",
+                params![cutoff],
+            )?;
+        }
+        tx.execute(
+            "UPDATE terminal_match_delivery
+             SET final_view_json = NULL
+             WHERE final_view_json IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM terminal_match_results AS result
+                   WHERE result.game_code = terminal_match_delivery.game_code
+                     AND result.generation = terminal_match_delivery.generation
+                     AND result.created_at < ?1
+               )",
             params![cutoff],
         )?;
         tx.commit()?;
@@ -1568,6 +1590,57 @@ mod tests {
         GameDb::open(file.path(), SessionRetention::Multiplayer).unwrap()
     }
 
+    fn insert_terminal_fixture(
+        db: &GameDb,
+        game_code: &str,
+        generation: u64,
+        created_at: u64,
+        deliveries: &[(u8, Option<&str>, Option<u64>)],
+    ) {
+        let display_json = serde_json::to_string(&TerminalMatchDisplay {
+            winner: None,
+            reason: "retained metadata".to_string(),
+            ranked_result: None,
+        })
+        .unwrap();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO terminal_match_results
+             (game_code, generation, terminal_revision, artifact_digest, display_json, created_at)
+             VALUES (?1, ?2, 9, ?3, ?4, ?5)",
+            params![
+                game_code,
+                generation,
+                format!("digest-{game_code}-{generation}"),
+                display_json,
+                created_at
+            ],
+        )
+        .unwrap();
+        for (player_id, final_view_json, acknowledged_at) in deliveries {
+            let delivery_id = format!("delivery-{game_code}-{generation}-{player_id}");
+            let pre_terminal_verifier = format!("pre-{game_code}-{generation}-{player_id}");
+            let credential_verifier = format!("credential-{game_code}-{generation}-{player_id}");
+            conn.execute(
+                "INSERT INTO terminal_match_delivery
+                 (game_code, generation, player_id, terminal_revision, delivery_id,
+                  pre_terminal_token_verifier, credential_verifier, acknowledged_at, final_view_json)
+                 VALUES (?1, ?2, ?3, 9, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    game_code,
+                    generation,
+                    *player_id,
+                    delivery_id,
+                    pre_terminal_verifier,
+                    credential_verifier,
+                    *acknowledged_at,
+                    final_view_json
+                ],
+            )
+            .unwrap();
+        }
+    }
+
     fn test_final_view_json(player_id: u8) -> String {
         serde_json::json!({
             "turn_number": 7,
@@ -2535,6 +2608,7 @@ mod tests {
             }],
         };
         db.prepare_full_terminal(&artifact).unwrap();
+        assert_eq!(db.delete_stale(PERSISTED_SESSION_MAX_AGE_SECS).unwrap(), 0);
         let original = db
             .current_terminal_delivery_for_recipient(&snapshot.key, PlayerId(0), "player-0")
             .unwrap()
@@ -2963,5 +3037,507 @@ mod tests {
         assert_eq!(db.load_all_drafts().unwrap().len(), 1);
         assert!(db.load_p2p_backup("B").unwrap().is_none());
         assert!(db.load_p2p_backup("BNEW").unwrap().is_some());
+    }
+
+    #[test]
+    fn stale_cutoff_is_strict_and_terminal_expiry_matches_code_and_generation() {
+        let db = test_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            for updated_at in [89u64, 90, 91] {
+                let suffix = updated_at.to_string();
+                conn.execute(
+                    "INSERT INTO game_sessions (game_code, session_json, updated_at) VALUES (?1, 'game', ?2)",
+                    params![format!("G{suffix}"), updated_at],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO draft_sessions (draft_code, session_json, updated_at) VALUES (?1, 'draft', ?2)",
+                    params![format!("D{suffix}"), updated_at],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO p2p_draft_backups (draft_code, host_peer_id, snapshot_json, updated_at)
+                     VALUES (?1, 'peer', 'backup', ?2)",
+                    params![format!("B{suffix}"), updated_at],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO game_sessions (game_code, session_json, updated_at) VALUES ('STALE-RECENT-TERM', 'game', 89)",
+                [],
+            )
+            .unwrap();
+        }
+
+        insert_terminal_fixture(
+            &db,
+            "MATCH",
+            1,
+            89,
+            &[
+                (0, Some("{\"seat\":0}"), None),
+                (1, Some("{\"seat\":1}"), None),
+            ],
+        );
+        insert_terminal_fixture(
+            &db,
+            "MATCH",
+            2,
+            91,
+            &[
+                (0, Some("{\"seat\":0}"), None),
+                (1, Some("{\"seat\":1}"), None),
+            ],
+        );
+        insert_terminal_fixture(&db, "MATCH", 3, 90, &[(0, Some("{\"seat\":0}"), None)]);
+        insert_terminal_fixture(&db, "OTHER", 1, 91, &[(0, Some("{\"seat\":0}"), None)]);
+        insert_terminal_fixture(
+            &db,
+            "STALE-RECENT-TERM",
+            1,
+            91,
+            &[(0, Some("{\"seat\":0}"), None)],
+        );
+
+        // With now=100 and max_age=10, 89 is stale, equality at 90 survives,
+        // and 91 is fresh. The session's updated_at does not age its separate
+        // recent terminal artifact.
+        assert_eq!(db.delete_stale_at(100, 10).unwrap(), 4);
+        assert!(db.load_p2p_backup("B89").unwrap().is_none());
+        assert!(db.load_p2p_backup("B90").unwrap().is_some());
+        assert!(db.load_p2p_backup("B91").unwrap().is_some());
+        assert!(db.load_all().unwrap().iter().all(|(code, _)| code != "G89"));
+        assert!(db.load_all().unwrap().iter().any(|(code, _)| code == "G90"));
+        assert!(db.load_all().unwrap().iter().any(|(code, _)| code == "G91"));
+        assert!(db
+            .load_all()
+            .unwrap()
+            .iter()
+            .all(|(code, _)| code != "STALE-RECENT-TERM"));
+
+        let conn = db.conn.lock().unwrap();
+        let payloads_for = |code: &str, generation: u64| {
+            let mut statement = conn
+                .prepare(
+                    "SELECT final_view_json FROM terminal_match_delivery
+                     WHERE game_code = ?1 AND generation = ?2 ORDER BY player_id",
+                )
+                .unwrap();
+            statement
+                .query_map(params![code, generation], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(payloads_for("MATCH", 1), vec![None, None]);
+        assert_eq!(
+            payloads_for("MATCH", 2),
+            vec![
+                Some("{\"seat\":0}".to_string()),
+                Some("{\"seat\":1}".to_string())
+            ]
+        );
+        assert_eq!(
+            payloads_for("MATCH", 3),
+            vec![Some("{\"seat\":0}".to_string())]
+        );
+        assert_eq!(
+            payloads_for("OTHER", 1),
+            vec![Some("{\"seat\":0}".to_string())]
+        );
+        assert_eq!(
+            payloads_for("STALE-RECENT-TERM", 1),
+            vec![Some("{\"seat\":0}".to_string())]
+        );
+    }
+
+    #[test]
+    fn stale_cutoff_saturates_at_zero_and_keeps_timestamp_zero_rows() {
+        let db = test_db();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO game_sessions (game_code, session_json, updated_at) VALUES ('ZERO', 'game', 0)",
+                [],
+            )
+            .unwrap();
+        insert_terminal_fixture(
+            &db,
+            "ZERO-TERM",
+            1,
+            0,
+            &[(0, Some("{\"zero\":true}"), None)],
+        );
+
+        // now=5 - max_age=10 saturates to zero; the SQL's strict less-than
+        // cutoff keeps a row at the floor.
+        assert_eq!(db.delete_stale_at(5, 10).unwrap(), 0);
+        assert_eq!(db.load_all().unwrap().len(), 1);
+        let payload: Option<String> = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT final_view_json FROM terminal_match_delivery
+                 WHERE game_code = 'ZERO-TERM' AND generation = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload.as_deref(), Some("{\"zero\":true}"));
+    }
+
+    #[test]
+    fn stale_cleanup_honors_retention_counts_only_sessions_and_is_idempotent() {
+        for retention in [SessionRetention::Multiplayer, SessionRetention::SingleUser] {
+            let file = NamedTempFile::new().unwrap();
+            let db = GameDb::open(file.path(), retention).unwrap();
+            {
+                let conn = db.conn.lock().unwrap();
+                conn.execute(
+                    "INSERT INTO game_sessions (game_code, session_json, updated_at) VALUES ('OLDGAME', 'game', 1)",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO draft_sessions (draft_code, session_json, updated_at) VALUES ('OLDDRAFT', 'draft', 1)",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO p2p_draft_backups (draft_code, host_peer_id, snapshot_json, updated_at)
+                     VALUES ('OLDBACK', 'peer', 'backup', 1)",
+                    [],
+                )
+                .unwrap();
+            }
+            insert_terminal_fixture(
+                &db,
+                "OLDTERM",
+                1,
+                1,
+                &[
+                    (0, Some("{\"seat\":0}"), None),
+                    (1, None, None),
+                    (2, None, Some(77)),
+                ],
+            );
+
+            let expected_deleted = if retention == SessionRetention::Multiplayer {
+                3
+            } else {
+                0
+            };
+            assert_eq!(
+                db.delete_stale_at(100_000, 86_400).unwrap(),
+                expected_deleted
+            );
+            assert_eq!(db.delete_stale_at(100_000, 86_400).unwrap(), 0);
+
+            let session_rows: (usize, usize, usize) = {
+                let conn = db.conn.lock().unwrap();
+                (
+                    conn.query_row("SELECT COUNT(*) FROM game_sessions", [], |row| row.get(0))
+                        .unwrap(),
+                    conn.query_row("SELECT COUNT(*) FROM draft_sessions", [], |row| row.get(0))
+                        .unwrap(),
+                    conn.query_row("SELECT COUNT(*) FROM p2p_draft_backups", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap(),
+                )
+            };
+            if retention == SessionRetention::Multiplayer {
+                assert_eq!(session_rows, (0, 0, 0));
+            } else {
+                assert_eq!(session_rows, (1, 1, 1));
+            }
+
+            let conn = db.conn.lock().unwrap();
+            let deliveries = {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT player_id, acknowledged_at, final_view_json
+                         FROM terminal_match_delivery WHERE game_code = 'OLDTERM' ORDER BY player_id",
+                    )
+                    .unwrap();
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, u8>(0)?,
+                            row.get::<_, Option<u64>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            assert_eq!(
+                deliveries,
+                vec![(0, None, None), (1, None, None), (2, Some(77), None)]
+            );
+        }
+    }
+
+    #[test]
+    fn failed_terminal_expiry_rolls_back_session_deletes_and_retry_succeeds() {
+        let db = test_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO game_sessions (game_code, session_json, updated_at) VALUES ('ROLLBACK', 'game', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_terminal_expiry
+                 BEFORE UPDATE OF final_view_json ON terminal_match_delivery
+                 BEGIN SELECT RAISE(ABORT, 'injected terminal expiry failure'); END;",
+            )
+            .unwrap();
+        }
+        insert_terminal_fixture(
+            &db,
+            "ROLLBACK-TERM",
+            1,
+            1,
+            &[(0, Some("{\"rollback\":true}"), None)],
+        );
+
+        assert!(db.delete_stale_at(100_000, 86_400).is_err());
+        assert_eq!(
+            db.load_all().unwrap().len(),
+            1,
+            "the preceding DELETE rolled back"
+        );
+        let payload_after_failure: Option<String> = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT final_view_json FROM terminal_match_delivery WHERE game_code = 'ROLLBACK-TERM'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            payload_after_failure.as_deref(),
+            Some("{\"rollback\":true}")
+        );
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_terminal_expiry;")
+            .unwrap();
+        assert_eq!(db.delete_stale_at(100_000, 86_400).unwrap(), 1);
+        assert!(db.load_all().unwrap().is_empty());
+        let payload_after_retry: Option<String> = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT final_view_json FROM terminal_match_delivery WHERE game_code = 'ROLLBACK-TERM'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload_after_retry, None);
+    }
+
+    #[test]
+    fn prepared_terminal_payload_expires_but_authenticated_metadata_survives_reopen() {
+        let file = NamedTempFile::new().unwrap();
+        let snapshot = full_snapshot("EXPIRE1", 1, 1, None, true);
+        let db = GameDb::open(file.path(), SessionRetention::Multiplayer).unwrap();
+        db.save_full_session(&snapshot).unwrap();
+        let artifact = FullTerminalArtifact {
+            key: snapshot.key.clone(),
+            terminal_revision: 2,
+            display: TerminalMatchDisplay {
+                winner: Some(PlayerId(1)),
+                reason: "Match ended".to_string(),
+                ranked_result: None,
+            },
+            recipients: vec![
+                TerminalRecipient {
+                    player_id: PlayerId(0),
+                    pre_terminal_player_token: "expiry-player-0".to_string(),
+                    final_view_json: test_final_view_json(0),
+                },
+                TerminalRecipient {
+                    player_id: PlayerId(1),
+                    pre_terminal_player_token: "expiry-player-1".to_string(),
+                    final_view_json: test_final_view_json(1),
+                },
+            ],
+        };
+        assert_eq!(
+            db.prepare_full_terminal(&artifact).unwrap(),
+            PrepareFullTerminalDisposition::Prepared
+        );
+        let request = TerminalBootstrapRequest {
+            key: snapshot.key.clone(),
+            player_token: "expiry-player-0".to_string(),
+            request_id: "expiry-bootstrap".to_string(),
+        };
+        let prepared = db.bootstrap_terminal_delivery(&request).unwrap().unwrap();
+        assert_eq!(
+            prepared.final_view.as_ref().unwrap().get(),
+            test_final_view_json(0)
+        );
+        let credential = prepared.credential.clone();
+        let delivery_id = prepared.delivery_id.clone();
+
+        let original_metadata = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT terminal_revision, artifact_digest, display_json, created_at
+                 FROM terminal_match_results WHERE game_code = ?1 AND generation = ?2",
+                params![snapshot.key.game_code, snapshot.key.generation],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, u64>(3)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE terminal_match_results SET created_at = 1 WHERE game_code = ?1 AND generation = ?2",
+                params![snapshot.key.game_code, snapshot.key.generation],
+            )
+            .unwrap();
+        assert_eq!(db.delete_stale(PERSISTED_SESSION_MAX_AGE_SECS).unwrap(), 0);
+
+        let expired = db.read_terminal_result(&credential).unwrap().unwrap();
+        assert_eq!(expired.delivery_id, delivery_id);
+        assert_eq!(expired.display.reason, "Match ended");
+        assert!(expired.final_view.is_none());
+        assert!(db
+            .bootstrap_terminal_delivery(&TerminalBootstrapRequest {
+                player_token: "wrong-token".to_string(),
+                request_id: "wrong-expired-token".to_string(),
+                ..request.clone()
+            })
+            .unwrap()
+            .is_none());
+        assert!(db
+            .read_terminal_result(&TerminalCredential("wrong-credential".to_string()))
+            .unwrap()
+            .is_none());
+        drop(db);
+
+        let reopened = GameDb::open(file.path(), SessionRetention::Multiplayer).unwrap();
+        let recovered = reopened.read_terminal_result(&credential).unwrap().unwrap();
+        assert_eq!(recovered.key, snapshot.key);
+        assert_eq!(recovered.terminal_revision, artifact.terminal_revision);
+        assert_eq!(recovered.delivery_id, delivery_id);
+        assert_eq!(recovered.credential, credential);
+        assert_eq!(recovered.display.reason, "Match ended");
+        assert!(recovered.final_view.is_none());
+        let late_bootstrap = reopened
+            .bootstrap_terminal_delivery(&request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(late_bootstrap.delivery_id, delivery_id);
+        assert!(late_bootstrap.final_view.is_none());
+        assert!(matches!(
+            reopened.bootstrap_terminal_delivery(&TerminalBootstrapRequest {
+                key: snapshot.key.clone(),
+                player_token: "expiry-player-1".to_string(),
+                request_id: "expiry-bootstrap".to_string(),
+            }),
+            Err(rusqlite::Error::InvalidQuery)
+        ));
+
+        assert_eq!(
+            reopened.prepare_full_terminal(&artifact).unwrap(),
+            PrepareFullTerminalDisposition::AlreadyPrepared
+        );
+        assert!(reopened
+            .read_terminal_result(&credential)
+            .unwrap()
+            .unwrap()
+            .final_view
+            .is_none());
+        assert!(reopened
+            .ack_terminal_delivery(&delivery_id, &credential)
+            .unwrap());
+        assert!(reopened
+            .ack_terminal_delivery(&delivery_id, &credential)
+            .unwrap());
+
+        let conn = reopened.conn.lock().unwrap();
+        let final_metadata = conn
+            .query_row(
+                "SELECT terminal_revision, artifact_digest, display_json, created_at
+                 FROM terminal_match_results WHERE game_code = ?1 AND generation = ?2",
+                params![snapshot.key.game_code, snapshot.key.generation],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, u64>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(final_metadata.0, original_metadata.0);
+        assert_eq!(final_metadata.1, original_metadata.1);
+        assert_eq!(final_metadata.2, original_metadata.2);
+        assert_eq!(
+            final_metadata.3, 1,
+            "replay did not refresh the expiry clock"
+        );
+        let delivery_metadata = conn
+            .query_row(
+                "SELECT delivery_id, pre_terminal_token_verifier, credential_verifier,
+                        acknowledged_at, final_view_json
+                 FROM terminal_match_delivery WHERE game_code = ?1 AND generation = ?2 AND player_id = 0",
+                params![snapshot.key.game_code, snapshot.key.generation],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<u64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(delivery_metadata.0, delivery_id.0);
+        assert_eq!(delivery_metadata.1, verifier("expiry-player-0"));
+        assert_eq!(delivery_metadata.2, verifier(&credential.0));
+        assert!(
+            delivery_metadata.3.is_some(),
+            "expiry itself did not acknowledge"
+        );
+        assert_eq!(delivery_metadata.4, None);
+        let bootstrap_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM terminal_bootstrap_requests
+                 WHERE request_id = 'expiry-bootstrap' AND game_code = ?1 AND generation = ?2 AND player_id = 0",
+                params![snapshot.key.game_code, snapshot.key.generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bootstrap_count, 1,
+            "the original bootstrap binding survived"
+        );
     }
 }

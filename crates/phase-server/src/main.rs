@@ -145,6 +145,160 @@ type SharedPlayerCount = Arc<AtomicU32>;
 type SharedGameDb = Arc<persistence::GameDb>;
 type SharedDraftState = Arc<Mutex<DraftSessionManager>>;
 const SPECTATOR_PLAYER_ID: PlayerId = PlayerId(u8::MAX);
+const PERSISTED_SESSION_REAPER_INTERVAL: Duration = Duration::from_secs(10);
+const PERSISTED_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Default)]
+struct StaleSessionReaper {
+    last_success: Option<tokio::time::Instant>,
+}
+
+impl StaleSessionReaper {
+    fn cleanup_if_due(&mut self, game_db: &persistence::GameDb) {
+        let now = tokio::time::Instant::now();
+        if self
+            .last_success
+            .is_some_and(|last| now.duration_since(last) < PERSISTED_SESSION_CLEANUP_INTERVAL)
+        {
+            return;
+        }
+
+        match game_db.delete_stale(persistence::PERSISTED_SESSION_MAX_AGE_SECS) {
+            Ok(deleted) => {
+                self.last_success = Some(now);
+                if deleted > 0 {
+                    info!(count = deleted, "cleaned up stale persisted sessions");
+                }
+            }
+            Err(error) => error!(error = %error, "failed to clean up stale persisted sessions"),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_background_reaper(
+    mut stale_session_reaper: StaleSessionReaper,
+    bg_state: SharedState,
+    bg_draft_state: SharedDraftState,
+    bg_connections: SharedConnections,
+    bg_draft_spectators: SharedDraftSpectators,
+    bg_game_spectators: SharedGameSpectators,
+    bg_lobby: SharedLobby,
+    bg_lobby_subs: SharedLobbySubscribers,
+    bg_game_db: SharedGameDb,
+) {
+    let mut interval = tokio::time::interval(PERSISTED_SESSION_REAPER_INTERVAL);
+    loop {
+        interval.tick().await;
+        stale_session_reaper.cleanup_if_due(&bg_game_db);
+
+        // Check reconnect grace period expiry. The read is non-destructive:
+        // a code this tick cannot act on is reported again by the next one.
+        let expired = {
+            let mgr = bg_state.lock().await;
+            mgr.reconnect.check_expired()
+        };
+        if !expired.is_empty() {
+            let prepared = prepare_disconnect_terminals(&bg_state, &bg_game_db, &expired).await;
+            let ExpirySweep {
+                acted: removed,
+                deferred,
+            } = {
+                let mut mgr = bg_state.lock().await;
+                reap_expired_disconnects(&mut mgr, &bg_game_db, &expired, &prepared)
+            };
+            // Unconditional inside this branch, because the per-game lines
+            // below are emitted only for what was removed: a tick that
+            // deferred every lapsed seat would otherwise look exactly like
+            // a tick with nothing to do, which is the one case contention
+            // needs reported.
+            info!(
+                forfeited = removed.len(),
+                deferred, "disconnect grace sweep"
+            );
+            // Nothing else is held here: the branch below takes
+            // `bg_game_spectators` at its end and the lobby-expiry branch
+            // takes `bg_lobby` and `bg_state` in sequence, never one inside
+            // the other, so the lobby lock this call takes is nested under
+            // neither.
+            delist_removed_sessions(&bg_lobby, &bg_lobby_subs, &removed).await;
+            {
+                let conns = bg_connections.lock().await;
+                for game_code in &removed {
+                    info!(game = %game_code, reason = "disconnect_expired", "game over");
+                    if let Some(players) = conns.get(game_code) {
+                        if let Some(deliveries) = prepared.get(game_code) {
+                            for (player, delivery) in deliveries {
+                                if let Some(sender) = players.get(player) {
+                                    let _ = sender.send(ServerMessage::TerminalResult {
+                                        delivery: Some(delivery.clone()),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Keeps its base argument — the codes this sweep removed — so
+            // it cannot prune a game it skipped.
+            prune_game_connections(&bg_connections, removed.iter().map(String::as_str)).await;
+            let mut specs = bg_game_spectators.lock().await;
+            for game_code in &removed {
+                specs.remove(game_code);
+            }
+        }
+
+        // Check lobby game expiry (5 minute timeout for waiting games).
+        // The report is non-destructive, so a listing this tick declines to
+        // act on is reported again by the next one; the broker then
+        // consumes exactly what was dispositioned. The Full-mode session/db
+        // deletion stays here — the broker is WASM-safe and has no
+        // SQLite/SessionManager.
+        let expired_lobby = {
+            let broker = bg_lobby.lock().await;
+            broker.lobby().check_expired(300, &SysEnv)
+        };
+        let lobby_sweep = if expired_lobby.is_empty() {
+            LobbyExpirySweep::default()
+        } else {
+            // Same discipline as the reaper above: `try_session` under the
+            // registry guard decides, the removal happens in the same
+            // critical section, and the session the retire needs is read
+            // from that guard before it is dropped. A contended game is
+            // skipped, not waited on.
+            let live_drafts = live_draft_codes(&bg_draft_state, &expired_lobby).await;
+            let mut mgr = bg_state.lock().await;
+            handle_expired_lobby_games(&mut mgr, &bg_game_db, &expired_lobby, &live_drafts)
+        };
+        // Every tick, not only the ticks a lobby entry lapsed: the
+        // tournament half of this sweep runs on its own lifecycle clocks
+        // and has no shell-side decline to wait for.
+        let routes =
+            ExpiredLobbyRoutes::capture(&lobby_sweep, &bg_connections, &bg_game_spectators).await;
+        finish_lobby_expiry_sweep(
+            &bg_lobby,
+            &bg_lobby_subs,
+            &bg_connections,
+            &bg_game_spectators,
+            &lobby_sweep,
+            routes,
+        )
+        .await;
+
+        sweep_draft_seat_expiry(
+            &bg_draft_state,
+            &bg_state,
+            &bg_connections,
+            &bg_draft_spectators,
+            &bg_game_spectators,
+            &bg_lobby,
+            &bg_lobby_subs,
+            &bg_game_db,
+        )
+        .await;
+    }
+}
+
 /// Stack size for every thread that can run the engine: the runtime *owner*
 /// thread spawned in `main`, plus Tokio's worker and blocking threads.
 ///
@@ -2921,15 +3075,10 @@ async fn serve() {
     let game_db: SharedGameDb = Arc::new(
         persistence::GameDb::open(&game_db_path, retention).expect("Failed to open game database"),
     );
-    // Clean up stale sessions (>24 hours old). Skipped for a single-user local
-    // instance, where the one suspended solo game must survive until replaced.
-    if !cli.single_user {
-        if let Ok(deleted) = game_db.delete_stale(86400) {
-            if deleted > 0 {
-                info!(count = deleted, "cleaned up stale persisted sessions");
-            }
-        }
-    }
+    // Always clean up once at startup. The database retention policy preserves
+    // SingleUser gameplay sessions while still expiring old terminal payloads.
+    let mut stale_session_reaper = StaleSessionReaper::default();
+    stale_session_reaper.cleanup_if_due(&game_db);
 
     // A single-user instance has no other players whose seats a grace period
     // would free, so reconnects never expire — a game suspended for any length
@@ -3056,127 +3205,19 @@ async fn serve() {
         .await;
     }
 
-    // Spawn background task for grace period and lobby expiry
-    let bg_state = state.clone();
-    let bg_draft_state = draft_sessions.clone();
-    let bg_connections = connections.clone();
-    let bg_draft_spectators = draft_spectators.clone();
-    let bg_game_spectators = game_spectators.clone();
-    let bg_lobby = lobby.clone();
-    let bg_lobby_subs = lobby_subscribers.clone();
-    let bg_game_db = game_db.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
-        loop {
-            interval.tick().await;
-
-            // Check reconnect grace period expiry. The read is non-destructive:
-            // a code this tick cannot act on is reported again by the next one.
-            let expired = {
-                let mgr = bg_state.lock().await;
-                mgr.reconnect.check_expired()
-            };
-            if !expired.is_empty() {
-                let prepared = prepare_disconnect_terminals(&bg_state, &bg_game_db, &expired).await;
-                let ExpirySweep {
-                    acted: removed,
-                    deferred,
-                } = {
-                    let mut mgr = bg_state.lock().await;
-                    reap_expired_disconnects(&mut mgr, &bg_game_db, &expired, &prepared)
-                };
-                // Unconditional inside this branch, because the per-game lines
-                // below are emitted only for what was removed: a tick that
-                // deferred every lapsed seat would otherwise look exactly like
-                // a tick with nothing to do, which is the one case contention
-                // needs reported.
-                info!(
-                    forfeited = removed.len(),
-                    deferred, "disconnect grace sweep"
-                );
-                // Nothing else is held here: the branch below takes
-                // `bg_game_spectators` at its end and the lobby-expiry branch
-                // takes `bg_lobby` and `bg_state` in sequence, never one inside
-                // the other, so the lobby lock this call takes is nested under
-                // neither.
-                delist_removed_sessions(&bg_lobby, &bg_lobby_subs, &removed).await;
-                {
-                    let conns = bg_connections.lock().await;
-                    for game_code in &removed {
-                        info!(game = %game_code, reason = "disconnect_expired", "game over");
-                        if let Some(players) = conns.get(game_code) {
-                            if let Some(deliveries) = prepared.get(game_code) {
-                                for (player, delivery) in deliveries {
-                                    if let Some(sender) = players.get(player) {
-                                        let _ = sender.send(ServerMessage::TerminalResult {
-                                            delivery: Some(delivery.clone()),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // Keeps its base argument — the codes this sweep removed — so
-                // it cannot prune a game it skipped.
-                prune_game_connections(&bg_connections, removed.iter().map(String::as_str)).await;
-                let mut specs = bg_game_spectators.lock().await;
-                for game_code in &removed {
-                    specs.remove(game_code);
-                }
-            }
-
-            // Check lobby game expiry (5 minute timeout for waiting games).
-            // The report is non-destructive, so a listing this tick declines to
-            // act on is reported again by the next one; the broker then
-            // consumes exactly what was dispositioned. The Full-mode session/db
-            // deletion stays here — the broker is WASM-safe and has no
-            // SQLite/SessionManager.
-            let expired_lobby = {
-                let broker = bg_lobby.lock().await;
-                broker.lobby().check_expired(300, &SysEnv)
-            };
-            let lobby_sweep = if expired_lobby.is_empty() {
-                LobbyExpirySweep::default()
-            } else {
-                // Same discipline as the reaper above: `try_session` under the
-                // registry guard decides, the removal happens in the same
-                // critical section, and the session the retire needs is read
-                // from that guard before it is dropped. A contended game is
-                // skipped, not waited on.
-                let live_drafts = live_draft_codes(&bg_draft_state, &expired_lobby).await;
-                let mut mgr = bg_state.lock().await;
-                handle_expired_lobby_games(&mut mgr, &bg_game_db, &expired_lobby, &live_drafts)
-            };
-            // Every tick, not only the ticks a lobby entry lapsed: the
-            // tournament half of this sweep runs on its own lifecycle clocks
-            // and has no shell-side decline to wait for.
-            let routes =
-                ExpiredLobbyRoutes::capture(&lobby_sweep, &bg_connections, &bg_game_spectators)
-                    .await;
-            finish_lobby_expiry_sweep(
-                &bg_lobby,
-                &bg_lobby_subs,
-                &bg_connections,
-                &bg_game_spectators,
-                &lobby_sweep,
-                routes,
-            )
-            .await;
-
-            sweep_draft_seat_expiry(
-                &bg_draft_state,
-                &bg_state,
-                &bg_connections,
-                &bg_draft_spectators,
-                &bg_game_spectators,
-                &bg_lobby,
-                &bg_lobby_subs,
-                &bg_game_db,
-            )
-            .await;
-        }
-    });
+    // Spawn the existing background maintenance worker. It owns persisted
+    // session cleanup on its normal 10s cadence, before it takes any locks.
+    tokio::spawn(run_background_reaper(
+        stale_session_reaper,
+        state.clone(),
+        draft_sessions.clone(),
+        connections.clone(),
+        draft_spectators.clone(),
+        game_spectators.clone(),
+        lobby.clone(),
+        lobby_subscribers.clone(),
+        game_db.clone(),
+    ));
 
     let cors = match cli.cors_origin.as_deref() {
         Some("*") | None => CorsLayer::permissive(),
@@ -3517,6 +3558,185 @@ async fn server_info(State(app_state): State<AppState>) -> Json<ServerInfoDocume
         build_commit: Some(build_commit().to_string()),
         public_url: app_state.public_url,
     })
+}
+
+#[cfg(test)]
+mod stale_session_reaper_tests {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use rusqlite::{params, Connection};
+    use tempfile::NamedTempFile;
+    use tokio::time::{advance, Duration};
+
+    use super::{
+        persistence, run_background_reaper, Broker, DraftSessionManager, Mutex, SessionManager,
+        SharedGameDb, StaleSessionReaper, PERSISTED_SESSION_CLEANUP_INTERVAL,
+        PERSISTED_SESSION_REAPER_INTERVAL,
+    };
+
+    fn test_db(path: &Path, retention: persistence::SessionRetention) -> SharedGameDb {
+        Arc::new(persistence::GameDb::open(path, retention).unwrap())
+    }
+
+    fn seed_stale_cycle(path: &Path, code: &str) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "INSERT INTO game_sessions (game_code, session_json, updated_at) VALUES (?1, 'game', 1)",
+            params![format!("game-{code}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO draft_sessions (draft_code, session_json, updated_at) VALUES (?1, 'draft', 1)",
+            params![format!("draft-{code}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO p2p_draft_backups (draft_code, host_peer_id, snapshot_json, updated_at)
+             VALUES (?1, 'peer', 'backup', 1)",
+            params![format!("backup-{code}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO terminal_match_results
+             (game_code, generation, terminal_revision, artifact_digest, display_json, created_at)
+             VALUES (?1, 1, 9, 'digest', '{\"winner\":null,\"reason\":\"expired\",\"ranked_result\":null}', 1)",
+            params![code],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO terminal_match_delivery
+             (game_code, generation, player_id, terminal_revision, delivery_id,
+              pre_terminal_token_verifier, credential_verifier, acknowledged_at, final_view_json)
+             VALUES (?1, 1, 0, 9, ?2, 'pre', 'credential', NULL, '{\"private\":true}')",
+            params![code, format!("delivery-{code}")],
+        )
+        .unwrap();
+    }
+
+    fn cycle_state(path: &Path, code: &str) -> ((u64, u64, u64), Option<String>) {
+        let conn = Connection::open(path).unwrap();
+        let counts = (
+            conn.query_row(
+                "SELECT COUNT(*) FROM game_sessions WHERE game_code = ?1",
+                params![format!("game-{code}")],
+                |row| row.get(0),
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM draft_sessions WHERE draft_code = ?1",
+                params![format!("draft-{code}")],
+                |row| row.get(0),
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM p2p_draft_backups WHERE draft_code = ?1",
+                params![format!("backup-{code}")],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        );
+        let payload = conn
+            .query_row(
+                "SELECT final_view_json FROM terminal_match_delivery WHERE game_code = ?1 AND generation = 1",
+                params![code],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (counts, payload)
+    }
+
+    fn spawn_production_worker(
+        game_db: SharedGameDb,
+        stale_session_reaper: StaleSessionReaper,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(run_background_reaper(
+            stale_session_reaper,
+            Arc::new(Mutex::new(SessionManager::new())),
+            Arc::new(Mutex::new(DraftSessionManager::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Broker::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            game_db,
+        ))
+    }
+
+    async fn let_reaper_run() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn production_reaper_repeats_without_restart_in_both_retention_modes() {
+        for retention in [
+            persistence::SessionRetention::Multiplayer,
+            persistence::SessionRetention::SingleUser,
+        ] {
+            let file = NamedTempFile::new().unwrap();
+            let db = test_db(file.path(), retention);
+            seed_stale_cycle(file.path(), "FIRST");
+            Connection::open(file.path())
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER fail_first_expiry
+                     BEFORE UPDATE OF final_view_json ON terminal_match_delivery
+                     WHEN OLD.game_code = 'FIRST'
+                     BEGIN SELECT RAISE(ABORT, 'retry on next production tick'); END;",
+                )
+                .unwrap();
+
+            // This is the same recurring task spawned by server startup. Its
+            // first 10s tick fails; the next tick must retry immediately after
+            // the database error instead of waiting for the hourly throttle.
+            let task = spawn_production_worker(db, StaleSessionReaper::default());
+            let_reaper_run().await;
+            assert_eq!(
+                cycle_state(file.path(), "FIRST"),
+                ((1, 1, 1), Some("{\"private\":true}".to_string())),
+                "the trigger aborts the first transaction"
+            );
+
+            Connection::open(file.path())
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_first_expiry;")
+                .unwrap();
+            advance(Duration::from_secs(10)).await;
+            let_reaper_run().await;
+            let expected_counts = if retention == persistence::SessionRetention::Multiplayer {
+                (0, 0, 0)
+            } else {
+                (1, 1, 1)
+            };
+            assert_eq!(
+                cycle_state(file.path(), "FIRST"),
+                (expected_counts, None),
+                "the recurring task retries the failed cleanup on its next tick"
+            );
+
+            seed_stale_cycle(file.path(), "SECOND");
+            advance(Duration::from_secs(10)).await;
+            let_reaper_run().await;
+            assert_eq!(
+                cycle_state(file.path(), "SECOND"),
+                ((1, 1, 1), Some("{\"private\":true}".to_string())),
+                "a successful cleanup is throttled for an hour"
+            );
+
+            advance(PERSISTED_SESSION_CLEANUP_INTERVAL - PERSISTED_SESSION_REAPER_INTERVAL).await;
+            let_reaper_run().await;
+            assert_eq!(
+                cycle_state(file.path(), "SECOND"),
+                (expected_counts, None),
+                "the same live task performs a later sweep without a process restart"
+            );
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }
 
 #[cfg(test)]
