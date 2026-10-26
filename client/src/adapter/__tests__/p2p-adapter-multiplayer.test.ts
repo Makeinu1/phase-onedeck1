@@ -650,6 +650,7 @@ class FakeOpenableConnection extends FakeDataConnection {
    * acknowledged, as opposed to what the host did about it.
    */
   readonly acksSent: P2PMessage[] = [];
+  readonly terminalReceiptsSent: P2PMessage[] = [];
 
   /**
    * Stop auto-acking. Callable at any point — including before
@@ -666,12 +667,22 @@ class FakeOpenableConnection extends FakeDataConnection {
     this.acking = true;
   }
 
+  stopReceipting() {
+    this.receipting = false;
+  }
+
+  resumeReceipting() {
+    this.receipting = true;
+  }
+
   /**
    * Default ON: a real guest acks every state-bearing frame it applies, and a
    * seat that never acks reads as permanently behind. Defaulting off would
    * change behavior in tests that have nothing to do with acknowledgement.
    */
   private acking = true;
+  private appliedRevision: number | null = null;
+  private receipting = true;
 
   /**
    * The frame type after which this channel stops taking bytes, or `null`.
@@ -694,11 +705,8 @@ class FakeOpenableConnection extends FakeDataConnection {
    * resolves TRUE and is indistinguishable from a delivered one at this
    * boundary. That is exactly why the ADVANCE signal is the guest's own
    * `state_ack` rather than the send result. The residual it leaves is
-   * `terminalDelivered`, which still records transmission: a parked terminal
-   * frame is recorded as delivered and the sweep stops nominating the seat.
-   * That residual is accepted (it is post-game, and acking it would need a
-   * second wire bump) and no test here covers it — this knob cannot produce
-   * it.
+   * A durable `terminal_result_receipt` is modeled separately below; channel
+   * acceptance itself is not treated as persistence.
    *
    * The refusal starts AFTER the named frame has been sent and acked, so the
    * seat is provably current on state when its next frame is refused.
@@ -720,6 +728,7 @@ class FakeOpenableConnection extends FakeDataConnection {
     // is a trap for the next test that does.
     super.onDecodedSend(msg);
     this.ackDecodedSend(msg);
+    this.receiptDecodedSend(msg);
     if (this.refuseAfter !== null && this.refuseAfter === msg.type) {
       this.refuseAfter = null;
       this.open = false;
@@ -739,6 +748,9 @@ class FakeOpenableConnection extends FakeDataConnection {
     // `game_setup` always carries one. An ack without a revision is not a
     // frame a real guest could produce.
     if (msg.revision == null) return;
+    this.appliedRevision = this.appliedRevision === null
+      ? msg.revision
+      : Math.max(this.appliedRevision, msg.revision);
     const ack = {
       type: "state_ack" as const,
       revision: msg.revision,
@@ -756,6 +768,27 @@ class FakeOpenableConnection extends FakeDataConnection {
     this.pendingDecodes.push(
       this.simulateData(ack).catch((e) => {
         console.warn("[FakeOpenableConnection] auto-ack dispatch failed:", e);
+      }),
+    );
+  }
+
+  private receiptDecodedSend(msg: P2PMessage): void {
+    if (
+      !this.receipting
+      || !this.open
+      || msg.type !== "terminal_result"
+      || !msg.authority
+      || this.appliedRevision !== msg.result.revision
+    ) return;
+    const receipt: P2PMessage = {
+      type: "terminal_result_receipt",
+      result: msg.result,
+      authority: msg.authority,
+    };
+    this.terminalReceiptsSent.push(receipt);
+    this.pendingDecodes.push(
+      this.simulateData(receipt).catch((e) => {
+        console.warn("[FakeOpenableConnection] auto terminal receipt dispatch failed:", e);
       }),
     );
   }
@@ -2161,6 +2194,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       revision: reconnectAck.revision,
     }));
     expect(reconnectFrames.slice(terminalIndex + 1).some((message) => message.type === "state_update")).toBe(false);
+    expect(reconnect.terminalReceiptsSent).toHaveLength(1);
     expect(reconnect.open).toBe(false);
     expect((adapter as unknown as { guestSessions: Map<number, unknown> }).guestSessions.has(1)).toBe(false);
     expect(events.some((event) => event.type === "playerReconnected")).toBe(false);
@@ -2169,11 +2203,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     await vi.waitFor(() => expect(nativeTerminalMocks.acknowledge).toHaveBeenCalledTimes(2));
     await vi.waitFor(() => expect((adapter as unknown as { nativeTerminalAcknowledged: boolean }).nativeTerminalAcknowledged).toBe(true));
     expect(persistenceMocks.clearGameStrict).toHaveBeenCalledWith("native-resume");
-    expect((adapter as unknown as {
-      nativeTerminalStateAcked: Set<number>;
-      terminalDelivered: Set<number>;
-    }).nativeTerminalStateAcked.has(1)).toBe(true);
-    expect((adapter as unknown as { terminalDelivered: Set<number> }).terminalDelivered.has(1)).toBe(true);
+    expect((adapter as unknown as { terminalResultReceipts: Set<number> }).terminalResultReceipts.has(1)).toBe(true);
     expect((adapter as unknown as { disconnectedSeats: Map<number, unknown> }).disconnectedSeats.has(1)).toBe(false);
     adapter.dispose();
   });
@@ -2415,7 +2445,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     adapter.dispose();
   });
 
-  it("ACKs Full terminal rows only after the final P2P state ACK and terminal send", async () => {
+  it("ACKs Full terminal rows only after a durable matching P2P terminal receipt", async () => {
     nativeWebSocketMocks.waitForPlayerSlots.mockResolvedValue([]);
     nativeWebSocketMocks.initializePregame.mockResolvedValue({
       playerId: 0,
@@ -2423,7 +2453,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       gameCode: "native-game",
       fullKey: { game_code: "native-game", generation: 1 },
     });
-    const { adapter } = makeNativeHost(2, { gameId: "native-terminal-ack", roomCode: "ABCDE" });
+    const { adapter } = makeNativeHost(3, { gameId: "native-terminal-ack", roomCode: "ABCDE" });
     await adapter.initialize();
 
     const finalState = (playerId: number): GameState => ({
@@ -2434,6 +2464,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     } as unknown as GameState);
     const hostState = finalState(0);
     const guestState = finalState(1);
+    const secondGuestState = finalState(2);
     const fullKey = { game_code: "native-game", generation: 1 };
     const makeDelivery = (playerId: number, state: GameState): FullTerminalDelivery => ({
       key: fullKey,
@@ -2446,6 +2477,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     const deliveries = new Map<number, FullTerminalDelivery>([
       [0, makeDelivery(0, hostState)],
       [1, makeDelivery(1, guestState)],
+      [2, makeDelivery(2, secondGuestState)],
     ]);
     const order: string[] = [];
     persistenceMocks.clearGameStrict.mockImplementation(async () => { order.push("clear"); });
@@ -2460,6 +2492,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
         playerTokens: Map<number, string>;
         latestViews: Map<number, NativeView>;
         terminalDeliveries: Map<number, FullTerminalDelivery>;
+        playerIds: () => number[];
       };
       playerTokens: Map<number, string>;
       guestSessions: Map<number, { send: (message: P2PMessage) => Promise<boolean>; close: () => void }>;
@@ -2467,11 +2500,18 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       guestAckedRevisions: Map<number, number>;
       commitTerminalIfComplete: (snapshot: EngineSnapshot, revision: number) => Promise<boolean>;
       recordGuestAck: (pid: number, revision: number) => void;
+      issuedTerminalResults: Map<number, P2PTerminalResult>;
+      terminalResultReceipts: Set<number>;
+      disconnectedSeats: Map<number, { disconnectedAt: number; timer: ReturnType<typeof setTimeout> | null }>;
+      recordTerminalReceipt: (pid: number, session: never, result: P2PTerminalResult) => void;
       tryAcknowledgeNativeTerminal: () => Promise<void>;
+      nativeTerminalAckReady: boolean;
       nativeTerminalAcknowledged: boolean;
     };
     const bridge = host.nativeBridge;
+    host.nativeTerminalAckReady = true;
     bridge.playerTokens.set(1, "native-guest-token");
+    bridge.playerTokens.set(2, "native-guest-token-2");
     for (const [playerId, delivery] of deliveries) {
       const state = delivery.finalView!;
       bridge.terminalDeliveries.set(playerId, delivery);
@@ -2486,12 +2526,20 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       });
     }
     host.playerTokens.set(1, "p2p-guest-token");
+    host.playerTokens.set(2, "p2p-guest-token-2");
     host.guestAckedRevisions.set(1, 8);
+    host.guestAckedRevisions.set(2, 8);
     const sent: P2PMessage[] = [];
-    host.guestSessions.set(1, {
+    const receiptSession = {
       send: vi.fn(async (message) => { sent.push(message); return true; }),
       close: vi.fn(),
-    });
+    };
+    host.guestSessions.set(1, receiptSession);
+    const secondReceiptSession = {
+      send: vi.fn(async (message) => { sent.push(message); return true; }),
+      close: vi.fn(),
+    };
+    host.guestSessions.set(2, secondReceiptSession);
 
     const snapshot: EngineSnapshot = {
       state: hostState,
@@ -2500,16 +2548,107 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     };
     expect(await host.commitTerminalIfComplete(snapshot, 9)).toBe(true);
     expect(sent).toContainEqual(expect.objectContaining({ type: "terminal_result", result: expect.objectContaining({ recipient: 1 }) }));
+    expect(sent).toContainEqual(expect.objectContaining({ type: "terminal_result", result: expect.objectContaining({ recipient: 2 }) }));
     expect(nativeTerminalMocks.acknowledge).not.toHaveBeenCalled();
     expect(persistenceMocks.clearGameStrict).not.toHaveBeenCalled();
 
     host.recordGuestAck(1, 9);
+    host.recordGuestAck(2, 9);
     await host.tryAcknowledgeNativeTerminal();
-    expect(order).toEqual(["clear", "ack:delivery-0", "ack:delivery-1"]);
+    expect(nativeTerminalMocks.acknowledge).not.toHaveBeenCalled();
+    const issued = host.issuedTerminalResults.get(1);
+    expect(issued).toEqual(expect.objectContaining({ recipient: 1, revision: 9 }));
+    host.recordTerminalReceipt(1, receiptSession as never, issued!);
+    // A receipt remains sufficient after this guest disconnects; the later
+    // participant's receipt can now finish cleanup without waiting on it.
+    host.disconnectedSeats.set(1, { disconnectedAt: Date.now(), timer: null });
+    host.guestSessions.delete(1);
+    expect(host.terminalResultReceipts.has(1)).toBe(true);
+    expect(nativeTerminalMocks.acknowledge).not.toHaveBeenCalled();
+    const secondIssued = host.issuedTerminalResults.get(2)!;
+    host.recordTerminalReceipt(2, secondReceiptSession as never, secondIssued);
+    expect(host.terminalResultReceipts).toEqual(new Set([1, 2]));
+    expect(host.nativeTerminalAckReady).toBe(true);
+    expect(bridge.playerIds()).toEqual([0, 1, 2]);
+    await host.tryAcknowledgeNativeTerminal();
+    await vi.waitFor(() => expect(order).toEqual(["clear", "ack:delivery-0", "ack:delivery-1", "ack:delivery-2"]));
+    expect(persistenceMocks.saveFullTerminalCleanupStrict).toHaveBeenCalledOnce();
     expect(host.nativeTerminalAcknowledged).toBe(true);
 
     await host.commitTerminalIfComplete(snapshot, 9);
-    expect(order).toHaveLength(3);
+    expect(order).toHaveLength(4);
+    adapter.dispose();
+  });
+
+  it("accepts only an exact terminal receipt from the authenticated recipient session", async () => {
+    const { adapter, emitConnection } = makeHost(3);
+    await adapter.initialize();
+    const guestOne = await joinGuest(emitConnection, {
+      type: "guest_deck",
+      deckData: { player: { main_deck: [], sideboard: [] } },
+    });
+    const guestTwo = await joinGuest(emitConnection, {
+      type: "guest_deck",
+      deckData: { player: { main_deck: [], sideboard: [] } },
+    });
+    guestOne.stopReceipting();
+    guestTwo.stopReceipting();
+    await adapter.initializeGame();
+
+    const host = adapter as unknown as {
+      authority: { sessionKey: string; hostIncarnation: string };
+      sessionKey: string;
+      authoritativeRevision: number;
+      terminalResult: P2PTerminalResult | null;
+      guestSessions: Map<number, never>;
+      terminalResultForRecipient: (pid: number, state: GameState, revision: number) => Promise<P2PTerminalResult>;
+      sendTerminalResult: (pid: number, session: never, result: P2PTerminalResult) => Promise<boolean>;
+      terminalResultReceipts: Set<number>;
+    };
+    const finalState = {
+      ...remoteState("receipt binding"),
+      waiting_for: { type: "GameOver", data: { winner: 0 } },
+    } as unknown as GameState;
+    const revision = host.authoritativeRevision;
+    host.terminalResult = {
+      key: host.sessionKey,
+      lease: host.authority,
+      recipient: 0,
+      revision,
+      terminalId: "host-terminal-for-receipt-binding",
+      finalStateCommitment: await p2pFinalStateCommitment(finalState),
+      display: { winner: 0, reason: "Game complete" },
+    };
+    const issued = await host.terminalResultForRecipient(1, finalState, revision);
+    expect(await host.sendTerminalResult(1, host.guestSessions.get(1)!, issued)).toBe(true);
+    await guestOne.getSentMessages();
+
+    // A second authenticated player cannot receipt another recipient's statement.
+    await guestTwo.simulateData({ type: "terminal_result_receipt", result: issued, authority: host.authority });
+    // Nor can a current recipient receipt a statement with any changed binding.
+    const forged = [
+      { ...issued, key: "other-session" },
+      { ...issued, lease: { ...issued.lease, sessionKey: "other-session" } },
+      { ...issued, lease: { ...issued.lease, hostIncarnation: "old-incarnation" } },
+      { ...issued, recipient: 2 },
+      { ...issued, revision: issued.revision + 1 },
+      { ...issued, terminalId: `${issued.terminalId}:stale` },
+      { ...issued, finalStateCommitment: `sha256:${"0".repeat(64)}` },
+      { ...issued, display: { ...issued.display, reason: "forged display" } },
+    ];
+    for (const result of forged) {
+      await guestOne.simulateData({ type: "terminal_result_receipt", result, authority: host.authority });
+    }
+    await guestOne.simulateData({ type: "terminal_result_receipt", result: issued, authority: {
+      ...host.authority,
+      hostIncarnation: "old-incarnation",
+    } });
+    await guestOne.simulateData({ type: "terminal_result_receipt", result: issued });
+    expect(host.terminalResultReceipts.has(1)).toBe(false);
+
+    await guestOne.simulateData({ type: "terminal_result_receipt", result: issued, authority: host.authority });
+    await guestOne.simulateData({ type: "terminal_result_receipt", result: issued, authority: host.authority });
+    expect(host.terminalResultReceipts).toEqual(new Set([1]));
     adapter.dispose();
   });
 
@@ -5891,6 +6030,214 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     return { adapter, conn };
   }
 
+  async function terminalReadyGuest(): Promise<{
+    adapter: P2PGuestAdapter;
+    conn: FakeDataConnection;
+    result: P2PTerminalResult;
+    authority: { sessionKey: string; hostIncarnation: string };
+  }> {
+    const { peer } = createFakePeer();
+    const conn = new FakeDataConnection();
+    const adapter = new P2PGuestAdapter(
+      { player: { main_deck: [], sideboard: [] } },
+      peer as unknown as Peer,
+      "host-peer",
+      conn as unknown as DataConnection,
+    );
+    const authority = { sessionKey: "guest-terminal-session", hostIncarnation: "host-incarnation-1" };
+    const finalState = {
+      ...remoteState("guest durable terminal"),
+      waiting_for: { type: "GameOver", data: { winner: 0 } },
+    } as unknown as GameState;
+    await adapter.initialize();
+    await conn.simulateData({
+      type: "game_setup",
+      wireProtocolVersion: WIRE_PROTOCOL_VERSION,
+      assignedPlayerId: 1,
+      playerToken: "seat-token",
+      revision: 7,
+      state: finalState,
+      events: [],
+      legalActions: [],
+      autoPassRecommended: false,
+      manaPaymentShortcutActions: [],
+      authority,
+    });
+    await adapter.initializeGame();
+    const result: P2PTerminalResult = {
+      key: authority.sessionKey,
+      lease: authority,
+      recipient: 1,
+      revision: 7,
+      terminalId: "host-terminal:recipient:1",
+      finalStateCommitment: await p2pFinalStateCommitment(finalState),
+      display: { winner: 0, reason: "Game complete" },
+    };
+    return { adapter, conn, result, authority };
+  }
+
+  async function pendingTerminalReconnect() {
+    const { adapter, emitConnection } = makeHost(2, 5_000);
+    await adapter.initialize();
+    const conn = await joinGuest(emitConnection, {
+      type: "guest_deck",
+      deckData: { player: { main_deck: [], sideboard: [] } },
+    });
+    conn.stopReceipting();
+    await adapter.initializeGame();
+    const host = adapter as unknown as {
+      authority: { sessionKey: string; hostIncarnation: string };
+      sessionKey: string;
+      authoritativeRevision: number;
+      terminalResult: P2PTerminalResult | null;
+      guestSessions: Map<number, { send: (message: P2PMessage) => Promise<boolean>; close: () => void }>;
+      pendingReconnectSessions: Map<number, { send: (message: P2PMessage) => Promise<boolean>; close: () => void }>;
+      pendingTerminalReconnectAcks: Map<number, {
+        session: { send: (message: P2PMessage) => Promise<boolean>; close: () => void };
+        revision: number;
+        snapshot: EngineSnapshot;
+        ready: boolean;
+        stateAckReceived: boolean;
+        finishing: boolean;
+      }>;
+      disconnectedSeats: Map<number, { disconnectedAt: number; timer: ReturnType<typeof setTimeout> | null }>;
+      completeTerminalReconnectAfterAck: (pid: number, session: never) => Promise<void>;
+      deliveryQueue: Promise<void>;
+      terminalResultReceipts: Set<number>;
+      issuedTerminalResults: Map<number, P2PTerminalResult>;
+    };
+    const session = host.guestSessions.get(1)!;
+    host.guestSessions.delete(1);
+    const revision = host.authoritativeRevision;
+    const finalState = {
+      ...remoteState("pending reconnect terminal"),
+      waiting_for: { type: "GameOver", data: { winner: 0 } },
+    } as unknown as GameState;
+    host.terminalResult = {
+      key: host.sessionKey,
+      lease: host.authority,
+      recipient: 0,
+      revision,
+      terminalId: "pending-host-terminal",
+      finalStateCommitment: await p2pFinalStateCommitment(finalState),
+      display: { winner: 0, reason: "Game complete" },
+    };
+    host.pendingReconnectSessions.set(1, session);
+    host.pendingTerminalReconnectAcks.set(1, {
+      session,
+      revision,
+      snapshot: { state: finalState, legalResult: { actions: [], autoPassRecommended: false }, seq: revision },
+      ready: true,
+      stateAckReceived: true,
+      finishing: false,
+    });
+    host.disconnectedSeats.set(1, { disconnectedAt: Date.now(), timer: null });
+    return { adapter, conn, host, session };
+  }
+
+  it("accepts a pending reconnect receipt that arrives while terminal send is settling", async () => {
+    const { adapter, conn, host, session } = await pendingTerminalReconnect();
+    const send = session.send.bind(session);
+    vi.spyOn(session, "send").mockImplementation(async (message) => {
+      const accepted = await send(message);
+      if (message.type === "terminal_result") {
+        await conn.simulateData({
+          type: "terminal_result_receipt",
+          result: message.result,
+          authority: message.authority,
+        });
+      }
+      return accepted;
+    });
+
+    await host.completeTerminalReconnectAfterAck(1, session as never);
+    expect(host.terminalResultReceipts.has(1)).toBe(true);
+    expect(host.pendingTerminalReconnectAcks.has(1)).toBe(false);
+    expect(host.pendingReconnectSessions.has(1)).toBe(false);
+    expect(host.disconnectedSeats.has(1)).toBe(false);
+    adapter.dispose();
+  });
+
+  it("keeps pending reconnect bound until a delayed receipt and retries the same statement", async () => {
+    const { adapter, conn, host, session } = await pendingTerminalReconnect();
+    await host.completeTerminalReconnectAfterAck(1, session as never);
+    expect(host.pendingTerminalReconnectAcks.has(1)).toBe(true);
+    expect(host.disconnectedSeats.has(1)).toBe(true);
+    expect(host.terminalResultReceipts.has(1)).toBe(false);
+    const first = (await conn.getSentMessages()).find((message) => (message as P2PMessage).type === "terminal_result") as
+      Extract<P2PMessage, { type: "terminal_result" }>;
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushPromises();
+    // The interval queues redelivery, which may enqueue terminal completion
+    // behind itself. Drain the latest queue tail until no nested work replaced it.
+    let deliveryTail: Promise<void>;
+    do {
+      deliveryTail = host.deliveryQueue;
+      await deliveryTail;
+    } while (deliveryTail !== host.deliveryQueue);
+    const terminals = (await conn.getSentMessages()).filter((message) => (message as P2PMessage).type === "terminal_result") as
+      Array<Extract<P2PMessage, { type: "terminal_result" }>>;
+    expect(terminals).toHaveLength(2);
+    expect(terminals[1].result).toEqual(first.result);
+
+    await conn.simulateData({
+      type: "terminal_result_receipt",
+      result: first.result,
+      authority: first.authority,
+    });
+    expect(host.terminalResultReceipts.has(1)).toBe(true);
+    expect(host.pendingTerminalReconnectAcks.has(1)).toBe(false);
+    expect(host.pendingReconnectSessions.has(1)).toBe(false);
+    expect(host.disconnectedSeats.has(1)).toBe(false);
+    adapter.dispose();
+  });
+
+  it("waits for a successful durable commit before sending a terminal receipt", async () => {
+    const { adapter, conn, result, authority } = await terminalReadyGuest();
+    const commit = deferred<boolean>();
+    terminalMocks.commitP2PTerminalResult.mockReturnValueOnce(commit.promise);
+
+    await conn.simulateData({ type: "terminal_result", result, authority });
+    await vi.waitFor(() => expect(terminalMocks.commitP2PTerminalResult).toHaveBeenCalledOnce());
+    expect((await conn.getSentMessages()).some((message) => (message as P2PMessage).type === "terminal_result_receipt")).toBe(false);
+    expect((adapter as unknown as { terminated: boolean }).terminated).toBe(false);
+
+    commit.resolve(false);
+    await flushPromises();
+    expect((await conn.getSentMessages()).some((message) => (message as P2PMessage).type === "terminal_result_receipt")).toBe(false);
+    expect((adapter as unknown as { terminated: boolean }).terminated).toBe(false);
+
+    await conn.simulateData({ type: "terminal_result", result, authority });
+    await vi.waitFor(async () => {
+      expect(await conn.getSentMessages()).toContainEqual(expect.objectContaining({
+        type: "terminal_result_receipt",
+        result,
+        authority,
+      }));
+    });
+    expect((adapter as unknown as { terminated: boolean }).terminated).toBe(true);
+    adapter.dispose();
+  });
+
+  it("keeps the guest session alive when receipt send fails and retries on terminal redelivery", async () => {
+    const { adapter, conn, result, authority } = await terminalReadyGuest();
+    const session = (adapter as unknown as { session: { send: (message: P2PMessage) => Promise<boolean> } }).session;
+    vi.spyOn(session, "send").mockImplementationOnce(async () => false);
+
+    await conn.simulateData({ type: "terminal_result", result, authority });
+    await flushPromises();
+    expect((adapter as unknown as { terminated: boolean }).terminated).toBe(false);
+    expect((await conn.getSentMessages()).some((message) => (message as P2PMessage).type === "terminal_result_receipt")).toBe(false);
+
+    await conn.simulateData({ type: "terminal_result", result, authority });
+    await vi.waitFor(async () => {
+      expect((await conn.getSentMessages()).filter((message) => (message as P2PMessage).type === "terminal_result_receipt")).toHaveLength(1);
+    });
+    expect((adapter as unknown as { terminated: boolean }).terminated).toBe(true);
+    adapter.dispose();
+  });
+
   it("accepts host latency updates after the handshake and rejects invalid readings", async () => {
     const { adapter, conn } = await joinedGuest();
     const events = vi.fn();
@@ -7694,10 +8041,10 @@ describe("P2PHostAdapter — host emission precedes the guest fan-out", () => {
  * alone still strands the seat: its adapter cache never receives the applied
  * state, and the guest watchdog compares the screen against exactly that
  * cache. Two host-side structures plus the 5s redelivery sweep close the gap:
- * `guestAckedRevisions` (how far along each seat is) and `terminalDelivered`
- * (whose statement reached the channel). `shouldRedeliver` reads both, and
- * BOTH lag checks — the sweep's nomination and `redeliverGuestState`'s own
- * re-check — go through it.
+ * `guestAckedRevisions` (how far along each seat is) and
+ * `terminalResultReceipts` (which guests durably committed their statements).
+ * `shouldRedeliver` reads both, and BOTH lag checks — the sweep's nomination
+ * and `redeliverGuestState`'s own re-check — go through it.
  *
  * `guestAckedRevisions` uses two different signals on purpose, because the two
  * failure directions are not symmetric. It ADVANCES only on the seat's own
@@ -7744,8 +8091,8 @@ describe("P2PHostAdapter — host emission precedes the guest fan-out", () => {
  *       claiming a revision the host never reached", and both new tests
  *       below, each of which needs a seat that a true send does NOT make
  *       current. This probe IS the shipped bug.
- *   P6  drop the reconnect path's `terminalDelivered` write → "stops
- *       nominating a seat that took its terminal result on reconnect" reds.
+ *   P6  treat reconnect channel acceptance as terminal delivery without a
+ *       receipt → the terminal retention assertions fail.
  *   P7  drop `seedGuestEntry` from the setup fan-out → "heals a seat whose
  *       handshake ack never reached the host" reds, and only it: with no
  *       entry the create-guard disarms the sweep, and the seat cannot ack its
@@ -8144,7 +8491,7 @@ describe("P2PHostAdapter — per-guest eventual state delivery", () => {
   //
   // The guard now gates BOTH clauses, and the terminal one is why it must be
   // explicit: `undefined < N` is already false, so the lag clause was
-  // accidentally safe, but `terminalResult !== null && !terminalDelivered.has(pid)`
+  // accidentally safe, but `terminalResult !== null && !terminalResultReceipts.has(pid)`
   // is TRUE for exactly this seat once the game closes — the close ran, and
   // this seat's terminal send never did. Dropping `acked === undefined` from
   // `shouldRedeliver` is this test's probe.
@@ -8213,7 +8560,7 @@ describe("P2PHostAdapter — per-guest eventual state delivery", () => {
   // `terminal_result` whose revision it never received. The sweep therefore
   // re-commits the terminal statement AFTER the healing state frame. The two
   // frames settle independently: the seat's ack clears the lag clause, and
-  // only an accepted terminal send clears `terminalDelivered`.
+  // only a durable guest receipt clears the terminal redelivery obligation.
   it("re-commits the terminal result for the seat that missed the game-ending broadcast", async () => {
     const { adapter, emitConnection } = makeHost(2, 5_000);
     await adapter.initialize();
@@ -8507,6 +8854,7 @@ describe("P2PHostAdapter — per-guest eventual state delivery", () => {
     expect(terminals[0].result?.recipient).toBe(1);
     expect(terminals[0].result?.revision).toBe(states[1].revision);
     expect(afterSweep.indexOf(states[1] as never)).toBeLessThan(afterSweep.indexOf(terminals[0] as never));
+    expect(guest.terminalReceiptsSent).toHaveLength(1);
 
     // And the flag terminates it: the delivered statement stops the sweep,
     // even though `terminalResult` stays armed for the rest of the session.
@@ -8582,6 +8930,7 @@ describe("P2PHostAdapter — per-guest eventual state delivery", () => {
       const sent = await rejoin.getSentMessages();
       expect(sent.filter((m) => (m as { type?: string }).type === "terminal_result")).toHaveLength(1);
     }, { interval: 10, timeout: 2_000 });
+    expect(rejoin.terminalReceiptsSent).toHaveLength(1);
     const handshake = await rejoin.getSentMessages();
     expect(handshake.filter((m) => (m as { type?: string }).type === "reconnect_ack")).toHaveLength(1);
     // The seat is current on state because it acked the CLOSING `state_update`

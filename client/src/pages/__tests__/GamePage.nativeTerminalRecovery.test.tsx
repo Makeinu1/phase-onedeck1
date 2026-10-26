@@ -208,7 +208,7 @@ describe("native terminal production consumer before cleanup ownership", () => {
     },
   );
 
-  it.each(["disconnected", "terminal undelivered", "final state unacked", "owner save failure", "ACK success", "ACK rejection"])(
+  it.each(["disconnected without receipt", "terminal send refused", "state ACK without receipt", "owner save failure", "ACK success", "ACK rejection"])(
     "native cleanup ownership through the actual adapter/Provider/page: %s",
     async (incomplete) => {
       await clearP2PTerminalResult(session.sessionKey);
@@ -246,9 +246,13 @@ describe("native terminal production consumer before cleanup ownership", () => {
         nativeBridge: unknown;
         nativeTerminalAckReady: boolean;
         disconnectedSeats: Map<PlayerId, { disconnectedAt: number; timer: null }>;
-        nativeTerminalStateAcked: Set<PlayerId>;
-        terminalDelivered: Set<PlayerId>;
-        guestSessions: Map<PlayerId, { send: () => Promise<boolean>; close: () => void }>;
+        guestSessions: Map<PlayerId, { send: (message: { type: string }) => Promise<boolean>; close: () => void }>;
+        guestAckedRevisions: Map<PlayerId, number>;
+        issuedTerminalResults: Map<PlayerId, P2PTerminalResult>;
+        terminalResultReceipts: Set<PlayerId>;
+        recordGuestAck: (pid: PlayerId, revision: number) => void;
+        recordTerminalReceipt: (pid: PlayerId, source: never, result: P2PTerminalResult) => void;
+        tryAcknowledgeNativeTerminal: () => Promise<void>;
         commitTerminalIfComplete: (snapshot: EngineSnapshot, revision: number) => Promise<boolean>;
       };
       host.nativeBridge = {
@@ -261,12 +265,15 @@ describe("native terminal production consumer before cleanup ownership", () => {
         dispose: vi.fn(),
       };
       host.nativeTerminalAckReady = true;
-      if (incomplete !== "disconnected") host.disconnectedSeats.clear();
-      if (incomplete !== "final state unacked") host.nativeTerminalStateAcked.add(1);
-      if (incomplete === "disconnected") host.terminalDelivered.add(1);
-      else host.guestSessions.set(1, {
-        send: async () => incomplete !== "terminal undelivered", close: vi.fn(),
-      });
+      if (incomplete === "disconnected without receipt") {
+        host.disconnectedSeats.set(1, { disconnectedAt: Date.now(), timer: null });
+      } else {
+        host.disconnectedSeats.clear();
+        host.guestAckedRevisions.set(1, terminal.revision - 1);
+        host.guestSessions.set(1, {
+          send: async () => incomplete !== "terminal send refused", close: vi.fn(),
+        });
+      }
       // Handoff comes from the real Provider's takeActiveP2PHost path. Native
       // startup/hydration is outside this gate test, so only that action is stubbed.
       vi.spyOn(useMultiplayerStore.getState(), "takeActiveP2PHost").mockReturnValueOnce(adapter);
@@ -280,11 +287,21 @@ describe("native terminal production consumer before cleanup ownership", () => {
           state: finalState, legalResult: { actions: [], autoPassRecommended: false }, seq: 1,
         }, terminal.revision)).toBe(true);
       });
-      expect(host.disconnectedSeats.has(1)).toBe(incomplete === "disconnected");
-      expect(host.terminalDelivered.has(1)).toBe(incomplete !== "terminal undelivered");
-      expect(host.nativeTerminalStateAcked.has(1)).toBe(incomplete !== "final state unacked");
-      const cleanupReady = incomplete === "owner save failure"
+      if (incomplete === "state ACK without receipt") {
+        host.recordGuestAck(1, terminal.revision);
+        await act(async () => host.tryAcknowledgeNativeTerminal());
+      }
+      const receiptRequired = incomplete === "owner save failure"
         || incomplete === "ACK success" || incomplete === "ACK rejection";
+      if (receiptRequired) {
+        const issued = host.issuedTerminalResults.get(1)!;
+        const source = host.guestSessions.get(1)!;
+        host.recordTerminalReceipt(1, source as never, issued);
+        await act(async () => host.tryAcknowledgeNativeTerminal());
+      }
+      expect(host.disconnectedSeats.has(1)).toBe(incomplete === "disconnected without receipt");
+      expect(host.terminalResultReceipts.has(1)).toBe(receiptRequired);
+      const cleanupReady = receiptRequired;
       expect(cleanupAuthority).toHaveBeenCalledTimes(cleanupReady ? 1 : 0);
       expect(acknowledge).toHaveBeenCalledTimes(incomplete === "ACK success" || incomplete === "ACK rejection" ? 1 : 0);
       expect(screen.getByRole("heading", { name: "VICTORY" })).toBeInTheDocument();
