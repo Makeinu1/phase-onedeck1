@@ -3024,13 +3024,17 @@ mod tests {
         use crate::types::game_state::{PendingReplacement, UnrepresentablePolicy};
         use crate::types::phase::Phase;
 
-        fn scenario() -> GameScenario {
+        pub(super) fn scenario() -> GameScenario {
             let mut scenario = GameScenario::new();
             scenario.at_phase(Phase::PreCombatMain);
             scenario
         }
 
-        fn add_card(scenario: &mut GameScenario, player: PlayerId, name: &str) -> ObjectId {
+        pub(super) fn add_card(
+            scenario: &mut GameScenario,
+            player: PlayerId,
+            name: &str,
+        ) -> ObjectId {
             scenario.add_real_card(
                 player,
                 name,
@@ -3039,7 +3043,7 @@ mod tests {
             )
         }
 
-        fn debug_runner(scenario: GameScenario) -> GameRunner {
+        pub(super) fn debug_runner(scenario: GameScenario) -> GameRunner {
             let mut runner = scenario.build();
             runner.state_mut().debug_mode = true;
             runner
@@ -3131,14 +3135,14 @@ mod tests {
             }
         }
 
-        fn replacement_prompt_open(runner: &GameRunner) -> bool {
+        pub(super) fn replacement_prompt_open(runner: &GameRunner) -> bool {
             matches!(
                 runner.state().waiting_for,
                 WaitingFor::ReplacementChoice { .. }
             )
         }
 
-        fn parked_policy(runner: &GameRunner) -> Option<UnrepresentablePolicy> {
+        pub(super) fn parked_policy(runner: &GameRunner) -> Option<UnrepresentablePolicy> {
             runner
                 .state()
                 .pending_replacement
@@ -4515,6 +4519,496 @@ mod tests {
 
             act_ok(&mut runner, gain(P1, 1));
             assert_eq!(life(&runner, P1), 21);
+        }
+    }
+
+    // ── Player-counter and energy gains settle through the checked authority ──
+    //
+    // Presets are written straight to the player fields, never through the raw
+    // `ModifyPlayerCounters` / `ModifyEnergy` editors.
+
+    mod player_counter_settlement {
+        use super::life_change::{
+            add_card, debug_runner, parked_policy, replacement_prompt_open, scenario,
+        };
+        use super::*;
+        use crate::game::scenario::{GameRunner, GameScenario, P0, P1};
+        use crate::game::scenario_db::GameScenarioDbExt;
+        use crate::types::ability::{QuantityModification, ReplacementPlayerScope};
+        use crate::types::game_state::{PendingReplacement, UnrepresentablePolicy};
+        use std::collections::HashMap;
+
+        /// Everything the action boundary must restore exactly when it rejects an
+        /// action: every player's poison, generic counters and energy, the state
+        /// revision, the prompt and its parked proposal, the stack and the
+        /// resolved rules journal.
+        #[derive(Debug, PartialEq)]
+        struct CounterRollbackSet {
+            players: Vec<(u32, HashMap<PlayerCounterKind, u32>, u32)>,
+            state_revision: u64,
+            waiting_for: WaitingFor,
+            pending_replacement: Option<PendingReplacement>,
+            stack_len: usize,
+            journal_len: usize,
+        }
+
+        fn counter_rollback_set(runner: &GameRunner) -> CounterRollbackSet {
+            let state = runner.state();
+            CounterRollbackSet {
+                players: state
+                    .players
+                    .iter()
+                    .map(|player| {
+                        (
+                            player.poison_counters,
+                            player.player_counters.clone(),
+                            player.energy,
+                        )
+                    })
+                    .collect(),
+                state_revision: state.state_revision,
+                waiting_for: state.waiting_for.clone(),
+                pending_replacement: state.pending_replacement.clone(),
+                stack_len: state.stack.len(),
+                journal_len: state.resolved_rules_journal.entries().len(),
+            }
+        }
+
+        fn assert_unrepresentable_for(error: &EngineError, player: PlayerId) {
+            assert!(
+                matches!(
+                    error,
+                    EngineError::LifeChangeUnrepresentable { player: failed } if *failed == player
+                ),
+                "expected the typed unrepresentable rejection for {player:?}, got {error:?}"
+            );
+        }
+
+        /// The two player resources a gain can settle: a generic player counter
+        /// (experience) and energy.
+        #[derive(Clone, Copy)]
+        enum Resource {
+            Experience,
+            Energy,
+        }
+
+        impl Resource {
+            fn get(self, runner: &GameRunner, player: PlayerId) -> u32 {
+                let player = &runner.state().players[player.0 as usize];
+                match self {
+                    Resource::Experience => player
+                        .player_counters
+                        .get(&PlayerCounterKind::Experience)
+                        .copied()
+                        .unwrap_or(0),
+                    Resource::Energy => player.energy,
+                }
+            }
+
+            fn set(self, runner: &mut GameRunner, player: PlayerId, value: u32) {
+                let player = &mut runner.state_mut().players[player.0 as usize];
+                match self {
+                    Resource::Experience => {
+                        player
+                            .player_counters
+                            .insert(PlayerCounterKind::Experience, value);
+                    }
+                    Resource::Energy => player.energy = value,
+                }
+            }
+
+            /// The deltas of this resource's change events for `player`.
+            fn deltas(self, events: &[GameEvent], player: PlayerId) -> Vec<i32> {
+                events
+                    .iter()
+                    .filter_map(|event| match (self, event) {
+                        (
+                            Resource::Experience,
+                            GameEvent::PlayerCounterChanged {
+                                player: changed,
+                                counter_kind: PlayerCounterKind::Experience,
+                                delta,
+                            },
+                        )
+                        | (
+                            Resource::Energy,
+                            GameEvent::EnergyChanged {
+                                player: changed,
+                                delta,
+                            },
+                        ) if *changed == player => Some(*delta),
+                        _ => None,
+                    })
+                    .collect()
+            }
+        }
+
+        /// Puts a P-controlled permanent in play carrying an any-player
+        /// `AddCounter` count replacement, set on both the live and base
+        /// definitions so a layer pass keeps it.
+        fn add_counter_quantity_source(
+            runner: &mut GameRunner,
+            controller: PlayerId,
+            modification: QuantityModification,
+        ) -> ObjectId {
+            let mut definition = ReplacementDefinition::new(ReplacementEvent::AddCounter)
+                .quantity_modification(modification);
+            definition.valid_player = Some(ReplacementPlayerScope::AnyPlayer);
+            let serial = runner.state().objects.len() as u64;
+            let id = create_object(
+                runner.state_mut(),
+                CardId(9_800 + serial),
+                controller,
+                format!("Counter Scaler {serial}"),
+                Zone::Battlefield,
+            );
+            let object = runner.state_mut().objects.get_mut(&id).unwrap();
+            object.replacement_definitions = vec![definition.clone()].into();
+            object.base_replacement_definitions = std::sync::Arc::new(vec![definition]);
+            id
+        }
+
+        /// Submits the debug `Proliferate` for P0 and asserts the reach guards:
+        /// the action was audited as used, and the real choice is open with the
+        /// recipient eligible.
+        fn proliferate_to_choice(runner: &mut GameRunner, recipient: PlayerId) {
+            let result = runner
+                .act(GameAction::Debug(DebugAction::Proliferate {
+                    player_id: P0,
+                }))
+                .expect("debug proliferate must start");
+            assert!(
+                result.events.iter().any(|event| matches!(
+                    event,
+                    GameEvent::DebugActionUsed { player_id, .. } if *player_id == P0
+                )),
+                "reach guard: the debug action must be audited as used by P0"
+            );
+            let WaitingFor::ProliferateChoice { player, eligible } = &runner.state().waiting_for
+            else {
+                panic!(
+                    "reach guard: expected ProliferateChoice, got {:?}",
+                    runner.state().waiting_for
+                );
+            };
+            assert_eq!(*player, P0);
+            assert!(
+                eligible.contains(&TargetRef::Player(recipient)),
+                "reach guard: the recipient must be eligible, got {eligible:?}"
+            );
+        }
+
+        fn select(recipient: PlayerId) -> GameAction {
+            GameAction::SelectTargets {
+                targets: vec![TargetRef::Player(recipient)],
+            }
+        }
+
+        fn assert_priority_with_empty_stack(runner: &GameRunner) {
+            assert!(
+                matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+                "expected Priority, got {:?}",
+                runner.state().waiting_for
+            );
+            assert!(runner.state().stack.is_empty());
+        }
+
+        /// CR 701.34a: proliferate gives P0 one more of the resource. A final
+        /// total past `u32` rejects the action with the typed error, restores the
+        /// entry state, and leaves the choice answerable (decline completes it).
+        fn ordinary_final_edit_overflow(resource: Resource) {
+            let mut runner = debug_runner(scenario());
+            resource.set(&mut runner, P0, u32::MAX);
+            proliferate_to_choice(&mut runner, P0);
+            let before = counter_rollback_set(&runner);
+
+            let error = runner
+                .act(select(P0))
+                .expect_err("an overflowing final edit must reject the action");
+
+            assert_unrepresentable_for(&error, P0);
+            assert_eq!(counter_rollback_set(&runner), before);
+            assert_eq!(resource.get(&runner, P0), u32::MAX);
+            assert!(matches!(
+                runner.state().waiting_for,
+                WaitingFor::ProliferateChoice { .. }
+            ));
+            runner
+                .act(GameAction::SelectTargets { targets: vec![] })
+                .expect("declining the restored choice completes it");
+            assert_priority_with_empty_stack(&runner);
+            assert_eq!(resource.get(&runner, P0), u32::MAX);
+
+            // Control: one below the limit takes the gain.
+            let mut runner = debug_runner(scenario());
+            resource.set(&mut runner, P0, u32::MAX - 1);
+            proliferate_to_choice(&mut runner, P0);
+            let result = runner
+                .act(select(P0))
+                .expect("a representable gain must apply");
+            assert_eq!(resource.get(&runner, P0), u32::MAX);
+            assert_eq!(resource.deltas(&result.events, P0), vec![1]);
+            assert_priority_with_empty_stack(&runner);
+        }
+
+        /// O1: ordinary resolution, player counter, checked final edit.
+        #[test]
+        fn proliferate_player_counter_total_overflow_rejects_and_rolls_back() {
+            ordinary_final_edit_overflow(Resource::Experience);
+        }
+
+        /// O2: ordinary resolution, energy, checked final edit.
+        #[test]
+        fn proliferate_energy_total_overflow_rejects_and_rolls_back() {
+            ordinary_final_edit_overflow(Resource::Energy);
+        }
+
+        /// O3, CR 603.2 + CR 603.3: Aether Hub's "you get {E}" trigger goes on the
+        /// stack and resolves on the priority passes. A replacement that takes the
+        /// gain past `i32::MAX` (but within `u32`) cannot be a delta; the resolving
+        /// pass is rejected and rolled back instead of wrapping to a negative
+        /// delta.
+        #[test]
+        fn aether_hub_energy_gain_past_i32_rejects_the_resolving_pass() {
+            let hub_land = |factor: u32| {
+                let mut scenario = scenario();
+                let hub = scenario.add_real_card(
+                    P0,
+                    "Aether Hub",
+                    Zone::Hand,
+                    crate::test_support::shared_card_db(),
+                );
+                let mut runner = debug_runner(scenario);
+                add_counter_quantity_source(
+                    &mut runner,
+                    P0,
+                    QuantityModification::Times { factor },
+                );
+                let card_id = runner.state().objects[&hub].card_id;
+                runner
+                    .act(GameAction::PlayLand {
+                        object_id: hub,
+                        card_id,
+                    })
+                    .expect("Aether Hub must be playable");
+                let stack = &runner.state().stack;
+                assert!(
+                    stack.len() == 1 && stack.iter().all(|entry| entry.source_id == hub),
+                    "reach guard: the ETB trigger must be on the stack"
+                );
+                (runner, hub)
+            };
+
+            let (mut runner, hub) = hub_land(u32::MAX);
+            let mut rejection = None;
+            for _ in 0..4 {
+                assert!(
+                    runner
+                        .state()
+                        .stack
+                        .iter()
+                        .any(|entry| entry.source_id == hub),
+                    "the trigger must still be on the stack before the resolving pass"
+                );
+                let before = counter_rollback_set(&runner);
+                match runner.act(GameAction::PassPriority) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        rejection = Some((before, error));
+                        break;
+                    }
+                }
+            }
+            let (before, error) = rejection.expect("the resolving pass must be rejected");
+            assert_unrepresentable_for(&error, P0);
+            assert_eq!(counter_rollback_set(&runner), before);
+            assert_eq!(Resource::Energy.get(&runner, P0), 0);
+
+            // Control: exactly `i32::MAX` is a representable delta.
+            let (mut runner, _) = hub_land(i32::MAX as u32);
+            let mut events = Vec::new();
+            for _ in 0..4 {
+                if runner.state().stack.is_empty() {
+                    break;
+                }
+                events.extend(
+                    runner
+                        .act(GameAction::PassPriority)
+                        .expect("a representable gain must resolve")
+                        .events,
+                );
+            }
+            assert_eq!(Resource::Energy.get(&runner, P0), i32::MAX as u32);
+            assert_eq!(Resource::Energy.deltas(&events, P0), vec![i32::MAX]);
+            assert_priority_with_empty_stack(&runner);
+        }
+
+        /// O4: a replacement's own arithmetic overflowing `u32` is recorded by the
+        /// applier, consumed by the settle step, and rejected at the boundary.
+        #[test]
+        fn proliferate_replacement_count_overflow_rejects_and_rolls_back() {
+            let mut runner = debug_runner(scenario());
+            Resource::Experience.set(&mut runner, P0, 1);
+            add_counter_quantity_source(
+                &mut runner,
+                P0,
+                QuantityModification::Plus { value: u32::MAX },
+            );
+            proliferate_to_choice(&mut runner, P0);
+            let before = counter_rollback_set(&runner);
+
+            let error = runner
+                .act(select(P0))
+                .expect_err("an overflowing replacement count must reject the action");
+
+            assert_unrepresentable_for(&error, P0);
+            assert_eq!(counter_rollback_set(&runner), before);
+            assert_eq!(Resource::Experience.get(&runner, P0), 1);
+
+            // Control: a representable `Plus` applies to the proliferate
+            // placement (1 + (1 + 1)), proving the source reaches this seam.
+            let mut runner = debug_runner(scenario());
+            Resource::Experience.set(&mut runner, P0, 1);
+            add_counter_quantity_source(&mut runner, P0, QuantityModification::Plus { value: 1 });
+            proliferate_to_choice(&mut runner, P0);
+            let result = runner
+                .act(select(P0))
+                .expect("a representable gain applies");
+            assert_eq!(Resource::Experience.get(&runner, P0), 3);
+            assert_eq!(Resource::Experience.deltas(&result.events, P0), vec![2]);
+            assert_priority_with_empty_stack(&runner);
+        }
+
+        /// A battlefield with Vorinclex, Monstrous Raider under each player: P0's
+        /// doubles the counters P0 puts, P1's halves the counters an opponent
+        /// (P0) puts.
+        fn vorinclex_pair() -> (GameScenario, ObjectId, ObjectId) {
+            let mut scenario = scenario();
+            let p0_vorinclex = add_card(&mut scenario, P0, "Vorinclex, Monstrous Raider");
+            let p1_vorinclex = add_card(&mut scenario, P1, "Vorinclex, Monstrous Raider");
+            (scenario, p0_vorinclex, p1_vorinclex)
+        }
+
+        /// Parks the CR 616.1 prompt for P0 proliferating P1: returns the
+        /// candidate indices of P0's doubler and P1's halver.
+        fn park_vorinclex_prompt(
+            runner: &mut GameRunner,
+            p0_vorinclex: ObjectId,
+            p1_vorinclex: ObjectId,
+        ) -> (usize, usize) {
+            proliferate_to_choice(runner, P1);
+            runner
+                .act(select(P1))
+                .expect("selecting the recipient must park the ordering prompt");
+            let WaitingFor::ReplacementChoice {
+                player,
+                candidate_count,
+                candidates,
+                ..
+            } = &runner.state().waiting_for
+            else {
+                panic!(
+                    "reach guard: expected the ordering prompt, got {:?}",
+                    runner.state().waiting_for
+                );
+            };
+            // CR 616.1: the affected player (the recipient) chooses, not the
+            // proliferating actor.
+            assert_eq!(*player, P1);
+            assert_eq!(*candidate_count, 2);
+            let index_of = |source: ObjectId| {
+                candidates
+                    .iter()
+                    .position(|candidate| candidate.source_id == source)
+                    .unwrap_or_else(|| panic!("no candidate from {source:?}: {candidates:?}"))
+            };
+            (index_of(p0_vorinclex), index_of(p1_vorinclex))
+        }
+
+        /// CR 616.1 + CR 616.1e: the resume settles through the fallible settle
+        /// step. With the recipient one below the limit, the doubler-first order
+        /// (1 -> 2 -> 1) lands the final count on `u32::MAX` + 1 and its
+        /// delivering answer is rejected with the typed error, leaving the prompt
+        /// answerable. The halver-first order (1 -> 0; the doubler then has
+        /// nothing to double) is a legal, representable answer. CR 616.1f: only
+        /// still-applicable effects apply after a choice.
+        fn resume_overflow(resource: Resource) {
+            let (scenario, p0_vorinclex, p1_vorinclex) = vorinclex_pair();
+            let mut runner = debug_runner(scenario);
+            resource.set(&mut runner, P1, u32::MAX);
+            let (doubler, halver) = park_vorinclex_prompt(&mut runner, p0_vorinclex, p1_vorinclex);
+            // The park was made inside P0's public action, so it is stamped for
+            // rejection.
+            assert_eq!(parked_policy(&runner), Some(UnrepresentablePolicy::Reject));
+
+            let before = counter_rollback_set(&runner);
+            let error = runner
+                .act(GameAction::ChooseReplacement { index: doubler })
+                .expect_err("the overflowing delivery must be rejected");
+            assert_unrepresentable_for(&error, P1);
+            assert_eq!(counter_rollback_set(&runner), before);
+            assert!(replacement_prompt_open(&runner));
+
+            let again = runner
+                .act(GameAction::ChooseReplacement { index: doubler })
+                .expect_err("the restored prompt must reject the same answer again");
+            assert_unrepresentable_for(&again, P1);
+            assert_eq!(counter_rollback_set(&runner), before);
+
+            let result = runner
+                .act(GameAction::ChooseReplacement { index: halver })
+                .expect("the halver-first order is representable");
+            assert_eq!(resource.get(&runner, P1), u32::MAX);
+            assert!(resource.deltas(&result.events, P1).is_empty());
+            assert_priority_with_empty_stack(&runner);
+
+            // Control: one below the limit, doubler first (1 -> 2 -> 1) lands
+            // exactly on the limit.
+            let (scenario, p0_vorinclex, p1_vorinclex) = vorinclex_pair();
+            let mut runner = debug_runner(scenario);
+            resource.set(&mut runner, P1, u32::MAX - 1);
+            let (doubler, _) = park_vorinclex_prompt(&mut runner, p0_vorinclex, p1_vorinclex);
+            let result = runner
+                .act(GameAction::ChooseReplacement { index: doubler })
+                .expect("a representable delivery must be accepted");
+            assert_eq!(resource.get(&runner, P1), u32::MAX);
+            assert_eq!(resource.deltas(&result.events, P1), vec![1]);
+            assert_priority_with_empty_stack(&runner);
+        }
+
+        /// R0: CR 616.1 resume, player counter.
+        #[test]
+        fn replacement_choice_resume_player_counter_overflow_rejects_and_stays_answerable() {
+            resume_overflow(Resource::Experience);
+        }
+
+        /// R0e: CR 616.1 resume, energy (Fabrication Module ruling 2024-06-07:
+        /// effects that interact with counters a player gets also apply to
+        /// energy counters).
+        #[test]
+        fn replacement_choice_resume_energy_overflow_rejects_and_stays_answerable() {
+            resume_overflow(Resource::Energy);
+        }
+
+        /// H1, CR 614.17 + CR 614.17c: a prohibited placement can't happen, so
+        /// there is nothing unrepresentable to reject. Guard row: prevention must
+        /// stay ahead of any representability decision.
+        #[test]
+        fn solemnity_prevents_the_gain_before_representability_is_judged() {
+            let mut scenario = scenario();
+            let solemnity = add_card(&mut scenario, P1, "Solemnity");
+            let mut runner = debug_runner(scenario);
+            assert_eq!(runner.state().objects[&solemnity].zone, Zone::Battlefield);
+            Resource::Experience.set(&mut runner, P0, u32::MAX);
+            proliferate_to_choice(&mut runner, P0);
+
+            let result = runner
+                .act(select(P0))
+                .expect("a prevented placement is not an error");
+
+            assert_eq!(Resource::Experience.get(&runner, P0), u32::MAX);
+            assert!(Resource::Experience.deltas(&result.events, P0).is_empty());
+            assert_priority_with_empty_stack(&runner);
         }
     }
 }
