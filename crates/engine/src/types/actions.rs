@@ -1192,7 +1192,9 @@ pub enum DebugCardCreationKind {
 
 /// Direct game-state manipulation actions for debugging, testing, and remediation.
 /// Bypasses `WaitingFor` validation — fires from any game state without disrupting
-/// the current prompt. Gated on `GameState::debug_mode`.
+/// the current prompt, except the player-resource variants that
+/// [`DebugAction::requires_settled_priority`] gates to a Priority window.
+/// Gated on `GameState::debug_mode`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum DebugAction {
