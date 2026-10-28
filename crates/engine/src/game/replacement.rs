@@ -4490,12 +4490,43 @@ fn try_resolve_event_replacement_quantity(
     }
 }
 
-/// A replacement's computed life quantity exceeds the engine's numeric range.
-/// Record it for life settlement: an open public-action ingress window
-/// rejects and restores that action, while legacy or outside-boundary resolution
-/// uses its compatibility skip. Leave the event unchanged because the pipeline
-/// stops at the loop head, so that value never becomes the final amount.
-fn record_life_quantity_overflow(
+/// The result of applying a `QuantityModification` to an event quantity.
+enum ScaledQuantity {
+    /// The modified quantity (`Half` rounds down; `Minus` floors at zero,
+    /// which is not an overflow).
+    Scaled(u32),
+    /// CR 614.6 + CR 614.7: the modified event never happens.
+    Prevented,
+    /// Engine numeric capacity: a `Times` / `Plus` result past `u32`. Recorded
+    /// for the settle step instead of clamped; not a CR 101.3 impossibility.
+    Unrepresentable,
+}
+
+/// Applies `modification` to `amount` with checked `Times` / `Plus`
+/// arithmetic, shared by the life and player-counter/energy appliers.
+fn scale_event_quantity(amount: u32, modification: &QuantityModification) -> ScaledQuantity {
+    match *modification {
+        QuantityModification::Times { factor } => amount
+            .checked_mul(factor)
+            .map_or(ScaledQuantity::Unrepresentable, ScaledQuantity::Scaled),
+        QuantityModification::Half => ScaledQuantity::Scaled(amount / 2),
+        QuantityModification::Plus { value } => amount
+            .checked_add(value)
+            .map_or(ScaledQuantity::Unrepresentable, ScaledQuantity::Scaled),
+        QuantityModification::Minus { value } => {
+            ScaledQuantity::Scaled(amount.saturating_sub(value))
+        }
+        QuantityModification::Prevent => ScaledQuantity::Prevented,
+    }
+}
+
+/// A replacement's computed life, player-counter or energy quantity exceeds the
+/// engine's numeric range. Record it for the settle step of the same event: an
+/// open public-action ingress window rejects and restores that action, while
+/// legacy or outside-boundary resolution uses its compatibility skip. Leave the
+/// event unchanged because the pipeline stops at the loop head, so that value
+/// never becomes the final amount.
+fn record_quantity_overflow(
     state: &mut GameState,
     rid: ReplacementId,
     event: ProposedEvent,
@@ -4520,7 +4551,6 @@ fn gain_life_applier(
     state: &mut GameState,
     _events: &mut Vec<GameEvent>,
 ) -> ApplyResult {
-    use crate::types::ability::QuantityModification;
     // Branch 1: structured `quantity_modification` (Double / Plus / Minus).
     // Used by Boon Reflection / Rhox Faithmender (Twice) and
     // Hardened Heart-style "+N" replacements.
@@ -4539,27 +4569,24 @@ fn gain_life_applier(
             // Engine numeric capacity: a `Times` / `Plus` result past `u32`
             // is recorded for the settle step instead of clamped.
             // `Minus` floors at zero, which is not an overflow.
-            let checked = match modification {
-                QuantityModification::Times { factor } => amount.checked_mul(factor),
-                QuantityModification::Half => Some(amount / 2),
-                QuantityModification::Plus { value } => amount.checked_add(value),
-                QuantityModification::Minus { value } => Some(amount.saturating_sub(value)),
+            let new_amount = match scale_event_quantity(amount, &modification) {
+                ScaledQuantity::Scaled(new_amount) => new_amount,
                 // CR 614.6 + CR 614.7: No life-gain replacement uses Prevent
                 // today (Tainted Remedy converts gain → loss via execute chain),
                 // but the variant composes here for symmetry — fully suppress
                 // the gain event.
-                QuantityModification::Prevent => return ApplyResult::Prevented,
-            };
-            let Some(new_amount) = checked else {
-                return record_life_quantity_overflow(
-                    state,
-                    rid,
-                    ProposedEvent::LifeGain {
-                        player_id,
-                        amount,
-                        applied,
-                    },
-                );
+                ScaledQuantity::Prevented => return ApplyResult::Prevented,
+                ScaledQuantity::Unrepresentable => {
+                    return record_quantity_overflow(
+                        state,
+                        rid,
+                        ProposedEvent::LifeGain {
+                            player_id,
+                            amount,
+                            applied,
+                        },
+                    );
+                }
             };
             return ApplyResult::Modified(ProposedEvent::LifeGain {
                 player_id,
@@ -4593,7 +4620,7 @@ fn gain_life_applier(
             return ApplyResult::Modified(event);
         }
         // The computed quantity exceeds the engine's numeric capacity.
-        Err(EventQuantityOverflow) => return record_life_quantity_overflow(state, rid, event),
+        Err(EventQuantityOverflow) => return record_quantity_overflow(state, rid, event),
         Ok(None) => {}
     }
 
@@ -4706,8 +4733,6 @@ fn lose_life_applier(
     state: &mut GameState,
     _events: &mut Vec<GameEvent>,
 ) -> ApplyResult {
-    use crate::types::ability::QuantityModification;
-
     let definition = state
         .objects
         .get(&rid.source)
@@ -4725,23 +4750,20 @@ fn lose_life_applier(
         // Engine numeric capacity: a `Times` / `Plus` result past `u32` is
         // recorded for the settle step instead of clamped. `Minus`
         // floors at zero, which is not an overflow.
-        let checked = match modification {
-            QuantityModification::Times { factor } => amount.checked_mul(factor),
-            QuantityModification::Half => Some(amount / 2),
-            QuantityModification::Plus { value } => amount.checked_add(value),
-            QuantityModification::Minus { value } => Some(amount.saturating_sub(value)),
-            QuantityModification::Prevent => return ApplyResult::Prevented,
-        };
-        let Some(new_amount) = checked else {
-            return record_life_quantity_overflow(
-                state,
-                rid,
-                ProposedEvent::LifeLoss {
-                    player_id,
-                    amount,
-                    applied,
-                },
-            );
+        let new_amount = match scale_event_quantity(amount, &modification) {
+            ScaledQuantity::Scaled(new_amount) => new_amount,
+            ScaledQuantity::Prevented => return ApplyResult::Prevented,
+            ScaledQuantity::Unrepresentable => {
+                return record_quantity_overflow(
+                    state,
+                    rid,
+                    ProposedEvent::LifeLoss {
+                        player_id,
+                        amount,
+                        applied,
+                    },
+                );
+            }
         };
         return ApplyResult::Modified(ProposedEvent::LifeLoss {
             player_id,
@@ -4778,7 +4800,7 @@ fn lose_life_applier(
                 // Return explicitly so this arm never depends on the later
                 // fall-through checks.
                 Err(EventQuantityError::Overflow) => {
-                    return record_life_quantity_overflow(state, rid, event);
+                    return record_quantity_overflow(state, rid, event);
                 }
                 Err(EventQuantityError::NotStatic) => {}
             }
@@ -4848,8 +4870,38 @@ fn add_counter_applier(
     };
 
     match event {
+        // Engine numeric capacity: a player or energy count (CR 122.1,
+        // CR 107.14) past `u32` is recorded for that placement's settle step
+        // (`player_counter::apply_player_counter_addition` /
+        // `energy::apply_energy_addition`) instead of clamped.
         ProposedEvent::AddCounter {
-            placement,
+            placement:
+                placement @ (CounterPlacement::Player { .. } | CounterPlacement::Energy { .. }),
+            count,
+            applied,
+        } => match scale_event_quantity(count, &modification) {
+            ScaledQuantity::Scaled(count) => ApplyResult::Modified(ProposedEvent::AddCounter {
+                placement,
+                count,
+                applied,
+            }),
+            ScaledQuantity::Prevented => ApplyResult::Prevented,
+            ScaledQuantity::Unrepresentable => record_quantity_overflow(
+                state,
+                rid,
+                ProposedEvent::AddCounter {
+                    placement,
+                    count,
+                    applied,
+                },
+            ),
+        },
+        // Object and MoveCounter placements keep saturating arithmetic: their
+        // settle steps have no consumer for the overflow record, and an untaken
+        // record stops every later replacement pipeline of the same action at
+        // the loop head.
+        ProposedEvent::AddCounter {
+            placement: placement @ CounterPlacement::Object { .. },
             count,
             applied,
         } => ApplyResult::Modified(ProposedEvent::AddCounter {
@@ -6660,6 +6712,24 @@ fn replacement_valid_card_matches(
     source_id: ObjectId,
     controller: Option<PlayerId>,
 ) -> bool {
+    // CR 400.7 + CR 614.1c: a cast-triggered rider modifies only its pinned
+    // spell's entry. Check the pre-move object, not a future incarnation or a
+    // stack entry that resolution may already have removed. Never refresh a
+    // stale pin from a recast sharing the storage id.
+    if let Some(pin) = repl_def.triggering_spell {
+        if !matches!(
+            event,
+            ProposedEvent::ZoneChange {
+                object_id,
+                from: Zone::Stack,
+                to: Zone::Battlefield,
+                ..
+            } if *object_id == pin.object_id
+        ) || !pin.is_current(state)
+        {
+            return false;
+        }
+    }
     let ctx = &repl_def.valid_card_context(state, source_id, controller);
     if let ProposedEvent::Connive { subject, .. } = event {
         return matches_target_filter_on_event_snapshot(state, subject, filter, ctx);
@@ -6686,8 +6756,7 @@ fn replacement_valid_card_matches(
     // type (`SelfRef`, a "card" filter), is not touched; a placement on a
     // player has no object and fails the filter as before.
     if repl_def.event == ReplacementEvent::AddCounter
-        && filter.population_zones().is_empty()
-        && super::filter::filter_implies_battlefield_permanent(filter)
+        && super::filter::filter_denotes_battlefield_permanent(filter)
         && !event
             .affected_object_id()
             .and_then(|oid| state.objects.get(&oid))
@@ -7838,6 +7907,23 @@ fn object_replacement_candidate_applies(
         // CR 614.1a: damage-target filters restrict which recipient is replaced.
         if let ProposedEvent::Damage { target, .. } = event {
             if !matches_damage_target_filter(tf, target, replacement_player, obj.id, state) {
+                return false;
+            }
+        }
+    }
+    // CR 400.7 + CR 615.1: an object-hosted prevention shield protects only its
+    // host's current incarnation. A blinked host keeps its id but bumps its
+    // incarnation, becoming a new object with no memory of the departed one's
+    // shield — refuse to apply this shield to a later incarnation. Registry
+    // (population) shields leave this field None and match the live population
+    // at each damage event, so they are unaffected.
+    if let Some(recorded) = repl_def.target_recipient_incarnation {
+        if let ProposedEvent::Damage { target, .. } = event {
+            let current = match target {
+                TargetRef::Object(oid) => state.objects.get(oid).map(|o| o.incarnation),
+                TargetRef::Player(_) => None,
+            };
+            if current != Some(recorded) {
                 return false;
             }
         }
@@ -12075,7 +12161,7 @@ fn as_enters_payment_shape(def: &ReplacementDefinition) -> bool {
         Effect::PayCost {
             cost: AbilityCost::PayLife { amount },
             ..
-        } if crate::game::effects::pay::is_pay_any_amount(amount)
+        } if crate::types::ability::is_pay_any_amount(amount)
     )
 }
 
@@ -12872,10 +12958,10 @@ fn pipeline_loop(
     record_proposed_event(&proposed);
 
     loop {
-        // Engine numeric capacity: an applier recorded that the modified life
-        // event is unrepresentable. Stop this pipeline before applying further
-        // replacements or asking another ordering prompt; the life settle step
-        // takes the record and the public action owner rejects and restores.
+        // Engine numeric capacity: an applier recorded that the modified life,
+        // player-counter or energy event is unrepresentable. Stop this pipeline
+        // before applying further replacements or asking another ordering
+        // prompt; that event's settle step takes the record and the public action owner rejects and restores.
         // Outside a public boundary, the existing compatibility policy logs and
         // skips it. This also covers the choice-resumed path, which re-enters
         // this loop through `pipeline_loop`.
@@ -17150,6 +17236,151 @@ mod tests {
         source: ObjectId,
     ) -> Option<crate::types::game_state::ReplacementQuantityOverflow> {
         Some(crate::types::game_state::ReplacementQuantityOverflow { source })
+    }
+
+    fn player_counter_event(count: u32) -> ProposedEvent {
+        ProposedEvent::AddCounter {
+            placement: CounterPlacement::Player {
+                actor: PlayerId(0),
+                player_id: PlayerId(0),
+                counter_kind: crate::types::player::PlayerCounterKind::Experience,
+            },
+            count,
+            applied: HashSet::new(),
+        }
+    }
+
+    fn energy_counter_event(count: u32) -> ProposedEvent {
+        ProposedEvent::AddCounter {
+            placement: CounterPlacement::Energy {
+                actor: PlayerId(0),
+                player_id: PlayerId(0),
+            },
+            count,
+            applied: HashSet::new(),
+        }
+    }
+
+    /// Runs a player or energy `AddCounter` through `replace_event` over one
+    /// any-player source (`ObjectId(10)`); returns the resulting count and the
+    /// overflow record.
+    fn replace_counter_count(
+        modification: QuantityModification,
+        event: ProposedEvent,
+    ) -> (
+        u32,
+        Option<crate::types::game_state::ReplacementQuantityOverflow>,
+    ) {
+        let mut state = test_state_with_object(
+            ObjectId(10),
+            Zone::Battlefield,
+            vec![life_qmod_def(ReplacementEvent::AddCounter, modification)],
+        );
+        let mut events = Vec::new();
+        let result = replace_event(&mut state, event, &mut events);
+        let ReplacementResult::Execute(ProposedEvent::AddCounter { count, .. }) = result else {
+            panic!("expected Execute of an AddCounter event, got {result:?}");
+        };
+        (count, state.replacement_quantity_overflow)
+    }
+
+    /// CR 122.1 + CR 107.14: a `Times` / `Plus` count past `u32` on a player or
+    /// energy placement is recorded for the settle step and the event is left
+    /// unchanged (never saturated). An object placement keeps its saturating
+    /// arithmetic and records nothing, because its settle step has no consumer
+    /// for the record.
+    #[test]
+    fn add_counter_applier_player_and_energy_overflow_is_recorded_not_clamped() {
+        let src = ObjectId(10);
+
+        // (a) Player placement, `Times`: 2 x 2^31 does not fit a u32.
+        assert_eq!(
+            replace_counter_count(
+                QuantityModification::Times {
+                    factor: 2_147_483_648
+                },
+                player_counter_event(2),
+            ),
+            (2, overflow_from(src))
+        );
+        // Control: above `i32::MAX` but within `u32`; the settle step decides.
+        assert_eq!(
+            replace_counter_count(
+                QuantityModification::Times {
+                    factor: 2_147_483_647
+                },
+                player_counter_event(2),
+            ),
+            (4_294_967_294, None)
+        );
+
+        // (b) Energy placement, `Plus`.
+        assert_eq!(
+            replace_counter_count(
+                QuantityModification::Plus { value: 1 },
+                energy_counter_event(u32::MAX),
+            ),
+            (u32::MAX, overflow_from(src))
+        );
+        assert_eq!(
+            replace_counter_count(
+                QuantityModification::Plus { value: 1 },
+                energy_counter_event(u32::MAX - 1),
+            ),
+            (u32::MAX, None)
+        );
+
+        // (c) Object placement keeps saturating arithmetic and records nothing.
+        let mut state = test_state_with_object(
+            ObjectId(10),
+            Zone::Battlefield,
+            vec![life_qmod_def(
+                ReplacementEvent::AddCounter,
+                QuantityModification::Plus { value: 1 },
+            )],
+        );
+        let object_event = ProposedEvent::AddCounter {
+            placement: CounterPlacement::Object {
+                actor: PlayerId(0),
+                object_id: ObjectId(10),
+                counter_type: CounterType::Plus1Plus1,
+            },
+            count: u32::MAX,
+            applied: HashSet::new(),
+        };
+        let applied = add_counter_applier(
+            object_event,
+            ReplacementId {
+                source: ObjectId(10),
+                index: 0,
+            },
+            &mut state,
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(
+                applied,
+                ApplyResult::Modified(ProposedEvent::AddCounter {
+                    count: u32::MAX,
+                    ..
+                })
+            ),
+            "object placements saturate: {applied:?}"
+        );
+        assert_eq!(state.replacement_quantity_overflow, None);
+
+        // (d) `Half` and `Minus` cannot overflow.
+        assert_eq!(
+            replace_counter_count(QuantityModification::Half, player_counter_event(u32::MAX)),
+            (u32::MAX / 2, None)
+        );
+        assert_eq!(
+            replace_counter_count(
+                QuantityModification::Minus { value: 5 },
+                energy_counter_event(3),
+            ),
+            (0, None)
+        );
     }
 
     /// A `Times` / `Plus` or computed gain beyond engine numeric capacity is

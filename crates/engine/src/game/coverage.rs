@@ -5661,6 +5661,7 @@ fn keyword_supported(kw: &Keyword) -> bool {
     match kw {
         Keyword::Unknown(_) => false,
         Keyword::CumulativeUpkeep(cost) => cost.supports_cumulative_upkeep_payment(),
+        Keyword::Morph(cost) => cost.is_supported(),
         kw if printed_color_set_protection_is_unexpanded(kw) => false,
         _ => true,
     }
@@ -5671,6 +5672,9 @@ fn keyword_gap_label(kw: &Keyword) -> Option<String> {
         Keyword::Unknown(s) => Some(format!("Keyword:{s}")),
         Keyword::CumulativeUpkeep(cost) if !cost.supports_cumulative_upkeep_payment() => {
             Some("Keyword:CumulativeUpkeepUnsupportedCost".to_string())
+        }
+        Keyword::Morph(cost) if !cost.is_supported() => {
+            Some("Keyword:MorphUnsupportedCost".to_string())
         }
         kw if printed_color_set_protection_is_unexpanded(kw) => {
             Some("Keyword:ProtectionColorSetUnexpanded".to_string())
@@ -9850,7 +9854,7 @@ fn delayed_trigger_strands_a_tracked_set(def: &AbilityDefinition) -> bool {
 }
 
 /// CR 608.2c + CR 614.1a: true when `def` is a counter whose graveyard-exile
-/// rider (`cast_from_zone::is_graveyard_exile_rider_subability`, the shape
+/// rider (`types::ability::is_graveyard_exile_rider_subability`, the shape
 /// `resolve_chain_body`'s counter rider branch consumes) carries a tail the
 /// resolver drops (`effects::counter_exile_rider_runs_tail`). The rider and the
 /// tail are asked of the resolver's own authorities; the `Effect::Counter`
@@ -9858,7 +9862,7 @@ fn delayed_trigger_strands_a_tracked_set(def: &AbilityDefinition) -> bool {
 fn counter_exile_rider_drops_its_tail(def: &AbilityDefinition) -> bool {
     matches!(&*def.effect, Effect::Counter { .. })
         && def.sub_ability.as_deref().is_some_and(|rider| {
-            crate::game::effects::cast_from_zone::is_graveyard_exile_rider_subability(
+            crate::types::ability::is_graveyard_exile_rider_subability(
                 &rider.effect,
                 rider.condition.as_ref(),
             ) && rider.sub_ability.as_deref().is_some_and(|tail| {
@@ -10956,7 +10960,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         // `cargo run --profile tool --bin coverage-report -- data --all`.
         QuantityRef::BattlefieldEntriesThisTurn { filter, .. } => (
             "BattlefieldEntriesThisTurn",
-            if crate::game::restrictions::ledger_filter_is_evaluable(filter) {
+            if crate::types::ability::ledger_filter_is_evaluable(filter) {
                 Handled
             } else {
                 Unhandled
@@ -14538,7 +14542,7 @@ mod tests {
         let rider_head = |def: &AbilityDefinition| {
             matches!(&*def.effect, Effect::Counter { .. })
                 && def.sub_ability.as_deref().is_some_and(|rider| {
-                    crate::game::effects::cast_from_zone::is_graveyard_exile_rider_subability(
+                    crate::types::ability::is_graveyard_exile_rider_subability(
                         &rider.effect,
                         rider.condition.as_ref(),
                     )
