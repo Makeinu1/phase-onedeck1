@@ -4926,8 +4926,8 @@ mod tests {
         }
 
         /// CR 616.1 + CR 616.1e: the resume settles through the fallible settle
-        /// step. With the recipient one below the limit, the doubler-first order
-        /// (1 -> 2 -> 1) lands the final count on `u32::MAX` + 1 and its
+        /// step. With the recipient at the limit, the doubler-first order
+        /// (1 -> 2 -> 1) takes the final total to `u32::MAX` + 1 and its
         /// delivering answer is rejected with the typed error, leaving the prompt
         /// answerable. The halver-first order (1 -> 0; the doubler then has
         /// nothing to double) is a legal, representable answer. CR 616.1f: only
