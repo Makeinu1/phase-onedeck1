@@ -47,6 +47,7 @@ pub(crate) fn add_energy_with_replacement(
 /// (CR 616.1). `actor` is the player who puts the counters. `Ok(true)` means
 /// the gain settled (applied or prevented) and `Ok(false)` means a choice is
 /// parked.
+#[allow(dead_code)]
 pub(crate) fn try_add_energy_with_replacement(
     state: &mut GameState,
     actor: PlayerId,

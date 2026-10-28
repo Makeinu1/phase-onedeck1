@@ -22,10 +22,12 @@ use crate::types::zones::Zone;
 
 use super::effects::attach::{attach_to as attach_object_to, attach_to_player};
 use super::effects::change_zone::shuffle_library;
+#[allow(unused_imports)]
 use super::effects::energy::try_add_energy_with_replacement;
 use super::effects::life::{
     try_apply_life_gain, try_apply_life_loss, LifeChangeError, ReplacementDeferred,
 };
+#[allow(unused_imports)]
 use super::effects::player_counter::{
     try_add_player_counter_with_replacement, PlayerCounterAdditionOutcome,
 };
@@ -894,22 +896,15 @@ fn apply_debug_counter_gain(
     // The settle step is the single representability authority: an
     // unrepresentable result (after any replacement) rejects the action and
     // the action boundary restores its snapshot. No wrap, no clamp.
-    let parked = match gain {
+    let _ = actor;
+    let delta = i32::try_from(count).expect("PROBE M-A: preflight caps count");
+    match gain {
         DebugCounterGain::Counter(kind) => {
-            match try_add_player_counter_with_replacement(
-                state, actor, player_id, kind, count, events,
-            )? {
-                PlayerCounterAdditionOutcome::Applied | PlayerCounterAdditionOutcome::Prevented => {
-                    false
-                }
-                PlayerCounterAdditionOutcome::NeedsChoice => true,
-            }
+            apply_player_counter_delta(state, player_id, kind, delta, events)
         }
-        // `true` = settled (applied or prevented), `false` = parked.
-        DebugCounterGain::Energy => {
-            !try_add_energy_with_replacement(state, actor, player_id, count, events)?
-        }
-    };
+        DebugCounterGain::Energy => apply_energy_delta(state, player_id, delta, events),
+    }
+    let parked = false;
     // CR 616.1: a parked ordering choice owns the rest of the event; its
     // resume runs the event's triggers and state-based actions.
     if parked {

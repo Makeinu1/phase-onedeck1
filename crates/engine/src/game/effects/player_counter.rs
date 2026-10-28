@@ -70,6 +70,7 @@ pub fn add_player_counter_with_replacement(
 /// action and the action boundary restores its snapshot. The fresh ingress
 /// window covers the whole call: a park made here is stamped for rejection on
 /// resume (CR 616.1). `actor` is the player who puts the counters.
+#[allow(dead_code)]
 pub(crate) fn try_add_player_counter_with_replacement(
     state: &mut GameState,
     actor: PlayerId,
