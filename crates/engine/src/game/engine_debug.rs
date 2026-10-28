@@ -6025,7 +6025,14 @@ mod tests {
                     .iter()
                     .all(|entry| entry.source_id == module));
                 runner.advance_until_stack_empty();
-                assert_eq!(p1p1(&runner, bears), 1);
+                assert!(
+                    runner.state().stack.is_empty(),
+                    "the Module trigger resolves"
+                );
+                // The Module's controller (P1) puts the counter, so P0's Vorinclex
+                // (an opponent's counters, halved, rounded down) turns 1 into 0;
+                // P1's own Halving Season does not apply to P1's counters.
+                assert_eq!(p1p1(&runner, bears), 0);
             }
         }
     }
