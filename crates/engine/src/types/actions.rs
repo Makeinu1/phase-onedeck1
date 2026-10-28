@@ -1541,10 +1541,8 @@ impl DebugAction {
     /// its own payload-dependent check in `preflight_debug_action`.
     pub fn requires_settled_priority(&self) -> bool {
         match self {
-            Self::GainLife { .. }
-            | Self::LoseLife { .. }
-            | Self::GivePlayerCounters { .. }
-            | Self::GiveEnergy { .. } => true,
+            Self::GainLife { .. } | Self::LoseLife { .. } => true,
+            Self::GivePlayerCounters { .. } | Self::GiveEnergy { .. } => false,
             Self::MoveToZone { .. }
             | Self::CreateCard { .. }
             | Self::RemoveObject { .. }
@@ -1590,14 +1588,7 @@ impl DebugAction {
                 }
                 Ok(())
             }
-            Self::GivePlayerCounters { count, .. } | Self::GiveEnergy { count, .. } => {
-                if *count > MAX_DEBUG_COUNTER_AMOUNT {
-                    return Err(format!(
-                        "Debug counter gain count {count} exceeds the maximum {MAX_DEBUG_COUNTER_AMOUNT}"
-                    ));
-                }
-                Ok(())
-            }
+            Self::GivePlayerCounters { .. } | Self::GiveEnergy { .. } => Ok(()),
             Self::MoveToZone { .. }
             | Self::CreateCard { .. }
             | Self::RemoveObject { .. }

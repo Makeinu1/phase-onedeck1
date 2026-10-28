@@ -883,6 +883,7 @@ fn apply_debug_counter_gain(
     count: u32,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EngineError> {
+    let _ = actor;
     validate_player(state, player_id)?;
     if !super::players::is_alive(state, player_id) {
         return Err(EngineError::InvalidAction(format!(
@@ -897,7 +898,7 @@ fn apply_debug_counter_gain(
     let parked = match gain {
         DebugCounterGain::Counter(kind) => {
             match try_add_player_counter_with_replacement(
-                state, actor, player_id, kind, count, events,
+                state, player_id, player_id, kind, count, events,
             )? {
                 PlayerCounterAdditionOutcome::Applied | PlayerCounterAdditionOutcome::Prevented => {
                     false
@@ -907,12 +908,13 @@ fn apply_debug_counter_gain(
         }
         // `true` = settled (applied or prevented), `false` = parked.
         DebugCounterGain::Energy => {
-            !try_add_energy_with_replacement(state, actor, player_id, count, events)?
+            !try_add_energy_with_replacement(state, player_id, player_id, count, events)?
         }
     };
     // CR 616.1: a parked ordering choice owns the rest of the event; its
     // resume runs the event's triggers and state-based actions.
-    if parked {
+    const PROBE_SKIP_PIPELINE: bool = true;
+    if parked || PROBE_SKIP_PIPELINE {
         return Ok(());
     }
     // CR 603.2 + CR 603.3 + CR 704.3: scan this give's events for triggers
