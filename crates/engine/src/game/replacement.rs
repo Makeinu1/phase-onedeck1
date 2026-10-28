@@ -4551,7 +4551,6 @@ fn gain_life_applier(
     state: &mut GameState,
     _events: &mut Vec<GameEvent>,
 ) -> ApplyResult {
-    use crate::types::ability::QuantityModification;
     // Branch 1: structured `quantity_modification` (Double / Plus / Minus).
     // Used by Boon Reflection / Rhox Faithmender (Twice) and
     // Hardened Heart-style "+N" replacements.
@@ -4734,8 +4733,6 @@ fn lose_life_applier(
     state: &mut GameState,
     _events: &mut Vec<GameEvent>,
 ) -> ApplyResult {
-    use crate::types::ability::QuantityModification;
-
     let definition = state
         .objects
         .get(&rid.source)
