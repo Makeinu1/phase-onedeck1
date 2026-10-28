@@ -112,6 +112,27 @@ pub(crate) fn within_ingress_life_window<T>(
     (result, window)
 }
 
+/// The action-ingress rule for any player-resource change (life, a player
+/// counter, or energy): runs `body` under `UnrepresentablePolicy::Reject`
+/// inside a fresh ingress window. The body's own unrepresentable error is
+/// reported first; otherwise a failure recorded in the window (a nested
+/// ordinary settlement) outranks the body's result, because the whole
+/// action is rejected and rolled back by the boundary. A park made inside
+/// the window is stamped `Reject`, so its resume is held to the same rule.
+/// An engine numeric limit, not a CR 101.3 impossibility.
+pub(crate) fn within_rejecting_ingress_window<T>(
+    state: &mut GameState,
+    body: impl FnOnce(&mut GameState, UnrepresentablePolicy) -> Result<T, LifeChangeUnrepresentable>,
+) -> Result<T, LifeChangeUnrepresentable> {
+    let (result, window) =
+        within_ingress_life_window(state, |state| body(state, UnrepresentablePolicy::Reject));
+    match (result, window.failed_player) {
+        (Err(own), _) => Err(own),
+        (Ok(_), Some(player)) => Err(LifeChangeUnrepresentable { player }),
+        (Ok(value), None) => Ok(value),
+    }
+}
+
 /// CR 119.3: Gain life — adjust the player's life total.
 pub fn resolve_gain(
     state: &mut GameState,
@@ -267,28 +288,26 @@ fn ordinary_life_outcome(result: Result<u32, LifeChangeError>) -> Result<u32, Re
 /// Runs an ingress life change under an open ingress window. A failure
 /// recorded anywhere inside the window (a substitute's or continuation's
 /// ordinary entry) outranks a deferral, because the whole action is rejected
-/// and rolled back by the boundary.
+/// and rolled back by the boundary. The window, policy and fold are the shared
+/// `within_rejecting_ingress_window`; a deferral rides through it as a success
+/// value.
 fn run_ingress_life_change(
     state: &mut GameState,
     proposed: ProposedEvent,
     settle: LifeSettleFn,
     events: &mut Vec<GameEvent>,
 ) -> Result<u32, LifeChangeError> {
-    let (result, window) = within_ingress_life_window(state, |state| {
-        apply_life_change_core(
-            state,
-            proposed,
-            settle,
-            UnrepresentablePolicy::Reject,
-            events,
-        )
+    let outcome = within_rejecting_ingress_window(state, |state, policy| {
+        match apply_life_change_core(state, proposed, settle, policy, events) {
+            Ok(applied) => Ok(Ok(applied)),
+            Err(LifeChangeError::Deferred(deferred)) => Ok(Err(deferred)),
+            Err(LifeChangeError::Unrepresentable(unrepresentable)) => Err(unrepresentable),
+        }
     });
-    match (result, window.failed_player) {
-        (Err(own @ LifeChangeError::Unrepresentable(_)), _) => Err(own),
-        (_, Some(player)) => Err(LifeChangeError::Unrepresentable(
-            LifeChangeUnrepresentable { player },
-        )),
-        (result, None) => result,
+    match outcome {
+        Ok(Ok(applied)) => Ok(applied),
+        Ok(Err(deferred)) => Err(LifeChangeError::Deferred(deferred)),
+        Err(unrepresentable) => Err(LifeChangeError::Unrepresentable(unrepresentable)),
     }
 }
 

@@ -17368,20 +17368,19 @@ pub fn preflight_debug_action(
         .validate_create_count()
         .map_err(EngineError::InvalidAction)?;
     action
-        .validate_life_change_amount()
+        .validate_player_resource_amount()
         .map_err(EngineError::InvalidAction)?;
 
-    // CR 616.1: a sandbox life change is a real event whose replacements can
-    // park a replacement-order choice for the affected player. Only a settled
-    // Priority boundary can own that choice; admitting a second event under an
-    // open prompt would replace the outstanding proposal before it resolves.
-    if matches!(
-        action,
-        DebugAction::GainLife { .. } | DebugAction::LoseLife { .. }
-    ) && !matches!(state.waiting_for, WaitingFor::Priority { .. })
+    // CR 616.1: a sandbox life change or player-counter/energy gain is a real
+    // event whose replacements can park a replacement-order choice for the
+    // affected player. Only a settled Priority boundary can own that choice;
+    // admitting a second event under an open prompt would replace the
+    // outstanding proposal before it resolves.
+    if action.requires_settled_priority()
+        && !matches!(state.waiting_for, WaitingFor::Priority { .. })
     {
         return Err(EngineError::InvalidAction(
-            "Debug::GainLife / Debug::LoseLife require a Priority window".into(),
+            "Debug::GainLife / Debug::LoseLife / Debug::GivePlayerCounters / Debug::GiveEnergy require a Priority window".into(),
         ));
     }
 

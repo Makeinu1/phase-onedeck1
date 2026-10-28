@@ -39,6 +39,26 @@ pub(crate) fn add_energy_with_replacement(
     )
 }
 
+/// CR 122.1 + CR 107.14: Action-ingress energy gain. Like
+/// [`add_energy_with_replacement`], except that a final result the engine
+/// cannot represent is returned as `Err`, so the caller rejects the action and
+/// the action boundary restores its snapshot. The fresh ingress window covers
+/// the whole call: a park made here is stamped for rejection on resume
+/// (CR 616.1). `actor` is the player who puts the counters. `Ok(true)` means
+/// the gain settled (applied or prevented) and `Ok(false)` means a choice is
+/// parked.
+pub(crate) fn try_add_energy_with_replacement(
+    state: &mut GameState,
+    actor: PlayerId,
+    player_id: PlayerId,
+    amount: u32,
+    events: &mut Vec<GameEvent>,
+) -> Result<bool, LifeChangeUnrepresentable> {
+    life::within_rejecting_ingress_window(state, |state, policy| {
+        add_energy_core(state, actor, player_id, amount, policy, events)
+    })
+}
+
 /// The policy-parameterized energy add pipeline: replacement, then the shared
 /// settle step (`apply_energy_addition`). `Ok(false)` means the replacement
 /// pipeline parked a choice.

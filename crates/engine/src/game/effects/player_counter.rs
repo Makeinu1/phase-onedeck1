@@ -64,6 +64,25 @@ pub fn add_player_counter_with_replacement(
     )
 }
 
+/// CR 122.1: Action-ingress player-counter gain. Like
+/// [`add_player_counter_with_replacement`], except that a final result the
+/// engine cannot represent is returned as `Err`, so the caller rejects the
+/// action and the action boundary restores its snapshot. The fresh ingress
+/// window covers the whole call: a park made here is stamped for rejection on
+/// resume (CR 616.1). `actor` is the player who puts the counters.
+pub(crate) fn try_add_player_counter_with_replacement(
+    state: &mut GameState,
+    actor: PlayerId,
+    player_id: PlayerId,
+    counter_kind: PlayerCounterKind,
+    count: u32,
+    events: &mut Vec<GameEvent>,
+) -> Result<PlayerCounterAdditionOutcome, LifeChangeUnrepresentable> {
+    life::within_rejecting_ingress_window(state, |state, policy| {
+        add_player_counter_core(state, actor, player_id, counter_kind, count, policy, events)
+    })
+}
+
 /// The policy-parameterized player-counter add pipeline: replacement, then the
 /// shared settle step (`apply_player_counter_addition`).
 fn add_player_counter_core(
