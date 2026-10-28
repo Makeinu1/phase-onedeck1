@@ -23,7 +23,11 @@ import type {
   SerializedAbilityCost,
   AiDecisionDiagnosticReceipt,
 } from "../adapter/types";
-import { supportsAiDecisionDiagnostics, supportsMatchConcede } from "../adapter/types";
+import {
+  supportsAiDecisionDiagnostics,
+  supportsDebugHandReveal,
+  supportsMatchConcede,
+} from "../adapter/types";
 import type {
   InteractionManaRestriction,
   InteractionPresentationSurface,
@@ -33,6 +37,7 @@ import { useDraftStore } from "../stores/draftStore";
 import { loadActiveQuickDraft } from "../services/quickDraftPersistence";
 import type { DraftMatchResult } from "../services/quickDraftPersistence";
 import { useResolvedGridRows, useResolvedSplitGridRows } from "../hooks/useResolvedGridRows.ts";
+import { useDebugHandReveal } from "../hooks/useDebugHandReveal";
 import { useIsMobile } from "../hooks/useIsMobile.ts";
 import { useLocalizedCardContent } from "../hooks/useLocalizedCardContent.ts";
 import { CardTextReference } from "../components/card/CardTextReference.tsx";
@@ -1020,9 +1025,9 @@ function GamePageContent({
   const canReportCard = gameState != null && !isSpectatorMode;
   const canActForWaitingState = useCanActForWaitingState();
   const boardChoiceLayerActive = useMemo(() => {
-    const choice = getBoardChoiceView(waitingFor, objects);
+    const choice = getBoardChoiceView(waitingFor, objects, gameState?.allows_cancel_cast);
     return canActForWaitingState && choice != null;
-  }, [canActForWaitingState, objects, waitingFor]);
+  }, [canActForWaitingState, gameState?.allows_cancel_cast, objects, waitingFor]);
   const helpSheetOpen = useUiStore((s) => s.helpSheetOpen);
   const setHelpSheetOpen = useUiStore((s) => s.setHelpSheetOpen);
   const dismissedFlowHelpNudge = usePreferencesStore((s) => s.dismissedFlowHelpNudge);
@@ -1065,6 +1070,7 @@ function GamePageContent({
       adapter.setAiDecisionDiagnosticsEnabled(false);
     };
   }, [adapter, aiDecisionCaptureEnabled]);
+  useDebugHandReveal(showAiHand);
   // The AUTHORITATIVE game mode. The URL-derived `mode` prop structurally
   // cannot contain `native-ai` (desktop solo arrives as `rawMode === "ai"`), so
   // it cannot answer "is anyone else at this table?".
@@ -1084,7 +1090,7 @@ function GamePageContent({
   const untapForcedSplit =
     seatCount > 2 &&
     canActForWaitingState &&
-    getBoardChoiceView(waitingFor, objects)?.intent === "untap";
+    getBoardChoiceView(waitingFor, objects, gameState?.allows_cancel_cast)?.intent === "untap";
   const effectiveMultiplayerBoardLayout = untapForcedSplit
     ? "split"
     : resolvedMultiplayerBoardLayout;
@@ -1565,7 +1571,7 @@ function GamePageContent({
             <>
               <div aria-hidden />
               <div className="min-w-0">
-                <OpponentHand showCards={showAiHand} />
+                <OpponentHand />
               </div>
               <DraggableWidget
                 target={{ kind: "widget", key: "opponentPiles" }}
@@ -1613,7 +1619,6 @@ function GamePageContent({
             effectiveMultiplayerBoardLayout={effectiveMultiplayerBoardLayout}
             oppHud={oppHud}
             playerHud={playerHud}
-            showOpponentCards={showAiHand}
             onKickPlayer={isP2PHost ? handleKickPlayer : undefined}
             onViewZone={handleViewZone}
           />
@@ -1756,7 +1761,7 @@ function GamePageContent({
       {/* Game menu — top-left hamburger */}
       <GameMenu
         gameId={gameId}
-        isAiMode={mode === "ai"}
+        isAiMode={mode === "ai" && supportsDebugHandReveal(adapter)}
         isOnlineMode={isOnlineMode}
         showAiHand={showAiHand}
         onToggleAiHand={() => setShowAiHand((v) => !v)}
