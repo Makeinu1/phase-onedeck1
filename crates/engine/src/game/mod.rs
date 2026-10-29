@@ -13,8 +13,6 @@ pub mod blitz;
 #[cfg(test)]
 #[path = "blitz_tests.rs"]
 mod blitz_tests;
-#[cfg(test)]
-mod probe_a3a_tests;
 pub mod boosters;
 pub mod bracket_estimate;
 pub mod card_subset;
@@ -22,6 +20,8 @@ pub mod casting;
 pub(crate) mod casting_costs;
 pub(crate) mod casting_targets;
 pub mod cipher;
+#[cfg(test)]
+mod probe_a3a_tests;
 // Tests for `cipher` live in a sibling file (declared here, not in `cipher.rs`,
 // so `cipher.rs` stays implementation-only).
 #[cfg(test)]
