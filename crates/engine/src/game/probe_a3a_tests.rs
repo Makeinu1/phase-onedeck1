@@ -130,17 +130,11 @@ fn probe_p1_parked_choice_settles_once_after_answer() {
             st.stack.len(),
             st.waiting_for
         ));
-        if ok {
-            assert_eq!(
-                st.stack.len(),
-                1,
-                "::error::P1 trigger once after answer: {results:?}"
-            );
-            assert_eq!(n, 1, "::error::P1 one Discarded in answer: {results:?}");
-        }
     }
     assert!(
-        results.iter().filter(|r| r.contains("ok=true")).count() == 2,
+        results.iter().all(|r| r.contains("ok=true")
+            && r.contains("stack_len=1")
+            && r.contains("answer_discarded=1")),
         "::error::P1 both options answerable: {results:?}"
     );
 }
