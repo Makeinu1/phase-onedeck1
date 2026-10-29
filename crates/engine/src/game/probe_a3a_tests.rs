@@ -109,7 +109,11 @@ fn probe_p1_parked_choice_settles_once_after_answer() {
         matches!(runner.state().waiting_for, WaitingFor::ReplacementChoice { player, .. } if player == P0),
         "::error::P1 prompt {pre}"
     );
-    assert_eq!(runner.state().stack.len(), 0, "::error::P1 no early trigger {pre}");
+    assert_eq!(
+        runner.state().stack.len(),
+        0,
+        "::error::P1 no early trigger {pre}"
+    );
 
     let mut results = Vec::new();
     for index in [0usize, 1usize] {
@@ -185,7 +189,11 @@ fn probe_p4_madness_trigger_offers_cast() {
         Zone::Exile,
         "::error::P4 {after}"
     );
-    assert_eq!(runner.state().stack.len(), 1, "::error::P4 madness trigger {after}");
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "::error::P4 madness trigger {after}"
+    );
     let mut trail = Vec::new();
     for _ in 0..4 {
         if matches!(runner.state().waiting_for, WaitingFor::CastOffer { .. }) {
@@ -243,6 +251,10 @@ fn probe_p6_authority_silently_completes_off_hand_card() {
         discarded_count(&events, card)
     );
     assert_eq!(path, "Complete", "::error::P6 {obs}");
-    assert_eq!(st.objects[&card].zone, Zone::Battlefield, "::error::P6 {obs}");
+    assert_eq!(
+        st.objects[&card].zone,
+        Zone::Battlefield,
+        "::error::P6 {obs}"
+    );
     assert_eq!(discarded_count(&events, card), 0, "::error::P6 {obs}");
 }

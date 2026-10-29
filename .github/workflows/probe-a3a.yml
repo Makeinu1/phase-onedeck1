@@ -1,0 +1,30 @@
+name: Probe A3a (fork-only)
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  probe:
+    if: github.head_ref == 'probe/a3a-discard'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-shared-key: rust-debug
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Enable sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+      - name: Run probes and publish results as annotations
+        run: |
+          set +e
+          cargo test -p phase-engine --lib -- probe_a3a --test-threads=1 > out.txt 2>&1
+          code=$?
+          grep -E '^test .*probe_a3a' out.txt | sed 's/^/::notice::/'
+          grep -E '^::error::' out.txt
+          grep -E '^(error(\[E[0-9]+\])?:|  --> )' out.txt | head -20 | sed 's/^/::warning::/'
+          tail -5 out.txt
+          exit $code
