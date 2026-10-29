@@ -77,13 +77,13 @@ fn probe_p2_complete_path_settles_opponent_trigger() {
         st.stack.len(),
         st.waiting_for
     );
-    assert_eq!(path, "Complete", "P2 {obs}");
-    assert_eq!(discarded_count(&events, card), 1, "P2 reach {obs}");
-    assert_eq!(st.objects[&card].zone, Zone::Graveyard, "P2 {obs}");
-    assert_eq!(st.stack.len(), 1, "P2 trigger once {obs}");
+    assert_eq!(path, "Complete", "::error::P2 {obs}");
+    assert_eq!(discarded_count(&events, card), 1, "::error::P2 reach {obs}");
+    assert_eq!(st.objects[&card].zone, Zone::Graveyard, "::error::P2 {obs}");
+    assert_eq!(st.stack.len(), 1, "::error::P2 trigger once {obs}");
     assert!(
         matches!(st.waiting_for, WaitingFor::Priority { .. }),
-        "P2 {obs}"
+        "::error::P2 {obs}"
     );
 }
 
@@ -104,12 +104,12 @@ fn probe_p1_parked_choice_settles_once_after_answer() {
         runner.state().stack.len(),
         runner.state().waiting_for
     );
-    assert_eq!(path, "NeedsReplacementChoice", "P1 park {pre}");
+    assert_eq!(path, "NeedsReplacementChoice", "::error::P1 park {pre}");
     assert!(
         matches!(runner.state().waiting_for, WaitingFor::ReplacementChoice { player, .. } if player == P0),
-        "P1 prompt {pre}"
+        "::error::P1 prompt {pre}"
     );
-    assert_eq!(runner.state().stack.len(), 0, "P1 no early trigger {pre}");
+    assert_eq!(runner.state().stack.len(), 0, "::error::P1 no early trigger {pre}");
 
     let mut results = Vec::new();
     for index in [0usize, 1usize] {
@@ -130,14 +130,14 @@ fn probe_p1_parked_choice_settles_once_after_answer() {
             assert_eq!(
                 st.stack.len(),
                 1,
-                "P1 trigger once after answer: {results:?}"
+                "::error::P1 trigger once after answer: {results:?}"
             );
-            assert_eq!(n, 1, "P1 one Discarded in answer: {results:?}");
+            assert_eq!(n, 1, "::error::P1 one Discarded in answer: {results:?}");
         }
     }
     assert!(
         results.iter().filter(|r| r.contains("ok=true")).count() == 2,
-        "P1 both options answerable: {results:?}"
+        "::error::P1 both options answerable: {results:?}"
     );
 }
 
@@ -159,9 +159,9 @@ fn probe_p3_rest_in_peace_redirect_is_still_a_discard() {
         st.stack.len(),
         st.waiting_for
     );
-    assert_eq!(st.objects[&card].zone, Zone::Exile, "P3 {obs}");
-    assert_eq!(discarded_count(&events, card), 1, "P3 {obs}");
-    assert_eq!(st.stack.len(), 1, "P3 trigger {obs}");
+    assert_eq!(st.objects[&card].zone, Zone::Exile, "::error::P3 {obs}");
+    assert_eq!(discarded_count(&events, card), 1, "::error::P3 {obs}");
+    assert_eq!(st.stack.len(), 1, "::error::P3 trigger {obs}");
 }
 
 /// P4: Madness card is exiled, its trigger reaches the stack through the
@@ -183,9 +183,9 @@ fn probe_p4_madness_trigger_offers_cast() {
     assert_eq!(
         runner.state().objects[&card].zone,
         Zone::Exile,
-        "P4 {after}"
+        "::error::P4 {after}"
     );
-    assert_eq!(runner.state().stack.len(), 1, "P4 madness trigger {after}");
+    assert_eq!(runner.state().stack.len(), 1, "::error::P4 madness trigger {after}");
     let mut trail = Vec::new();
     for _ in 0..4 {
         if matches!(runner.state().waiting_for, WaitingFor::CastOffer { .. }) {
@@ -204,7 +204,7 @@ fn probe_p4_madness_trigger_offers_cast() {
             WaitingFor::CastOffer { player, kind: CastOfferKind::Madness { object_id, .. } }
                 if player == P0 && object_id == card
         ),
-        "P4 cast offer {after} trail={trail:?}"
+        "::error::P4 cast offer {after} trail={trail:?}"
     );
 }
 
@@ -223,8 +223,8 @@ fn probe_p5_no_source_smiter_goes_to_graveyard() {
         discarded_count(&events, card),
         st.waiting_for
     );
-    assert_eq!(st.objects[&card].zone, Zone::Graveyard, "P5 {obs}");
-    assert_eq!(discarded_count(&events, card), 1, "P5 {obs}");
+    assert_eq!(st.objects[&card].zone, Zone::Graveyard, "::error::P5 {obs}");
+    assert_eq!(discarded_count(&events, card), 1, "::error::P5 {obs}");
 }
 
 /// P6: the authority reports `Complete` for a card that is not in a hand
@@ -242,7 +242,7 @@ fn probe_p6_authority_silently_completes_off_hand_card() {
         st.objects[&card].zone,
         discarded_count(&events, card)
     );
-    assert_eq!(path, "Complete", "P6 {obs}");
-    assert_eq!(st.objects[&card].zone, Zone::Battlefield, "P6 {obs}");
-    assert_eq!(discarded_count(&events, card), 0, "P6 {obs}");
+    assert_eq!(path, "Complete", "::error::P6 {obs}");
+    assert_eq!(st.objects[&card].zone, Zone::Battlefield, "::error::P6 {obs}");
+    assert_eq!(discarded_count(&events, card), 0, "::error::P6 {obs}");
 }
