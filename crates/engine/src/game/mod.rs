@@ -13,6 +13,8 @@ pub mod blitz;
 #[cfg(test)]
 #[path = "blitz_tests.rs"]
 mod blitz_tests;
+#[cfg(test)]
+mod probe_a3a_tests;
 pub mod boosters;
 pub mod bracket_estimate;
 pub mod card_subset;
