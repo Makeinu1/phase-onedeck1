@@ -24,7 +24,7 @@ jobs:
           cargo test -p phase-engine --lib -- probe_a3a --test-threads=1 > out.txt 2>&1
           code=$?
           grep -E '^test .*probe_a3a' out.txt | sed 's/^/::notice::/'
-          grep -E '^::error::' out.txt
+          grep -E '::error::' out.txt | sed 's/.*::error::/::error::/'
           grep -E '^(error(\[E[0-9]+\])?:|  --> )' out.txt | head -20 | sed 's/^/::warning::/'
           tail -5 out.txt
           exit $code
