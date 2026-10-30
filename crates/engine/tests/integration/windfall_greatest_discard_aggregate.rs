@@ -22,6 +22,7 @@
 //! instead of the greatest single player's 8.
 
 use engine::game::engine::apply;
+use engine::game::game_object::ObjectIncarnationRefExt;
 use engine::game::scenario::{GameRunner, GameScenario, Outcome, P0, P1};
 use engine::types::ability::{
     AbilityDefinition, AbilityKind, Effect, FilterProp, QuantityExpr, QuantityModification,
