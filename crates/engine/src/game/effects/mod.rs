@@ -19891,6 +19891,7 @@ pub(crate) fn drain_pending_discard_batch(
     match cursor {
         DiscardBatchCursor::All { remaining } => {
             for (i, obj_id) in remaining.iter().enumerate() {
+                let paused_card = discard::pin_paused_occurrence(state, *obj_id);
                 if let discard::DiscardOutcome::NeedsReplacementChoice(chooser) =
                     discard::discard_caused_by_effect_with_source_and_frame(
                         state,
@@ -19907,7 +19908,7 @@ pub(crate) fn drain_pending_discard_batch(
                     // CR 400.7: pin the pre-move occurrence, matching the park
                     // the `Random` arm below already receives from
                     // `discard_at_random`.
-                    batch.paused_card = discard::pin_paused_occurrence(state, *obj_id);
+                    batch.paused_card = paused_card;
                     repark_discard_batch(state, batch, events, chooser);
                     return Ok(PendingDiscardBatchOutcome::PausedForReplacement);
                 }

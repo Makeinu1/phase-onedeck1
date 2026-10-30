@@ -665,7 +665,7 @@ fn hand_to_battlefield_with_two_counters(event: ReplacementEvent) -> Replacement
     replacement
 }
 
-fn assert_windfall_draws_after_counter_pause(accept_redirect: bool, prevent_counter: bool) {
+fn assert_windfall_draws_after_counter_pause(accept_redirect: Option<bool>, prevent_counter: bool) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     for player in [P0, P1] {
@@ -677,11 +677,19 @@ fn assert_windfall_draws_after_counter_pause(accept_redirect: bool, prevent_coun
         .with_mana_cost(ManaCost::zero())
         .id();
     let mut runner = scenario.build();
+    let paused_card = engine::types::identifiers::ObjectIncarnationRef::from_object(
+        &runner.state().objects[&card],
+    );
     let object = runner.state_mut().objects.get_mut(&card).unwrap();
     object.card_types.core_types.push(CoreType::Artifact);
     object.replacement_definitions.push(
-        hand_to_battlefield_with_two_counters(ReplacementEvent::Discard)
-            .mode(ReplacementMode::Optional { decline: None }),
+        hand_to_battlefield_with_two_counters(ReplacementEvent::Discard).mode(
+            if accept_redirect.is_some() {
+                ReplacementMode::Optional { decline: None }
+            } else {
+                ReplacementMode::Mandatory
+            },
+        ),
     );
     // Declining the outer redirect preserves the accepted Discard payload;
     // its inner move takes this mandatory redirect before the counter pause.
@@ -701,12 +709,6 @@ fn assert_windfall_draws_after_counter_pause(accept_redirect: bool, prevent_coun
         initial.final_waiting_for(),
         WaitingFor::ReplacementChoice { player: P0, .. }
     ));
-    assert_eq!(runner.state().objects[&card].zone, Zone::Hand);
-    assert!(matches!(
-        runner.state().pending_replacement.as_ref().unwrap().proposed,
-        ProposedEvent::Discard { object_id, source_id: Some(source), .. }
-            if object_id == card && source == windfall
-    ));
     let batch = runner
         .state()
         .pending_discard_batch
@@ -714,44 +716,56 @@ fn assert_windfall_draws_after_counter_pause(accept_redirect: bool, prevent_coun
         .expect("Windfall must own a live discard batch at the first prompt");
     assert_eq!(batch.player, P0);
     assert_eq!(batch.source_id, windfall);
-    assert_eq!(batch.paused_card.object_id, card);
+    // CR 400.7: even a first prompt after delivery belongs to the original hand occurrence.
+    assert_eq!(batch.paused_card, paused_card);
     assert_eq!(batch.discard_frame, None);
-    let paused_card = batch.paused_card;
-    assert_eq!(
-        runner
-            .state()
-            .cards_discarded_this_turn_by_player
-            .get(&P0)
-            .copied()
-            .unwrap_or(0),
-        0
-    );
-    assert!(!batch
-        .preceding_events
-        .iter()
-        .any(|event| matches!(event, GameEvent::Discarded { .. })));
+    let moved_events = if let Some(accept_redirect) = accept_redirect {
+        assert_eq!(runner.state().objects[&card].zone, Zone::Hand);
+        assert!(matches!(
+            runner.state().pending_replacement.as_ref().unwrap().proposed,
+            ProposedEvent::Discard { object_id, source_id: Some(source), .. }
+                if object_id == card && source == windfall
+        ));
+        assert_eq!(
+            runner
+                .state()
+                .cards_discarded_this_turn_by_player
+                .get(&P0)
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        assert!(!batch
+            .preceding_events
+            .iter()
+            .any(|event| matches!(event, GameEvent::Discarded { .. })));
 
-    let moved = apply(
-        runner.state_mut(),
-        P0,
-        GameAction::ChooseReplacement {
-            index: usize::from(!accept_redirect),
-        },
-    )
-    .expect("answer Windfall's original discard replacement");
-    assert!(matches!(
-        moved.waiting_for,
-        WaitingFor::ReplacementChoice { player: P0, .. }
-    ));
+        let moved = apply(
+            runner.state_mut(),
+            P0,
+            GameAction::ChooseReplacement {
+                index: usize::from(!accept_redirect),
+            },
+        )
+        .expect("answer Windfall's original discard replacement");
+        assert!(matches!(
+            moved.waiting_for,
+            WaitingFor::ReplacementChoice { player: P0, .. }
+        ));
+        moved.events
+    } else {
+        // A mandatory redirect has no Discard prompt: the first public pause is AddCounter.
+        initial.events().to_vec()
+    };
     let pending = runner.state().pending_replacement.as_ref().unwrap();
     assert!(matches!(pending.proposed, ProposedEvent::AddCounter { .. }));
+    assert_eq!(pending.proposed.affected_object_id(), Some(card));
     assert_eq!(pending.discard_provenance, None);
     // CR 701.9a + CR 614.6: the redirected hand departure is one completed discard.
     assert_eq!(runner.state().objects[&card].zone, Zone::Battlefield);
     assert_eq!(runner.state().cards_discarded_this_turn_by_player[&P0], 1);
     assert_eq!(
-        moved
-            .events
+        moved_events
             .iter()
             .filter(|event| matches!(event,
             GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source) }
@@ -787,7 +801,7 @@ fn assert_windfall_draws_after_counter_pause(accept_redirect: bool, prevent_coun
     assert!(runner.state().stack.is_empty());
     assert!(runner.state().resolution_stack.is_empty());
     assert!(runner.state().pending_discard_batch.is_none());
-    // CR 608.2i: "discarded this way" reads the completed discard across both pauses.
+    // CR 608.2i: "discarded this way" reads the completed discard across the counter pause.
     for player in [P0, P1] {
         assert_eq!(
             LIBRARY_DEPTH - state_zone_len(&runner, player, Zone::Library),
@@ -814,14 +828,287 @@ fn assert_windfall_draws_after_counter_pause(accept_redirect: bool, prevent_coun
 #[test]
 fn windfall_retains_resumed_zone_change_discard_result_across_counter_pause() {
     for prevent_counter in [false, true] {
-        assert_windfall_draws_after_counter_pause(true, prevent_counter);
+        assert_windfall_draws_after_counter_pause(Some(true), prevent_counter);
     }
 }
 
 #[test]
 fn windfall_retains_accepted_discard_result_across_counter_pause() {
     for prevent_counter in [false, true] {
-        assert_windfall_draws_after_counter_pause(false, prevent_counter);
+        assert_windfall_draws_after_counter_pause(Some(false), prevent_counter);
+    }
+}
+
+#[test]
+fn windfall_retains_immediate_discard_result_when_counter_choice_is_the_first_prompt() {
+    for prevent_counter in [false, true] {
+        assert_windfall_draws_after_counter_pause(None, prevent_counter);
+    }
+}
+
+#[test]
+fn windfall_pins_each_immediate_discard_before_reparking_its_all_cursor() {
+    for prevent_counter in [false, true] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for player in [P0, P1] {
+            seed_library(&mut scenario, player, LIBRARY_DEPTH);
+        }
+        let cards = [
+            scenario.add_card_to_hand(P0, "First counter redirect"),
+            scenario.add_card_to_hand(P0, "Second counter redirect"),
+        ];
+        let windfall = scenario
+            .add_spell_to_hand_from_oracle(P0, "Windfall", false, WINDFALL)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+        let hand_occurrences = cards.map(|card| {
+            engine::types::identifiers::ObjectIncarnationRef::from_object(
+                &runner.state().objects[&card],
+            )
+        });
+        for card in cards {
+            let object = runner.state_mut().objects.get_mut(&card).unwrap();
+            object.card_types.core_types.push(CoreType::Artifact);
+            object
+                .replacement_definitions
+                .push(hand_to_battlefield_with_two_counters(
+                    ReplacementEvent::Discard,
+                ));
+            object.replacement_definitions.push(
+                ReplacementDefinition::new(ReplacementEvent::AddCounter)
+                    .valid_card(TargetFilter::SelfRef)
+                    .mode(ReplacementMode::Optional { decline: None })
+                    .quantity_modification(QuantityModification::Prevent),
+            );
+        }
+
+        let initial = runner.cast(windfall).resolve();
+        assert!(matches!(
+            initial.final_waiting_for(),
+            WaitingFor::ReplacementChoice { player: P0, .. }
+        ));
+        let mut events = initial.events().to_vec();
+        for (index, occurrence) in hand_occurrences.into_iter().enumerate() {
+            let pending = runner.state().pending_replacement.as_ref().unwrap();
+            assert!(matches!(pending.proposed, ProposedEvent::AddCounter { .. }));
+            assert_eq!(
+                pending.proposed.affected_object_id(),
+                Some(occurrence.object_id)
+            );
+            assert_eq!(
+                runner.state().objects[&occurrence.object_id].zone,
+                Zone::Battlefield
+            );
+            let batch = runner.state().pending_discard_batch.as_ref().unwrap();
+            // CR 400.7: each re-park retains that card's hand occurrence, never its battlefield one.
+            assert_eq!(batch.paused_card, occurrence);
+            assert_eq!(batch.player, P0);
+            assert_eq!(batch.source_id, windfall);
+            assert_eq!(
+                runner.state().cards_discarded_this_turn_by_player[&P0],
+                index as u32 + 1
+            );
+            let response = apply(
+                runner.state_mut(),
+                P0,
+                GameAction::ChooseReplacement {
+                    index: usize::from(!prevent_counter),
+                },
+            )
+            .expect("answer each immediate discard's counter prompt");
+            if index == 0 {
+                assert!(matches!(
+                    response.waiting_for,
+                    WaitingFor::ReplacementChoice { player: P0, .. }
+                ));
+            } else {
+                assert!(matches!(response.waiting_for, WaitingFor::Priority { .. }));
+            }
+            events.extend(response.events);
+        }
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+        assert_eq!(runner.state().objects[&windfall].zone, Zone::Graveyard);
+        assert!(runner.state().stack.is_empty());
+        assert!(runner.state().resolution_stack.is_empty());
+        assert!(runner.state().pending_discard_batch.is_none());
+        // CR 608.2i: both actual discards contribute to Windfall's completed clause.
+        for player in [P0, P1] {
+            assert_eq!(
+                LIBRARY_DEPTH - state_zone_len(&runner, player, Zone::Library),
+                2
+            );
+            assert_eq!(state_zone_len(&runner, player, Zone::Hand), 2);
+        }
+        for card in cards {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source) }
+                    if *object_id == card && *source == windfall))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                runner.state().objects[&card]
+                    .counters
+                    .get(&CounterType::Plus1Plus1)
+                    .copied()
+                    .unwrap_or(0),
+                if prevent_counter { 0 } else { 2 }
+            );
+        }
+        assert_eq!(runner.state().cards_discarded_this_turn_by_player[&P0], 2);
+    }
+}
+
+#[test]
+fn targeted_and_selected_discards_pin_the_hand_occurrence_before_counter_delivery() {
+    for targeted in [false, true] {
+        for redirect_event in [ReplacementEvent::Discard, ReplacementEvent::Moved] {
+            for prevent_counter in [false, true] {
+                let mut scenario = GameScenario::new();
+                scenario.at_phase(Phase::PreCombatMain);
+                seed_library(&mut scenario, P0, LIBRARY_DEPTH);
+                let card = scenario.add_card_to_hand(P0, "Selected counter redirect");
+                let bystander = scenario.add_card_to_hand(P0, "Unselected hand card");
+                let effect = if targeted {
+                    Effect::DiscardCard {
+                        count: 1,
+                        target: TargetFilter::Typed(
+                            TypedFilter::card()
+                                .properties(vec![FilterProp::InZone { zone: Zone::Hand }]),
+                        ),
+                    }
+                } else {
+                    Effect::Discard {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                        selection: engine::types::ability::CardSelectionMode::Chosen,
+                        unless_filter: None,
+                        filter: None,
+                    }
+                };
+                // A typed lifecycle fixture, rather than a new card/parser-support claim.
+                let mut ability = AbilityDefinition::new(AbilityKind::Spell, effect);
+                ability.sub_ability = Some(Box::new(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                )));
+                let spell = scenario
+                    .add_spell_to_hand(P0, "Discard continuation fixture", false)
+                    .with_mana_cost(ManaCost::zero())
+                    .with_ability_definition(ability)
+                    .id();
+                let mut runner = scenario.build();
+                let occurrence = engine::types::identifiers::ObjectIncarnationRef::from_object(
+                    &runner.state().objects[&card],
+                );
+                let object = runner.state_mut().objects.get_mut(&card).unwrap();
+                object.card_types.core_types.push(CoreType::Artifact);
+                let mut redirect = hand_to_battlefield_with_two_counters(redirect_event.clone());
+                if redirect_event == ReplacementEvent::Moved {
+                    redirect = redirect.destination_zone(Zone::Graveyard);
+                }
+                object.replacement_definitions.push(redirect);
+                object.replacement_definitions.push(
+                    ReplacementDefinition::new(ReplacementEvent::AddCounter)
+                        .valid_card(TargetFilter::SelfRef)
+                        .mode(ReplacementMode::Optional { decline: None })
+                        .quantity_modification(QuantityModification::Prevent),
+                );
+
+                let initial = if targeted {
+                    runner.cast(spell).target_object(card).resolve()
+                } else {
+                    runner.cast(spell).resolve()
+                };
+                let mut events = initial.events().to_vec();
+                if targeted {
+                    assert!(matches!(
+                        initial.final_waiting_for(),
+                        WaitingFor::ReplacementChoice { player: P0, .. }
+                    ));
+                } else {
+                    assert!(
+                        matches!(initial.final_waiting_for(), WaitingFor::DiscardChoice { player: P0, count: 1, cards, .. } if cards.contains(&card) && cards.contains(&bystander))
+                    );
+                    let selected = apply(
+                        runner.state_mut(),
+                        P0,
+                        GameAction::SelectCards { cards: vec![card] },
+                    )
+                    .expect("select the redirecting card through the public discard choice");
+                    assert!(matches!(
+                        selected.waiting_for,
+                        WaitingFor::ReplacementChoice { player: P0, .. }
+                    ));
+                    events.extend(selected.events);
+                }
+                let pending = runner.state().pending_replacement.as_ref().unwrap();
+                assert!(matches!(pending.proposed, ProposedEvent::AddCounter { .. }));
+                assert_eq!(pending.proposed.affected_object_id(), Some(card));
+                assert_eq!(pending.discard_provenance, None);
+                assert_eq!(runner.state().objects[&card].zone, Zone::Battlefield);
+                let batch = runner.state().pending_discard_batch.as_ref().unwrap();
+                // CR 400.7: the selected/targeted hand authority survives immediate delivery.
+                assert_eq!(batch.paused_card, occurrence);
+                assert_eq!(batch.source_id, spell);
+                assert_eq!(batch.player, P0);
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event,
+                    GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source) }
+                        if *object_id == card && *source == spell))
+                        .count(),
+                    1
+                );
+                assert_eq!(runner.state().cards_discarded_this_turn_by_player[&P0], 1);
+
+                let completed = apply(
+                    runner.state_mut(),
+                    P0,
+                    GameAction::ChooseReplacement {
+                        index: usize::from(!prevent_counter),
+                    },
+                )
+                .expect("settle the selected/targeted discard's counter replacement");
+                assert!(matches!(completed.waiting_for, WaitingFor::Priority { .. }));
+                assert_eq!(runner.state().objects[&spell].zone, Zone::Graveyard);
+                assert!(runner.state().stack.is_empty());
+                assert!(runner.state().resolution_stack.is_empty());
+                assert!(runner.state().pending_discard_batch.is_none());
+                // CR 608.2c: the spell's draw instruction runs after its completed discard.
+                assert_eq!(
+                    LIBRARY_DEPTH - state_zone_len(&runner, P0, Zone::Library),
+                    1
+                );
+                assert_eq!(state_zone_len(&runner, P0, Zone::Hand), 2);
+                assert_eq!(runner.state().objects[&bystander].zone, Zone::Hand);
+                assert_eq!(runner.state().cards_discarded_this_turn_by_player[&P0], 1);
+                assert!(!completed
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, GameEvent::Discarded { .. })));
+                assert_eq!(
+                    runner.state().objects[&card]
+                        .counters
+                        .get(&CounterType::Plus1Plus1)
+                        .copied()
+                        .unwrap_or(0),
+                    if prevent_counter { 0 } else { 2 }
+                );
+            }
+        }
     }
 }
 

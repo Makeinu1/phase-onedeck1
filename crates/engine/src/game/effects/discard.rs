@@ -510,6 +510,7 @@ pub fn resolve(
                 continue;
             }
             let player_id = obj.owner;
+            let paused_card = ObjectIncarnationRef::from_object(obj);
 
             // CR 701.9a + CR 609.3: Tamiyo, Collector of Tales class — an
             // opponent's spell or ability can't force the protected player to
@@ -569,7 +570,7 @@ pub fn resolve(
                                     },
                                     ability.source_id,
                                     EffectKind::from(&ability.effect),
-                                    pin_paused_occurrence(state, obj_id),
+                                    paused_card,
                                     discard_frame,
                                     events,
                                     events_before_self,
@@ -630,7 +631,7 @@ pub fn resolve(
                                             .map(ObjectIncarnationRef::from_object).collect(),
                                     },
                                     ability.source_id, EffectKind::from(&ability.effect),
-                                    pin_paused_occurrence(state, obj_id), discard_frame,
+                                    paused_card, discard_frame,
                                     events, events_before_self,
                                     crate::types::game_state::PendingDiscardBatchCompletion::Standard,
                                 );
@@ -660,7 +661,7 @@ pub fn resolve(
                         },
                         ability.source_id,
                         EffectKind::from(&ability.effect),
-                        pin_paused_occurrence(state, obj_id),
+                        paused_card,
                         discard_frame,
                         events,
                         events_before_self,
@@ -800,6 +801,7 @@ pub fn resolve(
             // Forced discard — no choice needed, discard all eligible cards.
             // When up_to=true, always present the choice (player may discard fewer).
             for (i, obj_id) in hand_cards.iter().enumerate() {
+                let paused_card = pin_paused_occurrence(state, *obj_id);
                 if let DiscardOutcome::NeedsReplacementChoice(player) =
                     discard_caused_by_effect_with_source_and_frame(
                         state,
@@ -827,7 +829,7 @@ pub fn resolve(
                         ability.source_id,
                         EffectKind::from(&ability.effect),
                         // CR 400.7: the pause parks the pre-move occurrence.
-                        pin_paused_occurrence(state, *obj_id),
+                        paused_card,
                         discard_frame,
                         events,
                         events_before_self,
