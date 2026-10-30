@@ -5584,6 +5584,10 @@ pub struct PendingDiscardBatch {
     /// `stamp_resumed_discard_if_unrecorded`, which matches the departing
     /// occurrence carried on the zone-change record rather than the id alone.
     pub paused_card: ObjectIncarnationRef,
+    /// Delivery descendants raised by this exact paused hand occurrence.
+    /// Absence is legacy unknown authority, never permission to resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_subtree: Option<ReplacementSubtreeBoundary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discard_frame: Option<crate::types::identifiers::DiscardFrameId>,
     /// CR 608.2f: the clause and the seats it has not reached, installed by the
@@ -26564,6 +26568,54 @@ fn validate_restored_attack_authority(
     Ok(())
 }
 
+/// Recover only an unperformed original replacement choice, before any delivery child existed.
+fn normalize_pending_discard_delivery_subtree(state: &mut GameState) -> Result<(), String> {
+    if state.viewer_projection.is_some() {
+        return Ok(());
+    }
+    let Some(batch) = state
+        .pending_discard_batch
+        .as_ref()
+        .filter(|batch| batch.delivery_subtree.is_none())
+    else {
+        return Ok(());
+    };
+    let initial = matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. })
+        && !state.replacement_may_cost_paused
+        && state.pending_cost_move_resume.is_none()
+        && state.pending_deferred_life_cost_resume.is_none()
+        && state.pending_discard_for_cost.is_none()
+        && batch.paused_card.is_current(state)
+        && state.objects.get(&batch.paused_card.object_id).is_some_and(|object| object.zone == Zone::Hand && object.owner == batch.player)
+        && !batch.preceding_events.iter().any(|event| matches!(event,
+            GameEvent::ZoneChanged { from: Some(Zone::Hand), record, .. }
+                if record.trigger_source_context().is_some_and(|context| context.identity.reference == batch.paused_card)))
+        && state.pending_replacement.as_ref().is_some_and(|pending| {
+            pending.depth == 0 && pending.proposed.applied_set().is_empty()
+                && !pending.may_cost_paid && pending.may_cost_remaining.is_none()
+                && pending.delivery_boundary.is_none()
+                && match &pending.proposed {
+                    ProposedEvent::Discard { player_id, object_id, source_id, caused_by_effect: true, discard_frame, .. } =>
+                        *player_id == batch.player && *object_id == batch.paused_card.object_id
+                            && *source_id == Some(batch.source_id) && *discard_frame == batch.discard_frame,
+                    ProposedEvent::ZoneChange { object_id, from: Zone::Hand, cause, discard_frame, .. } =>
+                        *object_id == batch.paused_card.object_id && *cause == Some(batch.source_id)
+                            && *discard_frame == batch.discard_frame,
+                    _ => false,
+                }
+        });
+    if !initial {
+        return state.validate_pending_discard_batch_authority();
+    }
+    let boundary = ReplacementSubtreeBoundary::at(&state.resolution_stack);
+    state
+        .pending_discard_batch
+        .as_mut()
+        .expect("checked legacy batch")
+        .delivery_subtree = Some(boundary);
+    Ok(())
+}
+
 impl GameStateDecode {
     pub(crate) fn decode_persisted_resolution_state(
         mut value: serde_json::Value,
@@ -26624,6 +26676,7 @@ impl GameStateDecode {
         validate_restored_zone_change_replay_keys(&state)?;
         normalize_delayed_trigger_allocators(&mut state)?;
         normalize_resolution_cast_offer_allocator(&mut state)?;
+        normalize_pending_discard_delivery_subtree(&mut state)?;
         // The PERSISTED half of the projection gate; `decode` below carries the other.
         // See the pairing comment there for why one site is not enough.
         reject_viewer_projection_as_authority(&state)?;
@@ -26666,6 +26719,7 @@ impl GameStateDecode {
         let mut state = Self::materialize_prepared(value)?;
         normalize_delayed_trigger_allocators(&mut state)?;
         normalize_resolution_cast_offer_allocator(&mut state)?;
+        normalize_pending_discard_delivery_subtree(&mut state)?;
         // NO viewer-projection guard here, deliberately. This is the TRANSPORT decode
         // path as much as a restore path: `ServerMessage::GameStarted { state, .. }`
         // (`server-core/src/protocol.rs`) carries a `filter_state_for_viewer` projection
@@ -28660,6 +28714,71 @@ impl GameState {
         });
     }
 
+    /// Place a known outer tail outside all children raised by its producer.
+    pub fn park_ability_continuation_after_child(
+        &mut self,
+        pending: PendingContinuation,
+        child_stack_start: ChildStackDepth,
+    ) -> Result<(), ResolutionStackError> {
+        match self
+            .resolution_stack
+            .capture_child_boundary()
+            .cmp(&child_stack_start)
+        {
+            std::cmp::Ordering::Less => {
+                panic!("discard producer removed a parent before its tail was parked")
+            }
+            std::cmp::Ordering::Greater => self
+                .insert_ability_continuation_parent_at_child_boundary(pending, child_stack_start),
+            std::cmp::Ordering::Equal => {
+                let offset = self.resolution_stack.len();
+                self.park_ability_continuation(pending);
+                self.rebase_pending_discard_delivery_subtree(offset);
+                Ok(())
+            }
+        }
+    }
+
+    fn rebase_pending_discard_delivery_subtree(&mut self, offset: usize) {
+        if let Some(boundary) = self
+            .pending_discard_batch
+            .as_mut()
+            .and_then(|batch| batch.delivery_subtree.as_mut())
+            .filter(|boundary| offset <= boundary.resolution_depth)
+        {
+            boundary.resolution_depth += 1;
+        }
+    }
+
+    /// Unknown legacy authority blocks outer work until checked load rejects or normalizes it.
+    pub(crate) fn pending_discard_batch_blocks_outer_work(&self) -> bool {
+        self.pending_discard_batch.as_ref().is_some_and(|batch| {
+            batch
+                .delivery_subtree
+                .is_none_or(|boundary| boundary.is_retired(&self.resolution_stack))
+        })
+    }
+
+    pub(crate) fn pending_discard_batch_is_due(&self) -> bool {
+        self.pending_discard_batch.as_ref().is_some_and(|batch| {
+            batch
+                .delivery_subtree
+                .is_some_and(|boundary| boundary.is_retired(&self.resolution_stack))
+        })
+    }
+
+    pub(crate) fn validate_pending_discard_batch_authority(&self) -> Result<(), String> {
+        if self
+            .pending_discard_batch
+            .as_ref()
+            .is_some_and(|batch| batch.delivery_subtree.is_none())
+        {
+            Err("pending discard batch lacks recoverable delivery subtree authority".into())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Insert a continuation immediately below the active child that paused
     /// before its sub-ability was discovered.
     pub fn insert_ability_continuation_parent_of_active(
@@ -28689,13 +28808,15 @@ impl GameState {
         child_stack_start: ChildStackDepth,
     ) -> Result<(), ResolutionStackError> {
         let choose_zone_trigger_context = pending.trigger_context.clone();
-        self.resolution_stack.insert_parent_at_child_boundary(
+        let offset = self.resolution_stack.insert_parent_at_child_boundary(
             super::resolution::ResolutionFrame::AbilityContinuation(AbilityContinuationFrame {
                 pending,
                 choose_zone_trigger_context,
             }),
             child_stack_start,
-        )
+        )?;
+        self.rebase_pending_discard_delivery_subtree(offset);
+        Ok(())
     }
 
     /// Inserts the continuation outside an active general-drain/draw pair so
@@ -28706,13 +28827,16 @@ impl GameState {
         pending: PendingContinuation,
     ) -> Result<(), ResolutionStackError> {
         let choose_zone_trigger_context = pending.trigger_context.clone();
-        self.resolution_stack
+        let offset = self
+            .resolution_stack
             .insert_ability_continuation_outside_active_post_replacement_draw(
                 AbilityContinuationFrame {
                     pending,
                     choose_zone_trigger_context,
                 },
-            )
+            )?;
+        self.rebase_pending_discard_delivery_subtree(offset);
+        Ok(())
     }
 
     /// Reads the continuation immediately outside an active paused
@@ -29239,10 +29363,12 @@ impl GameState {
         pending: PendingRepeatIteration,
         child_stack_start: ChildStackDepth,
     ) -> Result<(), ResolutionStackError> {
-        self.resolution_stack.insert_parent_at_child_boundary(
-            super::resolution::ResolutionFrame::RepeatFor(pending),
-            child_stack_start,
-        )
+        self.resolution_stack
+            .insert_parent_at_child_boundary(
+                super::resolution::ResolutionFrame::RepeatFor(pending),
+                child_stack_start,
+            )
+            .map(|_| ())
     }
 
     /// Returns the repeat-until owner only when it owns the stack top.
@@ -29282,10 +29408,12 @@ impl GameState {
         pending: PendingRepeatUntil,
         child_stack_start: ChildStackDepth,
     ) -> Result<(), ResolutionStackError> {
-        self.resolution_stack.insert_parent_at_child_boundary(
-            super::resolution::ResolutionFrame::RepeatUntil(pending),
-            child_stack_start,
-        )
+        self.resolution_stack
+            .insert_parent_at_child_boundary(
+                super::resolution::ResolutionFrame::RepeatUntil(pending),
+                child_stack_start,
+            )
+            .map(|_| ())
     }
 
     /// Returns the choose-one-of owner only when it owns the stack top.
@@ -29329,10 +29457,12 @@ impl GameState {
         pending: PendingVoteBallotIteration,
         child_stack_start: ChildStackDepth,
     ) -> Result<(), ResolutionStackError> {
-        self.resolution_stack.insert_parent_at_child_boundary(
-            super::resolution::ResolutionFrame::VoteBallot(pending),
-            child_stack_start,
-        )
+        self.resolution_stack
+            .insert_parent_at_child_boundary(
+                super::resolution::ResolutionFrame::VoteBallot(pending),
+                child_stack_start,
+            )
+            .map(|_| ())
     }
 
     /// Returns the per-player zone-choice owner only when it owns the stack top.
@@ -29882,6 +30012,7 @@ impl GameState {
                     super::resolution::ResolutionFrame::SpellResolution(pending),
                     child_stack_start,
                 )
+                .map(|_| ())
                 .expect("parked spell resolution must be inserted below its child stack"),
         }
     }
@@ -30875,10 +31006,14 @@ impl GameState {
         command: &ResolvedFrameTransitionCommand,
     ) -> Result<(), ResolvedFrameTransitionReplayInvariantError> {
         let mut resolution_stack = (*self.resolution_stack).clone();
+        let mut discard_parent_offset = None;
         match &command.transition {
             ResolvedFrameTransition::Push { frame } => resolution_stack.push_inner(frame.clone()),
             ResolvedFrameTransition::InsertParentOfActive { frame } => {
-                resolution_stack.insert_parent_of_active(frame.clone())?;
+                let offset = resolution_stack.insert_parent_of_active(frame.clone())?;
+                if matches!(frame, ResolutionFrame::AbilityContinuation(_)) {
+                    discard_parent_offset = Some(offset);
+                }
             }
             ResolvedFrameTransition::ParkBeneathLivePrompt { frame } => {
                 let _ = resolution_stack.park_beneath_live_prompt(frame.clone());
@@ -30892,6 +31027,9 @@ impl GameState {
         }
         resolution_stack.validate(&self.waiting_for)?;
         *self.resolution_stack = resolution_stack;
+        if let Some(offset) = discard_parent_offset {
+            self.rebase_pending_discard_delivery_subtree(offset);
+        }
         Ok(())
     }
 
@@ -40293,7 +40431,10 @@ mod tests {
     /// A mid-pause discard batch carrying one current-turn `ZoneChanged`.
     /// The event is the point: `preceding_events` is a LIVE event carrier, so
     /// its records must be rebound on load like every other one.
-    fn parked_discard_batch(record: ZoneChangeRecord) -> Box<PendingDiscardBatch> {
+    fn parked_discard_batch(
+        state: &GameState,
+        record: ZoneChangeRecord,
+    ) -> Box<PendingDiscardBatch> {
         Box::new(PendingDiscardBatch {
             player: PlayerId(0),
             cursor: DiscardBatchCursor::All {
@@ -40303,6 +40444,7 @@ mod tests {
             source_id: ObjectId(9_300),
             effect_kind: crate::types::ability::EffectKind::Discard,
             paused_card: ObjectIncarnationRef::of(ObjectId(9_303), 0),
+            delivery_subtree: Some(ReplacementSubtreeBoundary::at(&state.resolution_stack)),
             discard_frame: None,
             fan_out: None,
             preceding_events: vec![persisted_zone_change_event(record)],
@@ -40396,7 +40538,7 @@ mod tests {
         state.turn_number = 19;
         let record = persisted_zone_change_record(ObjectId(9_101), 19, 0);
         state.zone_changes_this_turn.push_back(record.clone());
-        state.pending_discard_batch = Some(parked_discard_batch(record));
+        state.pending_discard_batch = Some(parked_discard_batch(&state, record));
 
         let bare = {
             let mut bare = state.clone();
@@ -40487,7 +40629,7 @@ mod tests {
         state.turn_number = 19;
         let record = persisted_zone_change_record(ObjectId(9_101), 19, 0);
         state.zone_changes_this_turn.push_back(record.clone());
-        state.pending_discard_batch = Some(parked_discard_batch(record));
+        state.pending_discard_batch = Some(parked_discard_batch(&state, record));
         // The prompt a parked batch is waiting on. Without it the save is not
         // mid-pause and this test measures nothing. CR 616.1 is accurate for THIS
         // fixture, which builds a two-candidate ordering prompt; the production
@@ -55629,6 +55771,198 @@ mod replacement_subtree_boundary_tests {
     use crate::types::identifiers::ObjectId;
     use crate::types::player::PlayerId;
     use crate::types::resolution::AbilityContinuationFrame;
+
+    fn discard_batch_at(state: &GameState) -> Box<super::PendingDiscardBatch> {
+        Box::new(super::PendingDiscardBatch {
+            player: PlayerId(0),
+            cursor: super::DiscardBatchCursor::All { remaining: vec![] },
+            completion: super::PendingDiscardBatchCompletion::Standard,
+            source_id: ObjectId(70),
+            effect_kind: crate::types::ability::EffectKind::Discard,
+            paused_card: crate::types::identifiers::ObjectIncarnationRef::of(ObjectId(71), 0),
+            delivery_subtree: Some(ReplacementSubtreeBoundary::at(&state.resolution_stack)),
+            discard_frame: None,
+            fan_out: None,
+            preceding_events: vec![],
+        })
+    }
+
+    fn same_source_pending(state: &GameState) -> PendingContinuation {
+        let pending = PendingContinuation::new(
+            Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                vec![],
+                ObjectId(70),
+                PlayerId(0),
+            )),
+            state,
+        );
+        assert!(pending.return_result_occurrence.is_none());
+        pending
+    }
+
+    #[test]
+    fn discard_boundary_rebases_real_outer_insertions_but_not_inner_or_same_depth_work() {
+        let mut state = GameState::new_two_player(42);
+        let producer = state.resolution_stack.capture_child_boundary();
+        state.pending_discard_batch = Some(discard_batch_at(&state));
+        state
+            .park_ability_continuation_after_child(same_source_pending(&state), producer)
+            .unwrap();
+        assert_eq!(
+            state
+                .pending_discard_batch
+                .as_ref()
+                .unwrap()
+                .delivery_subtree
+                .unwrap()
+                .resolution_depth,
+            1
+        );
+        assert!(
+            state.pending_discard_batch_is_due(),
+            "no-child outer append adjusts once"
+        );
+        state.park_ability_continuation(same_source_pending(&state));
+        let child_boundary = state.resolution_stack.capture_child_boundary();
+        state.park_ability_continuation(same_source_pending(&state));
+        assert!(
+            !state.pending_discard_batch_is_due(),
+            "same source and None result do not identify the outer reader"
+        );
+        let before = state.pending_discard_batch.clone();
+        state
+            .insert_ability_continuation_parent_at_child_boundary(
+                same_source_pending(&state),
+                child_boundary,
+            )
+            .unwrap();
+        assert_eq!(
+            state.pending_discard_batch, before,
+            "an actual insertion inside the subtree must not shift its prefix"
+        );
+        let top = state.take_active_ability_continuation().unwrap().unwrap();
+        state.push_ability_continuation(top.clone());
+        state.replace_active_ability_continuation(top).unwrap();
+        assert_eq!(
+            state.pending_discard_batch, before,
+            "take/push and replacement keep depth"
+        );
+        let invalid = state.resolution_stack.capture_child_boundary();
+        let stack = state.resolution_stack.clone();
+        assert!(state
+            .insert_ability_continuation_parent_at_child_boundary(
+                same_source_pending(&state),
+                invalid
+            )
+            .is_err());
+        assert_eq!(state.resolution_stack, stack);
+        assert_eq!(state.pending_discard_batch, before);
+        state
+            .park_ability_continuation_after_child(same_source_pending(&state), producer)
+            .unwrap();
+        assert_eq!(
+            state
+                .pending_discard_batch
+                .as_ref()
+                .unwrap()
+                .delivery_subtree
+                .unwrap()
+                .resolution_depth,
+            2
+        );
+        // The new outer continuation is below the entire child stack, not merely the last child.
+        assert_eq!(state.resolution_stack.len(), 5);
+        for _ in 0..3 {
+            state.take_active_ability_continuation().unwrap().unwrap();
+        }
+        assert!(state.pending_discard_batch_is_due());
+    }
+
+    #[test]
+    fn discard_parent_journal_replay_rebases_once_and_failed_validation_is_atomic() {
+        use crate::types::resolution::{OptionalEffectFrame, ResolutionFrame};
+        use crate::types::resolved_commands::{ResolvedFrameTransition, ResolvedRulesCommand};
+        let mut state = GameState::new_two_player(42);
+        state.park_ability_continuation(same_source_pending(&state));
+        state.pending_discard_batch = Some(discard_batch_at(&state));
+        state.park_ability_continuation(same_source_pending(&state));
+        let mut replay = state.clone();
+        let before = state.resolved_rules_journal.entries().len();
+        state
+            .insert_ability_continuation_parent_of_active(same_source_pending(&state))
+            .unwrap();
+        assert_eq!(state.resolved_rules_journal.entries().len(), before + 1);
+        let entry = state.resolved_rules_journal.entries().back().unwrap();
+        let Some(ResolvedRulesCommand::FrameTransition(command)) = entry.command.as_ref() else {
+            panic!("one real frame transition must be journaled")
+        };
+        replay.apply_resolved_frame_transition(command).unwrap();
+        assert_eq!(replay.resolution_stack, state.resolution_stack);
+        assert_eq!(replay.pending_discard_batch, state.pending_discard_batch);
+        assert_eq!(
+            state
+                .pending_discard_batch
+                .as_ref()
+                .unwrap()
+                .delivery_subtree
+                .unwrap()
+                .resolution_depth,
+            2
+        );
+        let prior_stack = state.resolution_stack.clone();
+        let prior_batch = state.pending_discard_batch.clone();
+        let prior_journal = state.resolved_rules_journal.clone();
+        // A direct-choice owner under an unrelated Priority fails candidate validation.
+        assert!(state
+            .resolve_and_apply_frame_transition(ResolvedFrameTransition::InsertParentOfActive {
+                frame: ResolutionFrame::OptionalEffect(OptionalEffectFrame {
+                    ability: same_source_pending(&state).chain,
+                    trigger_event: None,
+                    trigger_events: vec![],
+                    trigger_match_count: None,
+                    return_result_occurrence: None,
+                }),
+            })
+            .is_err());
+        assert_eq!(state.resolution_stack, prior_stack);
+        assert_eq!(state.pending_discard_batch, prior_batch);
+        assert_eq!(state.resolved_rules_journal, prior_journal);
+    }
+
+    #[test]
+    fn discard_due_waits_for_its_identified_enclosing_drain_after_unrelated_top_retires() {
+        let mut state = state_with_paused_enclosing_frame();
+        state.pending_discard_batch = Some(discard_batch_at(&state));
+        assert!(state.pending_discard_batch_is_due());
+        let enclosing = state
+            .pending_discard_batch
+            .as_ref()
+            .unwrap()
+            .delivery_subtree
+            .unwrap()
+            .enclosing;
+        state.install_post_replacement_drain(
+            ready_drain("same-frame child"),
+            ResidentDrainPolicy::Replace,
+        );
+        let (_, child) = state.begin_post_replacement_dispatch().unwrap();
+        state.park_ability_continuation(same_source_pending(&state));
+        state.take_active_ability_continuation().unwrap().unwrap();
+        assert_eq!(
+            state
+                .pending_discard_batch
+                .as_ref()
+                .unwrap()
+                .delivery_subtree
+                .unwrap()
+                .enclosing,
+            enclosing
+        );
+        assert!(!state.pending_discard_batch_is_due());
+        assert!(state.finish_post_replacement_dispatch(child).is_some());
+        assert!(state.pending_discard_batch_is_due());
+    }
 
     fn ready_drain(name: &str) -> PostReplacementDrain {
         PostReplacementDrain::ready(PostReplacementContinuation::Template(Box::new(

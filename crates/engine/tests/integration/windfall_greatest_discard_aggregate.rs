@@ -667,6 +667,675 @@ fn hand_to_battlefield_with_two_counters(event: ReplacementEvent) -> Replacement
     replacement
 }
 
+fn install_sacrifice_delivery(
+    state: &mut engine::types::game_state::GameState,
+    card: ObjectId,
+    optional: bool,
+) {
+    let mut redirect = hand_to_battlefield_with_two_counters(ReplacementEvent::Moved)
+        .destination_zone(Zone::Graveyard);
+    if let Effect::ChangeZone {
+        enter_with_counters,
+        ..
+    } = redirect.execute.as_mut().unwrap().effect.as_mut()
+    {
+        enter_with_counters.clear();
+    }
+    if optional {
+        redirect.mode = ReplacementMode::Optional { decline: None };
+    }
+    let object = state.objects.get_mut(&card).unwrap();
+    object.card_types.core_types.push(CoreType::Creature);
+    object.power = Some(2);
+    object.toughness = Some(2);
+    object.replacement_definitions.push(redirect);
+    object.replacement_definitions.push(
+        ReplacementDefinition::new(ReplacementEvent::Moved)
+            .valid_card(TargetFilter::SelfRef)
+            .destination_zone(Zone::Battlefield)
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Sacrifice {
+                    target: TargetFilter::Typed(
+                        TypedFilter::creature()
+                            .controller(engine::types::ability::ControllerRef::You),
+                    ),
+                    count: QuantityExpr::up_to(QuantityExpr::Fixed { value: 1 }),
+                    min_count: 0,
+                },
+            )),
+    );
+}
+
+#[test]
+fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
+    use engine::types::ability::{CardSelectionMode, DelayedTriggerCondition};
+    for mode in [
+        None,
+        Some(CardSelectionMode::Chosen),
+        Some(CardSelectionMode::Random),
+    ] {
+        for delayed in [false, true] {
+            for optional in [false, true] {
+                let db = crate::support::shared_card_db()
+                    .expect("required committed discard observer fixture");
+                let mut scenario = GameScenario::new();
+                scenario.at_phase(Phase::PreCombatMain);
+                for player in [P0, P1] {
+                    seed_library(&mut scenario, player, LIBRARY_DEPTH);
+                }
+                let cards = [
+                    scenario.add_card_to_hand(P0, "First delivery"),
+                    scenario.add_card_to_hand(P0, "Second delivery"),
+                ];
+                let other = if mode.is_none() {
+                    scenario.add_card_to_hand(P1, "Other seat discard")
+                } else {
+                    scenario.add_card_to_hand(P0, "Unselected original")
+                };
+                let fodder = [
+                    scenario
+                        .add_creature(P0, "First eligible fodder", 1, 1)
+                        .id(),
+                    scenario
+                        .add_creature(P0, "Second eligible fodder", 1, 1)
+                        .id(),
+                ];
+                let observer = scenario.add_real_card(P1, "Geth's Grimoire", Zone::Battlefield, db);
+                let spell = if let Some(selection) = mode.clone() {
+                    let ability = AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::Discard {
+                            count: QuantityExpr::Fixed { value: 2 },
+                            target: TargetFilter::Controller,
+                            selection,
+                            unless_filter: None,
+                            filter: None,
+                        },
+                    )
+                    .sub_ability(AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::Draw {
+                            count: QuantityExpr::Fixed { value: 1 },
+                            target: TargetFilter::Controller,
+                        },
+                    ));
+                    scenario
+                        .add_spell_to_hand(P0, "Typed discard then draw", false)
+                        .with_mana_cost(ManaCost::zero())
+                        .with_ability_definition(ability)
+                        .id()
+                } else {
+                    scenario
+                        .add_spell_to_hand_from_oracle(P0, "Windfall", false, WINDFALL)
+                        .with_mana_cost(ManaCost::zero())
+                        .id()
+                };
+                let mut runner = scenario.build();
+                // Give all Random candidates the same delivery shape; its seed still chooses distinct original occurrences.
+                let candidates = if mode == Some(CardSelectionMode::Random) {
+                    vec![cards[0], cards[1], other]
+                } else {
+                    cards.to_vec()
+                };
+                let original = candidates
+                    .iter()
+                    .map(|id| {
+                        (
+                            *id,
+                            engine::types::identifiers::ObjectIncarnationRef::from_object(
+                                &runner.state().objects[id],
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for card in candidates {
+                    install_sacrifice_delivery(runner.state_mut(), card, optional);
+                }
+                if delayed {
+                    let mut trigger = runner.state().objects[&observer]
+                        .trigger_definitions
+                        .iter()
+                        .next()
+                        .expect("real observer parsed")
+                        .clone();
+                    trigger.execute = None;
+                    runner
+                        .state_mut()
+                        .objects
+                        .get_mut(&observer)
+                        .unwrap()
+                        .trigger_definitions
+                        .clear();
+                    engine::game::triggers::install_delayed_trigger(
+                        runner.state_mut(),
+                        engine::types::game_state::DelayedTrigger::new(
+                            DelayedTriggerCondition::WhenNextEvent {
+                                trigger: Box::new(trigger),
+                                or_trigger: None,
+                                lifetime: Default::default(),
+                            },
+                            Box::new(ResolvedAbility::new(
+                                Effect::Draw {
+                                    count: QuantityExpr::Fixed { value: 1 },
+                                    target: TargetFilter::Controller,
+                                },
+                                vec![],
+                                observer,
+                                P1,
+                            )),
+                            P1,
+                            observer,
+                            true,
+                        ),
+                        &mut Vec::new(),
+                    );
+                }
+                let initial = runner.cast(spell).resolve();
+                let mut events = initial.events().to_vec();
+                if mode == Some(CardSelectionMode::Chosen) {
+                    assert!(matches!(
+                        runner.state().waiting_for,
+                        WaitingFor::DiscardChoice {
+                            player: P0,
+                            count: 2,
+                            ..
+                        }
+                    ));
+                    events.extend(
+                        apply(
+                            runner.state_mut(),
+                            P0,
+                            GameAction::SelectCards {
+                                cards: cards.to_vec(),
+                            },
+                        )
+                        .unwrap()
+                        .events,
+                    );
+                }
+                let mut delivered = Vec::new();
+                for index in 0..2 {
+                    if optional {
+                        assert!(matches!(
+                            runner.state().waiting_for,
+                            WaitingFor::ReplacementChoice { player: P0, .. }
+                        ));
+                        let batch = runner
+                            .state()
+                            .pending_discard_batch
+                            .as_ref()
+                            .expect("original order choice owns batch");
+                        assert_eq!(
+                            runner.state().objects[&batch.paused_card.object_id].zone,
+                            Zone::Hand
+                        );
+                        assert!(batch.delivery_subtree.is_some());
+                        events.extend(
+                            apply(
+                                runner.state_mut(),
+                                P0,
+                                GameAction::ChooseReplacement { index: 0 },
+                            )
+                            .unwrap()
+                            .events,
+                        );
+                    }
+                    let WaitingFor::EffectZoneChoice {
+                        player: P0,
+                        ref cards,
+                        ..
+                    } = runner.state().waiting_for
+                    else {
+                        panic!(
+                            "delivery {index} lost actual wait: {:?}",
+                            runner.state().waiting_for
+                        )
+                    };
+                    assert!(cards.contains(&fodder[index]));
+                    let batch = runner
+                        .state()
+                        .pending_discard_batch
+                        .as_ref()
+                        .expect("non-order delivery retains cursor");
+                    let paused = batch.paused_card;
+                    assert!(original.iter().any(|(_, pin)| *pin == paused));
+                    assert!(!delivered.contains(&paused.object_id));
+                    match &batch.cursor {
+                        engine::types::game_state::DiscardBatchCursor::All { remaining } => {
+                            assert_eq!(remaining.len(), 1 - index)
+                        }
+                        engine::types::game_state::DiscardBatchCursor::Ordered { remaining } => {
+                            assert_eq!(remaining.len(), 1 - index)
+                        }
+                        engine::types::game_state::DiscardBatchCursor::Random {
+                            pool,
+                            remaining,
+                        } => {
+                            assert_eq!(*remaining, 1 - index);
+                            assert!(!pool.contains(&paused.object_id));
+                            assert!(delivered.iter().all(|id| !pool.contains(id)));
+                        }
+                    }
+                    delivered.push(paused.object_id);
+                    assert!(!cards.contains(&paused.object_id));
+                    assert!(batch.delivery_subtree.is_some());
+                    assert_eq!(
+                        runner.state().players[0].library.len(),
+                        LIBRARY_DEPTH,
+                        "draw waits for whole cursor"
+                    );
+                    assert_eq!(runner.state().players[1].library.len(), LIBRARY_DEPTH);
+                    assert_eq!(
+                        runner.state().objects[&paused.object_id].zone,
+                        Zone::Battlefield
+                    );
+                    // Current non-order snapshots retain the exact subtree in all decode ingresses.
+                    for ingress in 0..3 {
+                        let restored = if ingress == 0 {
+                            serde_json::from_value::<engine::types::game_state::GameState>(
+                                serde_json::to_value(runner.state()).unwrap(),
+                            )
+                            .unwrap()
+                        } else {
+                            let saved = if ingress == 1 {
+                                PersistedGameState::Raw(Box::new(runner.state().clone()))
+                            } else {
+                                PersistedGameState::capture(runner.state().clone())
+                            };
+                            serde_json::from_value::<PersistedGameState>(
+                                serde_json::to_value(saved).unwrap(),
+                            )
+                            .unwrap()
+                            .into_game_state()
+                            .unwrap()
+                        };
+                        assert_eq!(
+                            restored
+                                .pending_discard_batch
+                                .as_ref()
+                                .unwrap()
+                                .delivery_subtree,
+                            batch.delivery_subtree
+                        );
+                    }
+                    events.extend(
+                        apply(
+                            runner.state_mut(),
+                            P0,
+                            GameAction::SelectCards {
+                                cards: if index == 0 {
+                                    vec![fodder[index]]
+                                } else {
+                                    vec![]
+                                },
+                            },
+                        )
+                        .unwrap()
+                        .events,
+                    );
+                }
+                // CR 608.2c + CR 608.2i: the complete (2,1) instruction supplies Windfall's draw2.
+                assert!(matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::Priority { .. }
+                ));
+                assert!(runner.state().pending_discard_batch.is_none());
+                assert!(runner.state().resolution_stack.is_empty());
+                assert_eq!(runner.state().objects[&spell].zone, Zone::Graveyard);
+                assert_eq!(runner.state().cards_discarded_this_turn_by_player[&P0], 2);
+                assert_eq!(
+                    runner.state().players[0].library.len(),
+                    LIBRARY_DEPTH - if mode.is_none() { 2 } else { 1 }
+                );
+                if mode.is_none() {
+                    assert_eq!(runner.state().cards_discarded_this_turn_by_player[&P1], 1);
+                    assert_eq!(runner.state().objects[&other].zone, Zone::Graveyard);
+                    assert_eq!(runner.state().players[1].library.len(), LIBRARY_DEPTH - 2);
+                } else if mode == Some(CardSelectionMode::Chosen) {
+                    assert_eq!(runner.state().objects[&other].zone, Zone::Hand);
+                }
+                // CR 701.9a + CR 603.2c: each selected original has one source-bound discard and observer.
+                for id in delivered {
+                    assert_eq!(events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source) } if *object_id == id && *source == spell)).count(), 1);
+                }
+                assert_eq!(
+                    runner
+                        .state()
+                        .stack
+                        .iter()
+                        .filter(|entry| entry.source_id == observer && entry.controller == P1)
+                        .count(),
+                    if delayed { 1 } else { 2 }
+                );
+                assert_eq!(runner.state().objects[&fodder[0]].zone, Zone::Graveyard);
+                assert_eq!(runner.state().objects[&fodder[1]].zone, Zone::Battlefield);
+            }
+        }
+    }
+}
+
+#[test]
+fn initial_legacy_library_batch_restores_and_finishes_the_original_public_choices() {
+    use engine::types::game_state::GameState;
+    let db = crate::support::shared_card_db().expect("required Library fixture");
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    for player in [P0, P1] {
+        seed_library(&mut scenario, player, LIBRARY_DEPTH);
+    }
+    seed_hand(&mut scenario, P0, 2);
+    seed_hand(&mut scenario, P1, 1);
+    scenario.add_real_card(P0, "Library of Leng", Zone::Battlefield, db);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Windfall", false, WINDFALL)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(spell).resolve();
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { player: P0, .. }
+    ));
+    assert!(matches!(
+        runner
+            .state()
+            .pending_replacement
+            .as_ref()
+            .unwrap()
+            .proposed,
+        ProposedEvent::Discard {
+            caused_by_effect: true,
+            ..
+        }
+    ));
+    let expected = runner
+        .state()
+        .pending_discard_batch
+        .as_ref()
+        .unwrap()
+        .delivery_subtree
+        .unwrap();
+    for ingress in 0..3 {
+        let mut encoded = if ingress == 0 {
+            serde_json::to_value(runner.state()).unwrap()
+        } else if ingress == 1 {
+            serde_json::to_value(PersistedGameState::Raw(Box::new(runner.state().clone()))).unwrap()
+        } else {
+            serde_json::to_value(PersistedGameState::capture(runner.state().clone())).unwrap()
+        };
+        let payload = if ingress == 2 {
+            &mut encoded["state"]
+        } else {
+            &mut encoded
+        };
+        payload["pending_discard_batch"]
+            .as_object_mut()
+            .unwrap()
+            .remove("delivery_subtree");
+        let state: GameState = if ingress == 0 {
+            serde_json::from_value(encoded).unwrap()
+        } else {
+            serde_json::from_value::<PersistedGameState>(encoded)
+                .unwrap()
+                .into_game_state()
+                .unwrap()
+        };
+        assert_eq!(
+            state
+                .pending_discard_batch
+                .as_ref()
+                .unwrap()
+                .delivery_subtree,
+            Some(expected)
+        );
+        let mut restored = GameRunner::from_state(state);
+        assert_eq!(answer_every_replacement_choice(&mut restored, "Decline"), 2);
+        assert!(matches!(
+            restored.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+        assert!(restored.state().pending_discard_batch.is_none());
+        assert!(restored.state().resolution_stack.is_empty());
+        // CR 608.2c + CR 608.2i: restored original choices retain the completed (2,1) instruction.
+        assert_eq!(restored.state().cards_discarded_this_turn_by_player[&P0], 2);
+        assert_eq!(restored.state().cards_discarded_this_turn_by_player[&P1], 1);
+        assert_eq!(restored.state().players[0].library.len(), LIBRARY_DEPTH - 2);
+        assert_eq!(restored.state().players[1].library.len(), LIBRARY_DEPTH - 2);
+    }
+}
+
+#[test]
+fn discard_delivery_restore_normalizes_only_initial_legacy_authority_and_admission_is_atomic() {
+    use engine::game::engine::apply_for_simulation;
+    use engine::types::game_state::GameState;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    for player in [P0, P1] {
+        seed_library(&mut scenario, player, LIBRARY_DEPTH);
+    }
+    let cards = [
+        scenario.add_card_to_hand(P0, "First legacy original"),
+        scenario.add_card_to_hand(P0, "Second legacy original"),
+    ];
+    let other = scenario.add_card_to_hand(P1, "Other legacy seat");
+    let fodder = scenario.add_creature(P0, "Legacy delivery fuel", 1, 1).id();
+    let windfall = scenario
+        .add_spell_to_hand_from_oracle(P0, "Windfall", false, WINDFALL)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    for card in cards {
+        install_sacrifice_delivery(runner.state_mut(), card, true);
+    }
+    runner.cast(windfall).resolve();
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { player: P0, .. }
+    ));
+    let initial = runner.state().clone();
+    let prefix = initial.resolution_stack.len();
+    assert_eq!(initial.objects[&cards[0]].zone, Zone::Hand);
+    assert!(initial
+        .pending_replacement
+        .as_ref()
+        .unwrap()
+        .proposed
+        .applied_set()
+        .is_empty());
+    for ingress in 0..3 {
+        let encoded = |state: &GameState| {
+            if ingress == 0 {
+                serde_json::to_value(state).unwrap()
+            } else if ingress == 1 {
+                serde_json::to_value(PersistedGameState::Raw(Box::new(state.clone()))).unwrap()
+            } else {
+                serde_json::to_value(PersistedGameState::capture(state.clone())).unwrap()
+            }
+        };
+        let decode = |value: serde_json::Value| -> Result<GameState, String> {
+            if ingress == 0 {
+                serde_json::from_value(value).map_err(|error| error.to_string())
+            } else {
+                serde_json::from_value::<PersistedGameState>(value)
+                    .map_err(|error| error.to_string())?
+                    .into_game_state()
+                    .map_err(|error| error.to_string())
+            }
+        };
+        let mut old = encoded(&initial);
+        let payload = if ingress == 2 {
+            &mut old["state"]
+        } else {
+            &mut old
+        };
+        payload["pending_discard_batch"]
+            .as_object_mut()
+            .unwrap()
+            .remove("delivery_subtree");
+        let mut restored = decode(old).expect("exact pre-subtree old choice is recoverable");
+        let boundary = restored
+            .pending_discard_batch
+            .as_ref()
+            .unwrap()
+            .delivery_subtree
+            .unwrap();
+        assert_eq!(boundary.resolution_depth, prefix);
+        assert_eq!(
+            boundary.enclosing,
+            initial
+                .pending_discard_batch
+                .as_ref()
+                .unwrap()
+                .delivery_subtree
+                .unwrap()
+                .enclosing
+        );
+        apply(
+            &mut restored,
+            P0,
+            GameAction::ChooseReplacement { index: 0 },
+        )
+        .unwrap();
+        assert!(
+            matches!(restored.waiting_for, WaitingFor::EffectZoneChoice { player: P0, ref cards, .. } if cards.contains(&fodder))
+        );
+        // A post-move historical snapshot cannot reconstruct its original subtree.
+        let mut ambiguous = encoded(&restored);
+        let payload = if ingress == 2 {
+            &mut ambiguous["state"]
+        } else {
+            &mut ambiguous
+        };
+        payload["pending_discard_batch"]
+            .as_object_mut()
+            .unwrap()
+            .remove("delivery_subtree");
+        assert!(decode(ambiguous)
+            .unwrap_err()
+            .contains("pending discard batch lacks recoverable delivery subtree authority"));
+        // Current populated non-order snapshots publicly finish from every ingress.
+        let mut current = decode(encoded(&restored)).unwrap();
+        apply(&mut current, P0, GameAction::SelectCards { cards: vec![] }).unwrap();
+        assert!(matches!(
+            current.waiting_for,
+            WaitingFor::ReplacementChoice { player: P0, .. }
+        ));
+        apply(&mut current, P0, GameAction::ChooseReplacement { index: 0 }).unwrap();
+        assert!(matches!(
+            current.waiting_for,
+            WaitingFor::EffectZoneChoice { player: P0, .. }
+        ));
+        apply(
+            &mut current,
+            P0,
+            GameAction::SelectCards {
+                cards: vec![fodder],
+            },
+        )
+        .unwrap();
+        assert!(matches!(current.waiting_for, WaitingFor::Priority { .. }));
+        assert!(current.pending_discard_batch.is_none());
+        assert!(current.resolution_stack.is_empty());
+        assert_eq!(current.cards_discarded_this_turn_by_player[&P0], 2);
+        assert_eq!(current.cards_discarded_this_turn_by_player[&P1], 1);
+        assert_eq!(current.players[0].library.len(), LIBRARY_DEPTH - 2);
+        assert_eq!(current.players[1].library.len(), LIBRARY_DEPTH - 2);
+        assert_eq!(current.objects[&other].zone, Zone::Graveyard);
+        for malformed in 0..7 {
+            let mut bad = initial.clone();
+            bad.pending_discard_batch.as_mut().unwrap().delivery_subtree = None;
+            match malformed {
+                0 => bad.pending_discard_batch.as_mut().unwrap().player = P1,
+                1 => bad.pending_discard_batch.as_mut().unwrap().source_id = fodder,
+                2 => {
+                    bad.pending_discard_batch
+                        .as_mut()
+                        .unwrap()
+                        .paused_card
+                        .incarnation += 1
+                }
+                3 => {
+                    bad.pending_discard_batch.as_mut().unwrap().discard_frame =
+                        Some(engine::types::identifiers::DiscardFrameId(900))
+                }
+                4 => bad.pending_replacement.as_mut().unwrap().depth = 1,
+                5 => bad.pending_replacement.as_mut().unwrap().may_cost_paid = true,
+                6 => bad.replacement_may_cost_paused = true,
+                _ => unreachable!(),
+            }
+            assert!(decode(encoded(&bad))
+                .unwrap_err()
+                .contains("pending discard batch lacks recoverable delivery subtree authority"));
+        }
+    }
+    for simulation in [false, true] {
+        let mut missing = initial.clone();
+        missing
+            .pending_discard_batch
+            .as_mut()
+            .unwrap()
+            .delivery_subtree = None;
+        let before = serde_json::to_value(&missing).unwrap();
+        let journal = missing.resolved_rules_journal.clone();
+        let action = GameAction::ChooseReplacement { index: 0 };
+        let result = if simulation {
+            apply_for_simulation(&mut missing, P0, action)
+        } else {
+            apply(&mut missing, P0, action)
+        };
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("pending discard batch lacks recoverable delivery subtree authority"));
+        assert_eq!(serde_json::to_value(&missing).unwrap(), before);
+        assert_eq!(missing.resolved_rules_journal, journal);
+        // The zero-count debug shortcut shares the same admission gate.
+        missing.debug_mode = true;
+        let before = serde_json::to_value(&missing).unwrap();
+        let zero = GameAction::Debug(engine::types::actions::DebugAction::CreateCard {
+            card_name: "unused zero-count fixture".into(),
+            owner: P0,
+            zone: Zone::Hand,
+            count: 0,
+            attach_to: None,
+            run_etb: false,
+            nonlegendary: false,
+            creation_kind: Default::default(),
+        });
+        let result = if simulation {
+            apply_for_simulation(&mut missing, P0, zero.clone())
+        } else {
+            apply(&mut missing, P0, zero.clone())
+        };
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("pending discard batch lacks recoverable delivery subtree authority"));
+        assert_eq!(serde_json::to_value(&missing).unwrap(), before);
+        let mut populated = initial.clone();
+        populated.debug_mode = true;
+        let before = serde_json::to_value(&populated).unwrap();
+        let result = if simulation {
+            apply_for_simulation(&mut populated, P0, zero)
+        } else {
+            apply(&mut populated, P0, zero)
+        };
+        assert!(result.unwrap().events.is_empty());
+        assert_eq!(serde_json::to_value(&populated).unwrap(), before);
+        let mut valid = initial.clone();
+        let positive = if simulation {
+            apply_for_simulation(&mut valid, P0, GameAction::ChooseReplacement { index: 0 })
+        } else {
+            apply(&mut valid, P0, GameAction::ChooseReplacement { index: 0 })
+        };
+        assert!(matches!(
+            positive.unwrap().waiting_for,
+            WaitingFor::EffectZoneChoice { player: P0, .. }
+        ));
+    }
+}
+
 fn assert_windfall_draws_after_counter_pause(accept_redirect: Option<bool>, prevent_counter: bool) {
     let db = crate::support::shared_card_db()
         .expect("discard observer regression requires the committed card fixture");

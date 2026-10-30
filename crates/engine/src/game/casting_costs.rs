@@ -2556,7 +2556,7 @@ pub(crate) fn handle_discard_for_cost(
     for (index, &card_id) in chosen.iter().enumerate() {
         match super::effects::discard::discard_as_cost(state, card_id, player, events) {
             super::effects::discard::DiscardOutcome::Complete => {}
-            super::effects::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) => {
+            super::effects::discard::DiscardOutcome::NeedsChoice(waiting_for) => {
                 state.pending_discard_for_cost =
                     Some(Box::new(PendingDiscardForCostResume::Chosen {
                         player,
@@ -2564,7 +2564,7 @@ pub(crate) fn handle_discard_for_cost(
                         chosen: chosen.to_vec(),
                         paused_at_index: index,
                     }));
-                super::casting::pause_cost_payment_for_replacement_choice(state, choice_player);
+                state.waiting_for = *waiting_for;
                 // CR 603.2 + CR 603.3b: Earlier cards in a count>1 discard cost may
                 // already have emitted graveyard `ZoneChanged` events before this
                 // replacement pause. Park them now — the post-action pipeline will
@@ -2601,7 +2601,7 @@ pub(crate) fn handle_discard_for_cost(
     // membership instead of being re-pinned into a live hidden-zone referent.
     // Mirrors `finish_cost_object_moves` and `handle_sacrifice_for_cost`, which
     // already settle on their move seams.
-    // The `NeedsReplacementChoice` arm above returns early and its resumed
+    // The `NeedsChoice` arm above returns early and its resumed
     // suffix settles in `resume_interrupted_cost_payment`.
     //
     // SCOPED to `chosen` — exactly the cards this discard component moved. A
@@ -2784,7 +2784,6 @@ fn pay_deferred_random_discard_cost(
             remaining_eligible,
             remaining_count,
             paused_pick,
-            chooser,
             ..
         } => {
             commit_random_discard_cost_picks(state, pending, &completed_picks);
@@ -2795,7 +2794,6 @@ fn pay_deferred_random_discard_cost(
                 remaining_count,
                 paused_pick,
             }));
-            super::casting::pause_cost_payment_for_replacement_choice(state, chooser);
             let waiting_for = state.waiting_for.clone();
             park_cost_payment_triggers_if_paused(
                 state,
@@ -2851,7 +2849,6 @@ fn resume_random_discard_cost_payment(
                 remaining_eligible,
                 remaining_count,
                 paused_pick,
-                chooser,
                 ..
             } => {
                 commit_random_discard_cost_picks(state, &mut pending, &completed_picks);
@@ -2863,7 +2860,6 @@ fn resume_random_discard_cost_payment(
                         remaining_count,
                         paused_pick,
                     }));
-                super::casting::pause_cost_payment_for_replacement_choice(state, chooser);
                 let waiting_for = state.waiting_for.clone();
                 park_cost_payment_triggers_if_paused(
                     state,
@@ -3528,7 +3524,7 @@ pub(crate) fn resume_interrupted_cost_payment(
         for (index, &card_id) in chosen.iter().enumerate().skip(paused_at_index + 1) {
             match super::effects::discard::discard_as_cost(state, card_id, player, events) {
                 super::effects::discard::DiscardOutcome::Complete => {}
-                super::effects::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) => {
+                super::effects::discard::DiscardOutcome::NeedsChoice(waiting_for) => {
                     state.pending_discard_for_cost =
                         Some(Box::new(PendingDiscardForCostResume::Chosen {
                             player,
@@ -3536,7 +3532,7 @@ pub(crate) fn resume_interrupted_cost_payment(
                             chosen: chosen.clone(),
                             paused_at_index: index,
                         }));
-                    super::casting::pause_cost_payment_for_replacement_choice(state, choice_player);
+                    state.waiting_for = *waiting_for;
                     // CR 603.2 + CR 603.3b: Same mid-loop replacement pause as
                     // `handle_discard_for_cost` — park already-emitted discard
                     // cost events (including replacement-delivered discards in
@@ -23586,6 +23582,311 @@ mod tests {
             .expect("second replacement choice should finish cost payment");
         assert_eq!(state.objects[&second].zone, Zone::Graveyard);
         assert_eq!(state.stack.len(), 1, "activation should reach the stack");
+    }
+
+    #[test]
+    fn chosen_and_random_cast_discard_keep_initial_and_resumed_actual_delivery_waits() {
+        use crate::types::ability::{
+            CardSelectionMode, ControllerRef, DiscardSelfScope, ReplacementDefinition,
+            ReplacementMode, SacrificeCost, TypedFilter,
+        };
+        use crate::types::counter::CounterType;
+        use crate::types::game_state::RandomDraw;
+        use crate::types::replacements::ReplacementEvent;
+        use rand::Rng;
+        for random in [false, true] {
+            for resumed in [false, true] {
+                for non_order in [false, true] {
+                    let mut scenario = GameScenario::new();
+                    scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+                    let originals = [
+                        scenario.add_card_to_hand(P0, "First distinct cost card"),
+                        scenario.add_card_to_hand(P0, "Second distinct cost card"),
+                        scenario.add_card_to_hand(P0, "Unpicked cost card"),
+                    ];
+                    let sibling = scenario
+                        .add_creature(P0, "Earlier sacrifice cost", 1, 1)
+                        .id();
+                    let fodder = scenario.add_creature(P0, "Delivery child fuel", 2, 2).id();
+                    let spell = scenario
+                        .add_spell_to_hand(P0, "Typed cost payload witness", false)
+                        .with_mana_cost(ManaCost::zero())
+                        .from_oracle_text("Draw a card.")
+                        .with_additional_cost(AdditionalCost::Required(AbilityCost::Composite {
+                            costs: vec![
+                                AbilityCost::Sacrifice(SacrificeCost::count(
+                                    TargetFilter::SpecificObject { id: sibling },
+                                    1,
+                                )),
+                                AbilityCost::Discard {
+                                    count: QuantityExpr::Fixed { value: 2 },
+                                    filter: None,
+                                    selection: if random {
+                                        CardSelectionMode::Random
+                                    } else {
+                                        CardSelectionMode::Chosen
+                                    },
+                                    self_scope: DiscardSelfScope::FromHand,
+                                },
+                            ],
+                        }))
+                        .id();
+                    let mut runner = scenario.build();
+                    let pins = originals.map(|id| {
+                        crate::types::identifiers::ObjectIncarnationRef::from_object(
+                            &runner.state().objects[&id],
+                        )
+                    });
+                    let mut expected_rng = runner.state().rng.clone();
+                    let mut pool = originals.to_vec();
+                    let picks = if random {
+                        let first = pool.swap_remove(
+                            expected_rng
+                                .draw(RandomDraw::Outcome)
+                                .random_range(0..pool.len()),
+                        );
+                        let second = pool.swap_remove(
+                            expected_rng
+                                .draw(RandomDraw::Outcome)
+                                .random_range(0..pool.len()),
+                        );
+                        [first, second]
+                    } else {
+                        [originals[0], originals[1]]
+                    };
+                    for id in originals {
+                        let mut redirect = ReplacementDefinition::new(ReplacementEvent::Moved)
+                            .valid_card(TargetFilter::SelfRef)
+                            .destination_zone(Zone::Graveyard)
+                            .execute(AbilityDefinition::new(
+                                AbilityKind::Spell,
+                                Effect::ChangeZone {
+                                    origin: Some(Zone::Hand),
+                                    destination: if non_order && (!resumed || id != picks[0]) {
+                                        Zone::Battlefield
+                                    } else {
+                                        Zone::Exile
+                                    },
+                                    target: TargetFilter::SelfRef,
+                                    owner_library: false,
+                                    enter_transformed: false,
+                                    enters_under: None,
+                                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                                    enters_attacking: false,
+                                    up_to: false,
+                                    enter_with_counters: vec![],
+                                    conditional_enter_with_counters: vec![],
+                                    face_down_profile: None,
+                                    enters_modified_if: None,
+                                },
+                            ));
+                        redirect.active_zones = vec![Zone::Hand];
+                        if !non_order || (resumed && id == picks[0]) {
+                            redirect.mode = ReplacementMode::Optional { decline: None };
+                        }
+                        let object = runner.state_mut().objects.get_mut(&id).unwrap();
+                        object
+                            .card_types
+                            .core_types
+                            .push(crate::types::card_type::CoreType::Creature);
+                        object.power = Some(2);
+                        object.toughness = Some(2);
+                        object.replacement_definitions.push(redirect);
+                        if non_order && (!resumed || id != picks[0]) {
+                            object.replacement_definitions.push(
+                                ReplacementDefinition::new(ReplacementEvent::Moved)
+                                    .valid_card(TargetFilter::SelfRef)
+                                    .destination_zone(Zone::Battlefield)
+                                    .execute(AbilityDefinition::new(
+                                        AbilityKind::Spell,
+                                        Effect::Sacrifice {
+                                            target: TargetFilter::Typed(
+                                                TypedFilter::creature()
+                                                    .controller(ControllerRef::You),
+                                            ),
+                                            count: QuantityExpr::up_to(QuantityExpr::Fixed {
+                                                value: 1,
+                                            }),
+                                            min_count: 0,
+                                        },
+                                    )),
+                            );
+                        }
+                    }
+                    runner
+                        .act(GameAction::CastSpell {
+                            object_id: spell,
+                            card_id: runner.state().objects[&spell].card_id,
+                            targets: vec![],
+                            payment_mode: CastPaymentMode::Auto,
+                        })
+                        .unwrap();
+                    if matches!(
+                        runner.state().waiting_for,
+                        WaitingFor::PayCost {
+                            kind: PayCostKind::Sacrifice,
+                            ..
+                        }
+                    ) {
+                        runner
+                            .act(GameAction::SelectCards {
+                                cards: vec![sibling],
+                            })
+                            .unwrap();
+                    }
+                    assert_eq!(runner.state().objects[&sibling].zone, Zone::Graveyard);
+                    if !random {
+                        assert!(matches!(
+                            runner.state().waiting_for,
+                            WaitingFor::PayCost {
+                                kind: PayCostKind::Discard,
+                                ..
+                            }
+                        ));
+                        runner
+                            .act(GameAction::SelectCards {
+                                cards: picks.to_vec(),
+                            })
+                            .unwrap();
+                    }
+                    if resumed {
+                        assert!(matches!(
+                            runner.state().waiting_for,
+                            WaitingFor::ReplacementChoice { player: P0, .. }
+                        ));
+                        runner
+                            .act(GameAction::ChooseReplacement { index: 0 })
+                            .unwrap();
+                        assert_eq!(runner.state().objects[&picks[0]].zone, Zone::Exile);
+                    }
+                    if !non_order {
+                        for _ in usize::from(resumed)..2 {
+                            assert!(matches!(
+                                runner.state().waiting_for,
+                                WaitingFor::ReplacementChoice { player: P0, .. }
+                            ));
+                            runner
+                                .act(GameAction::ChooseReplacement { index: 0 })
+                                .unwrap();
+                        }
+                        assert!(runner.state().pending_discard_for_cost.is_none());
+                        assert_eq!(runner.state().objects[&spell].zone, Zone::Stack);
+                        assert_eq!(runner.state().stack.len(), 1);
+                        continue;
+                    }
+                    let WaitingFor::EffectZoneChoice {
+                        player: P0,
+                        ref cards,
+                        ..
+                    } = runner.state().waiting_for
+                    else {
+                        panic!("cost lost actual wait: {:?}", runner.state().waiting_for)
+                    };
+                    assert!(cards.contains(&fodder));
+                    let expected = picks[usize::from(resumed)];
+                    assert!(!cards.contains(&expected));
+                    let root = runner
+                        .state()
+                        .pending_discard_for_cost
+                        .as_deref()
+                        .expect("exact cost cursor remains owned");
+                    let pending = match root {
+                        PendingDiscardForCostResume::Chosen {
+                            pending,
+                            chosen,
+                            paused_at_index,
+                            ..
+                        } => {
+                            assert!(!random);
+                            assert_eq!(chosen, &picks);
+                            assert_eq!(*paused_at_index, usize::from(resumed));
+                            pending
+                        }
+                        PendingDiscardForCostResume::Random {
+                            pending,
+                            paused_pick,
+                            remaining_count,
+                            remaining_eligible,
+                            ..
+                        } => {
+                            assert!(random);
+                            assert_eq!(paused_pick.occurrence.object_id, expected);
+                            assert!(pins.contains(&paused_pick.occurrence));
+                            assert_eq!(
+                                paused_pick.snapshot.incarnation,
+                                paused_pick.occurrence.incarnation
+                            );
+                            assert_eq!(*remaining_count, usize::from(!resumed));
+                            assert!(!remaining_eligible.contains(&expected));
+                            if resumed {
+                                assert!(!remaining_eligible.contains(&picks[0]));
+                            }
+                            pending
+                        }
+                    };
+                    assert_eq!(pending.object_id, spell);
+                    assert_eq!(pending.ability.source_id, spell);
+                    assert!(pending
+                        .ability
+                        .cost_paid_objects
+                        .iter()
+                        .any(|record| record.object_id() == sibling));
+                    if !random {
+                        for id in picks {
+                            assert!(pending.ability.cost_paid_objects.iter().any(|record| record
+                                .object_id()
+                                == id
+                                && record.snapshot().is_some_and(|snapshot| pins
+                                    .iter()
+                                    .any(|pin| pin.object_id == id
+                                        && pin.incarnation == snapshot.incarnation))));
+                        }
+                    }
+                    let rng_at_pause = runner.state().rng.clone();
+                    let response = runner
+                        .act(GameAction::SelectCards {
+                            cards: vec![fodder],
+                        })
+                        .unwrap();
+                    assert_eq!(runner.state().objects[&fodder].zone, Zone::Graveyard);
+                    assert!(!response.events.iter().any(|event| matches!(event, GameEvent::Discarded { object_id, .. } if *object_id == expected)));
+                    assert_eq!(
+                        runner.state().rng.get_word_pos(),
+                        rng_at_pause.get_word_pos(),
+                        "answer cannot resample a parked cost pick"
+                    );
+                    assert_eq!(
+                        runner.state().rng.outcome_draws(),
+                        rng_at_pause.outcome_draws()
+                    );
+                    let ability = match runner.state().pending_discard_for_cost.as_deref() {
+                        Some(
+                            PendingDiscardForCostResume::Chosen { pending, .. }
+                            | PendingDiscardForCostResume::Random { pending, .. },
+                        ) => pending.ability.as_ref(),
+                        None => runner
+                            .state()
+                            .stack
+                            .iter()
+                            .find(|entry| entry.source_id == spell)
+                            .expect("same ability survives in stack carrier")
+                            .ability()
+                            .expect("spell carries its original resolved ability"),
+                    };
+                    assert_eq!(ability.source_id, spell);
+                    assert!(ability
+                        .cost_paid_objects
+                        .iter()
+                        .any(|record| record.object_id() == sibling));
+                    assert_eq!(
+                        runner.state().objects[&expected]
+                            .counters
+                            .get(&CounterType::Plus1Plus1),
+                        None
+                    );
+                }
+            }
+        }
     }
 
     #[test]

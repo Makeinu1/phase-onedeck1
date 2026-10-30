@@ -1451,12 +1451,21 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
     // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
     // replacement subtree has retired resumes before any further resolution
     // work; every frame left on top of it is outer work.
-    if state.counter_cost_root_is_due() {
+    if state.counter_cost_root_is_due() || state.pending_discard_batch_blocks_outer_work() {
         return;
     }
     counters::drain_pending_counter_moves(state, events);
+    if state.pending_discard_batch_blocks_outer_work() {
+        return;
+    }
     counters::drain_pending_counter_removals(state, events);
+    if state.pending_discard_batch_blocks_outer_work() {
+        return;
+    }
     counters::drain_pending_counter_additions(state, events);
+    if state.pending_discard_batch_blocks_outer_work() {
+        return;
+    }
     if waits_for_resolution_choice(&state.waiting_for) {
         state.resolution_stack.note_repeat_until_descendant_choice();
         return;
@@ -1554,6 +1563,9 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
                     }
                 }
             }
+        }
+        if state.pending_discard_batch_blocks_outer_work() {
+            return;
         }
         let discard_frame = state
             .resolution_stack
@@ -1715,7 +1727,10 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
         // work; every frame left on top of it is outer work. Once the subtree
         // retired with the continuation that just ran, the paused dispatch on top
         // belongs to an outer owner and stays paused.
-        if !waits_for_resolution_choice(&state.waiting_for) && !state.counter_cost_root_is_due() {
+        if !waits_for_resolution_choice(&state.waiting_for)
+            && !state.counter_cost_root_is_due()
+            && !state.pending_discard_batch_blocks_outer_work()
+        {
             // CR 615.5: a resumed continuation completes its own paused
             // resident drain only after it has not raised another choice.
             state.finish_active_paused_post_replacement_dispatch();
@@ -1732,7 +1747,7 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
     // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
     // replacement subtree has retired resumes before any further resolution
     // work; every frame left on top of it is outer work.
-    if state.counter_cost_root_is_due() {
+    if state.counter_cost_root_is_due() || state.pending_discard_batch_blocks_outer_work() {
         return;
     }
     // CR 701.38d: Resume per-ballot vote iteration after an interactive
@@ -1741,6 +1756,9 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
     if !waits_for_resolution_choice(&state.waiting_for) && state.active_vote_ballot().is_some() {
         vote::drain_active_vote_ballot(state, events);
     }
+    if state.pending_discard_batch_blocks_outer_work() {
+        return;
+    }
     // CR 608.2c + CR 109.5: After the per-iteration chain drains, drive any
     // remaining `repeat_for` iterations. Each resumed iteration may itself
     // pause and re-stash via the loop in `resolve_ability_chain`, producing a
@@ -1748,8 +1766,14 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
     if !waits_for_resolution_choice(&state.waiting_for) && state.active_repeat_for().is_some() {
         drain_active_repeat_for(state, events);
     }
+    if state.pending_discard_batch_blocks_outer_work() {
+        return;
+    }
     if !waits_for_resolution_choice(&state.waiting_for) {
         choose_one_of::resume_pending(state, events);
+    }
+    if state.pending_discard_batch_blocks_outer_work() {
+        return;
     }
     // CR 608.2c: After the iteration's choice and any chained
     // continuation have fully drained (state is back at priority), resume a
@@ -1996,7 +2020,7 @@ pub(crate) fn resume_resolution_frames(state: &mut GameState, events: &mut Vec<G
     // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
     // replacement subtree has retired resumes before any further resolution
     // work; every frame left on top of it is outer work.
-    if state.counter_cost_root_is_due() {
+    if state.counter_cost_root_is_due() || state.pending_discard_batch_blocks_outer_work() {
         return;
     }
 
@@ -20018,6 +20042,9 @@ pub(crate) fn drain_pending_discard_batch(
         DiscardBatchCursor::All { remaining } => {
             for (i, obj_id) in remaining.iter().enumerate() {
                 let paused_card = discard::pin_paused_occurrence(state, *obj_id);
+                let delivery_subtree = crate::types::game_state::ReplacementSubtreeBoundary::at(
+                    &state.resolution_stack,
+                );
                 if let discard::DiscardOutcome::NeedsChoice(waiting_for) =
                     discard::discard_caused_by_effect_with_source_and_frame(
                         state,
@@ -20035,6 +20062,7 @@ pub(crate) fn drain_pending_discard_batch(
                     // the `Random` arm below already receives from
                     // `discard_at_random`.
                     batch.paused_card = paused_card;
+                    batch.delivery_subtree = Some(delivery_subtree);
                     state.waiting_for = *waiting_for;
                     repark_discard_batch(state, batch, events);
                     return Ok(PendingDiscardBatchOutcome::PausedForReplacement);
@@ -20046,6 +20074,7 @@ pub(crate) fn drain_pending_discard_batch(
                 remaining_eligible,
                 remaining_count,
                 paused_card,
+                delivery_subtree,
                 ..
             } = discard::discard_at_random(
                 state,
@@ -20064,6 +20093,7 @@ pub(crate) fn drain_pending_discard_batch(
                     remaining: remaining_count,
                 };
                 batch.paused_card = paused_card;
+                batch.delivery_subtree = Some(delivery_subtree);
                 // Random discard already installed the actual delivery prompt.
                 repark_discard_batch(state, batch, events);
                 return Ok(PendingDiscardBatchOutcome::PausedForReplacement);
@@ -20078,6 +20108,9 @@ pub(crate) fn drain_pending_discard_batch(
                     continue;
                 }
                 let player = state.objects[&card.object_id].owner;
+                let delivery_subtree = crate::types::game_state::ReplacementSubtreeBoundary::at(
+                    &state.resolution_stack,
+                );
                 if let discard::DiscardOutcome::NeedsChoice(waiting_for) =
                     discard::discard_caused_by_effect_with_source_and_frame(
                         state,
@@ -20093,6 +20126,7 @@ pub(crate) fn drain_pending_discard_batch(
                     };
                     batch.player = player;
                     batch.paused_card = *card;
+                    batch.delivery_subtree = Some(delivery_subtree);
                     state.waiting_for = *waiting_for;
                     repark_discard_batch(state, batch, events);
                     return Ok(PendingDiscardBatchOutcome::PausedForReplacement);
@@ -21259,6 +21293,7 @@ fn resolve_chain_body(
     // value catches the replace case correctly (issue #491).
     let pending_continuation_before = state.active_ability_continuation().cloned();
     let child_stack_start = state.resolution_stack.capture_child_boundary();
+    let discard_batch_was_absent = state.pending_discard_batch.is_none();
 
     // CR 608.2c + CR 701.20b + CR 603.3d: A multi-target reveal-all producer whose
     // per-target referent (the revealed card) is consumed by later co-instructions
@@ -21514,7 +21549,27 @@ fn resolve_chain_body(
                         }
                         tail = Some(Box::new(remaining_narrowed));
                     }
-                    append_to_pending_continuation(state, tail);
+                    if discard_batch_was_absent && state.pending_discard_batch.is_some() {
+                        if let Some(tail) = tail {
+                            if state.active_ability_continuation().is_some()
+                                && state.active_ability_continuation()
+                                    == pending_continuation_before.as_ref()
+                            {
+                                append_to_pending_continuation(state, Some(tail));
+                            } else {
+                                state
+                                    .park_ability_continuation_after_child(
+                                        PendingContinuation::new(tail, state),
+                                        child_stack_start,
+                                    )
+                                    .map_err(|error| {
+                                        EffectError::InvalidParam(error.to_string())
+                                    })?;
+                            }
+                        }
+                    } else {
+                        append_to_pending_continuation(state, tail);
+                    }
                     break;
                 }
             }
@@ -21888,8 +21943,8 @@ fn resolve_chain_body(
                 // source, by a different seat, or one that a nested clause has
                 // already handed off, fails a conjunct and the driver falls
                 // through to the ordinary per-seat leg path below, unchanged.
-                let handed_to_discard_batch =
-                    state.pending_discard_batch.as_ref().is_some_and(|batch| {
+                let handed_to_discard_batch = discard_batch_was_absent
+                    && state.pending_discard_batch.as_ref().is_some_and(|batch| {
                         batch.source_id == scoped_template.source_id
                             && batch.player == *pid
                             && batch.fan_out.is_none()
@@ -21914,8 +21969,20 @@ fn resolve_chain_body(
                     }
                     // Only the unscoped tail goes to the generic continuation;
                     // the per-seat legs do not exist on this path.
-                    if after_scope.is_some() {
-                        append_to_pending_continuation(state, after_scope.clone());
+                    if let Some(tail) = after_scope.clone() {
+                        if state.active_ability_continuation().is_some()
+                            && state.active_ability_continuation()
+                                == pending_continuation_before.as_ref()
+                        {
+                            append_to_pending_continuation(state, Some(tail));
+                        } else {
+                            state
+                                .park_ability_continuation_after_child(
+                                    PendingContinuation::new(tail, state),
+                                    child_stack_start,
+                                )
+                                .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
+                        }
                     }
                     // Deliberately skips the clause postlude below: the batch
                     // owns that publication now, and running it here as well
@@ -22040,7 +22107,15 @@ fn resolve_chain_body(
         } else if after_scope_owned_by_sidecar {
             if let Some(after_scope) = after_scope {
                 if state.active_ability_continuation().is_none() {
-                    park_player_scope_queue_end(state, after_scope.as_ref().clone());
+                    if discard_batch_was_absent && state.pending_discard_batch.is_some() {
+                        let pending =
+                            PendingContinuation::player_scope_queue_end(after_scope.clone(), state);
+                        state
+                            .park_ability_continuation_after_child(pending, child_stack_start)
+                            .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
+                    } else {
+                        park_player_scope_queue_end(state, after_scope.as_ref().clone());
+                    }
                 }
                 if let Some(frame) = state.active_ability_continuation_frame_mut() {
                     // CR 608.2f: generated APNAP nodes and their exact per-seat
@@ -24034,7 +24109,15 @@ fn resolve_chain_body(
         && state.resolving_player_scope_tail.is_some()
         && state.active_ability_continuation().is_none()
     {
-        park_player_scope_queue_end(state, ability.clone());
+        if discard_batch_was_absent && state.pending_discard_batch.is_some() {
+            let pending =
+                PendingContinuation::player_scope_queue_end(Box::new(ability.clone()), state);
+            state
+                .park_ability_continuation_after_child(pending, child_stack_start)
+                .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
+        } else {
+            park_player_scope_queue_end(state, ability.clone());
+        }
         return Ok(progress);
     }
 
@@ -24054,7 +24137,11 @@ fn resolve_chain_body(
             }
             apply_parent_chain_context(&mut tail, ability, effect_context_object.as_ref(), state);
             let pending = PendingContinuation::new(Box::new(tail), state);
-            if state.resolution_stack.capture_child_boundary() > child_stack_start {
+            if discard_batch_was_absent && state.pending_discard_batch.is_some() {
+                state
+                    .park_ability_continuation_after_child(pending, child_stack_start)
+                    .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
+            } else if state.resolution_stack.capture_child_boundary() > child_stack_start {
                 state
                     .insert_ability_continuation_parent_at_child_boundary(
                         pending,
@@ -24816,7 +24903,14 @@ fn resolve_chain_body(
                     ability,
                     &state.waiting_for,
                 );
-            if (matches!(ability.effect, Effect::RollDie { .. })
+            if discard_batch_was_absent && state.pending_discard_batch.is_some() {
+                let mut pending = PendingContinuation::new(Box::new(sub_clone), state);
+                pending.pending_return_result_producer = pending_return_result_producer;
+                pending.x_announcement = x_announcement;
+                state
+                    .park_ability_continuation_after_child(pending, child_stack_start)
+                    .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
+            } else if (matches!(ability.effect, Effect::RollDie { .. })
                 || sub_clone.reads_return_result.is_some()
                 || state
                     .resolution_stack
@@ -41839,6 +41933,9 @@ mod tests {
                     0,
                 ),
                 discard_frame: None,
+                delivery_subtree: Some(crate::types::game_state::ReplacementSubtreeBoundary::at(
+                    &state.resolution_stack,
+                )),
                 fan_out,
                 preceding_events: Vec::new(),
             }));

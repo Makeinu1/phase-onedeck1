@@ -1317,6 +1317,9 @@ pub(super) fn apply_action_boundary_with_stack_limit(
     mode: PublicFinalizeMode,
     stack_resolution_limit: Option<u32>,
 ) -> Result<ActionResult, EngineError> {
+    state
+        .validate_pending_discard_batch_authority()
+        .map_err(EngineError::InvalidAction)?;
     let _boundary = super::play_trace::BoundaryDepth::enter();
     // A zero-count debug create is intentionally a true no-op. It still passes
     // both the ordinary action-authority check and the sandbox capability
@@ -1425,6 +1428,9 @@ fn apply_action_boundary_core(
     stack_resolution_limit: Option<u32>,
     authorize_actor: bool,
 ) -> Result<RawActionApplication, EngineError> {
+    state
+        .validate_pending_discard_batch_authority()
+        .map_err(EngineError::InvalidAction)?;
     let lifecycle = super::lifecycle::enter_action_frame();
     if let Err(error) = mana_sources::preflight_tap_land_action(state, authenticated_actor, &action)
     {
@@ -9439,7 +9445,8 @@ pub(super) fn resume_pending_continuation_if_priority(
         resume_pending_continuation_pass(state, events)?;
         let after = SubtreePosition::at(&state.resolution_stack);
         if !matches!(state.waiting_for, WaitingFor::Priority { .. })
-            || state.counter_cost_root_subtree() != CounterCostRootSubtree::Unfinished
+            || (state.counter_cost_root_subtree() != CounterCostRootSubtree::Unfinished
+                && state.pending_discard_batch.is_none())
             || !after.is_strictly_inside(&before)
         {
             return Ok(());
@@ -9495,10 +9502,53 @@ fn resume_due_counter_cost_root(
     Ok(())
 }
 
+/// CR 608.2c + CR 608.2i: finish the paused instruction before any outer reader.
+fn resume_due_discard_batch(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EngineError> {
+    state
+        .validate_pending_discard_batch_authority()
+        .map_err(EngineError::InvalidAction)?;
+    if !matches!(state.waiting_for, WaitingFor::Priority { .. })
+        || state.pending_replacement.is_some()
+        || !state.pending_discard_batch_is_due()
+    {
+        return Ok(());
+    }
+    let batch = state
+        .pending_discard_batch
+        .as_ref()
+        .expect("due discard batch");
+    let window = || batch.preceding_events.iter().chain(events.iter());
+    let departed = window().any(|event| matches!(event,
+        GameEvent::ZoneChanged { from: Some(Zone::Hand), record, .. }
+            if record.trigger_source_context().is_some_and(|context| context.identity.reference == batch.paused_card)));
+    let discarded = window().any(|event| matches!(event,
+        GameEvent::Discarded { player_id, object_id, source_id }
+            if *player_id == batch.player && *object_id == batch.paused_card.object_id && *source_id == Some(batch.source_id)));
+    if !departed || !discarded {
+        return Err(EngineError::InvalidAction(
+            "pending discard batch lacks completed original hand departure".into(),
+        ));
+    }
+    match effects::drain_pending_discard_batch(state, events)
+        .map_err(|error| EngineError::InvalidAction(error.to_string()))?
+    {
+        effects::PendingDiscardBatchOutcome::PausedForReplacement => {
+            engine_resolution_choices::defer_observer_triggers_for_paused_choice(state, events, 0);
+        }
+        effects::PendingDiscardBatchOutcome::Idle
+        | effects::PendingDiscardBatchOutcome::Completed => {}
+    }
+    Ok(())
+}
+
 fn resume_pending_continuation_pass(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EngineError> {
+    resume_due_discard_batch(state, events)?;
     if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
         // CR 118.3b + CR 119.4 + CR 616.1: A life-payment replacement child
         // drains to its recorded resolution boundary before the paid outer
@@ -9511,17 +9561,23 @@ fn resume_pending_continuation_pass(
         if deferred_life_boundary.is_none_or(|boundary| state.resolution_stack.len() > boundary) {
             super::life_safety::observe_boundary_carrier(state);
             effects::drain_pending_continuation(state, events);
+            resume_due_discard_batch(state, events)?;
             effects::counters::resume_copy_target_entry_completions(state, events)?;
+            resume_due_discard_batch(state, events)?;
         }
         resume_due_counter_cost_root(state, events)?;
+        resume_due_discard_batch(state, events)?;
         if matches!(state.waiting_for, WaitingFor::Priority { .. })
             && deferred_life_boundary.is_none_or(|boundary| state.resolution_stack.len() > boundary)
         {
             super::life_safety::observe_boundary_carrier(state);
             effects::resume_resolution_frames(state, events);
+            resume_due_discard_batch(state, events)?;
             effects::counters::resume_copy_target_entry_completions(state, events)?;
+            resume_due_discard_batch(state, events)?;
         }
         resume_due_counter_cost_root(state, events)?;
+        resume_due_discard_batch(state, events)?;
         let mut drained_deferred_life = false;
         if matches!(state.waiting_for, WaitingFor::Priority { .. })
             && state
@@ -9535,6 +9591,7 @@ fn resume_pending_continuation_pass(
             let waiting_for = drain_pending_deferred_life_cost_resume(state, events)?;
             state.waiting_for = waiting_for;
             drained_deferred_life = true;
+            resume_due_discard_batch(state, events)?;
         }
         if matches!(state.waiting_for, WaitingFor::Priority { .. })
             && drained_deferred_life
@@ -9542,12 +9599,20 @@ fn resume_pending_continuation_pass(
         {
             super::life_safety::observe_boundary_carrier(state);
             effects::drain_pending_continuation(state, events);
+            resume_due_discard_batch(state, events)?;
             effects::counters::resume_copy_target_entry_completions(state, events)?;
+            resume_due_discard_batch(state, events)?;
             if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
                 super::life_safety::observe_boundary_carrier(state);
                 effects::resume_resolution_frames(state, events);
+                resume_due_discard_batch(state, events)?;
                 effects::counters::resume_copy_target_entry_completions(state, events)?;
+                resume_due_discard_batch(state, events)?;
             }
+        }
+        resume_due_discard_batch(state, events)?;
+        if state.pending_discard_batch.is_some() {
+            return Ok(());
         }
         // CR 614.12a + CR 111.1: An entry replacement's required choices are made
         // BEFORE the permanent enters, so a liminal entry whose "as enters" chain
@@ -30603,5 +30668,138 @@ mod legacy_copy_announcement_tests {
             r.act(GameAction::PassPriority).expect("resolve");
         }
         assert_eq!(elementals(&r), 1, "no Elemental for the abandoned copy");
+    }
+}
+
+#[cfg(test)]
+mod discard_delivery_resume_tests {
+    use super::*;
+    use crate::game::zones::create_object;
+    use crate::types::ability::{QuantityExpr, TargetFilter};
+    use crate::types::game_state::{
+        DiscardBatchCursor, PendingContinuation, PendingDiscardBatch,
+        PendingDiscardBatchCompletion, ReplacementSubtreeBoundary,
+    };
+    use crate::types::identifiers::{CardId, ObjectIncarnationRef};
+
+    #[test]
+    fn same_source_none_result_child_finishes_before_discard_batch_and_outer_draw() {
+        let mut state = GameState::new_two_player(42);
+        state.phase = crate::types::phase::Phase::PreCombatMain;
+        let first = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Original completed hand occurrence".into(),
+            Zone::Hand,
+        );
+        let second = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Remaining original hand card".into(),
+            Zone::Hand,
+        );
+        let source = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Shared child and outer source".into(),
+            Zone::Battlefield,
+        );
+        let library = (0..3)
+            .map(|i| {
+                create_object(
+                    &mut state,
+                    CardId(10 + i),
+                    PlayerId(0),
+                    format!("Library {i}"),
+                    Zone::Library,
+                )
+            })
+            .collect::<Vec<_>>();
+        let pin = ObjectIncarnationRef::from_object(&state.objects[&first]);
+        let mut preceding = vec![];
+        assert!(matches!(
+            effects::discard::discard_caused_by_effect_with_source(
+                &mut state,
+                first,
+                PlayerId(0),
+                Some(source),
+                &mut preceding
+            ),
+            effects::discard::DiscardOutcome::Complete
+        ));
+        let draw = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let outer = PendingContinuation::new(Box::new(draw), &state);
+        assert!(outer.return_result_occurrence.is_none());
+        state.park_ability_continuation(outer);
+        state.pending_discard_batch = Some(Box::new(PendingDiscardBatch {
+            player: PlayerId(0),
+            cursor: DiscardBatchCursor::All {
+                remaining: vec![second],
+            },
+            completion: PendingDiscardBatchCompletion::Standard,
+            source_id: source,
+            effect_kind: EffectKind::Discard,
+            paused_card: pin,
+            delivery_subtree: Some(ReplacementSubtreeBoundary::at(&state.resolution_stack)),
+            discard_frame: None,
+            fan_out: None,
+            preceding_events: preceding,
+        }));
+        let mut child = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        child.sub_ability = Some(Box::new(ResolvedAbility::new(
+            Effect::Scry {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        )));
+        let child = PendingContinuation::new(Box::new(child), &state);
+        assert!(child.return_result_occurrence.is_none());
+        state.park_ability_continuation(child);
+        let before_life = state.players[0].life;
+        resume_pending_continuation_if_priority(&mut state, &mut vec![]).unwrap();
+        let WaitingFor::ScryChoice {
+            player: PlayerId(0),
+            ref cards,
+        } = state.waiting_for
+        else {
+            panic!(
+                "same-source child must positively execute before outer draw: {:?}",
+                state.waiting_for
+            )
+        };
+        assert_eq!(state.players[0].life, before_life + 1);
+        assert_eq!(state.players[0].library.len(), library.len());
+        assert_eq!(state.objects[&second].zone, Zone::Hand);
+        let cards = cards.clone();
+        let result = apply_as_current(&mut state, GameAction::SelectCards { cards }).unwrap();
+        assert!(matches!(result.waiting_for, WaitingFor::Priority { .. }));
+        assert_eq!(state.objects[&second].zone, Zone::Graveyard);
+        assert_eq!(state.players[0].library.len(), library.len() - 1);
+        assert_eq!(state.cards_discarded_this_turn_by_player[&PlayerId(0)], 2);
+        assert!(state.pending_discard_batch.is_none());
+        assert!(state.resolution_stack.is_empty());
+        assert_eq!(result.events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id: Some(bound) } if *object_id == second && *bound == source)).count(), 1);
     }
 }

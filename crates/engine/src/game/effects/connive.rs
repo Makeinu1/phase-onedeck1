@@ -231,13 +231,12 @@ pub(crate) fn discard_all_and_count_nonlands(
     let mut nonland_count = 0;
     for &card_id in cards {
         let is_nonland = is_nonland_card(state, card_id);
-        if let super::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) =
+        if let super::discard::DiscardOutcome::NeedsChoice(waiting_for) =
             super::discard::discard_caused_by_effect_with_source(
                 state, card_id, player, None, events,
             )
         {
-            state.waiting_for =
-                crate::game::replacement::replacement_choice_waiting_for(choice_player, state);
+            state.waiting_for = *waiting_for;
             return None;
         }
         if is_nonland {
@@ -317,6 +316,38 @@ mod tests {
     use crate::types::card_type::CoreType;
     use crate::types::identifiers::CardId;
     use crate::types::player::PlayerId;
+
+    #[test]
+    fn connive_discard_forwards_actual_delivery_prompt_and_keeps_completed_nonland_count() {
+        let (mut state, card, fodder) = super::super::discard::non_order_discard_fixture_for_test();
+        assert_eq!(
+            discard_all_and_count_nonlands(&mut state, &[card], PlayerId(0), &mut vec![]),
+            None
+        );
+        assert!(
+            matches!(state.waiting_for, WaitingFor::EffectZoneChoice { player: PlayerId(0), ref cards, .. } if cards.contains(&fodder) && !cards.contains(&card))
+        );
+        crate::game::engine::apply_as_current(
+            &mut state,
+            crate::types::actions::GameAction::SelectCards {
+                cards: vec![fodder],
+            },
+        )
+        .unwrap();
+        assert_eq!(state.objects[&fodder].zone, Zone::Graveyard);
+        let (mut complete, card, _) = super::super::discard::non_order_discard_fixture_for_test();
+        complete
+            .objects
+            .get_mut(&card)
+            .unwrap()
+            .replacement_definitions
+            .clear();
+        assert_eq!(
+            discard_all_and_count_nonlands(&mut complete, &[card], PlayerId(0), &mut vec![]),
+            Some(1)
+        );
+        assert_eq!(complete.objects[&card].zone, Zone::Graveyard);
+    }
 
     fn make_connive_ability(source: ObjectId, target: ObjectId) -> ResolvedAbility {
         ResolvedAbility::new(

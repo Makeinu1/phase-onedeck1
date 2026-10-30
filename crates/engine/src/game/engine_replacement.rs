@@ -344,6 +344,43 @@ fn handle_replacement_choice_inner(
             batch.discard_frame,
         )
     });
+    let original_discard_response = state.pending_discard_batch.as_ref().is_some_and(|batch| {
+        batch.paused_card.is_current(state)
+            && state
+                .objects
+                .get(&batch.paused_card.object_id)
+                .is_some_and(|object| object.zone == Zone::Hand && object.owner == batch.player)
+            && state
+                .pending_replacement
+                .as_ref()
+                .is_some_and(|pending| match &pending.proposed {
+                    ProposedEvent::Discard {
+                        player_id,
+                        object_id,
+                        source_id,
+                        discard_frame,
+                        caused_by_effect: true,
+                        ..
+                    } => {
+                        *player_id == batch.player
+                            && *object_id == batch.paused_card.object_id
+                            && *source_id == Some(batch.source_id)
+                            && *discard_frame == batch.discard_frame
+                    }
+                    ProposedEvent::ZoneChange {
+                        object_id,
+                        from: Zone::Hand,
+                        cause,
+                        discard_frame,
+                        ..
+                    } => {
+                        *object_id == batch.paused_card.object_id
+                            && *cause == Some(batch.source_id)
+                            && *discard_frame == batch.discard_frame
+                    }
+                    _ => false,
+                })
+    });
     let is_parked_discard_delivery = |events: &[GameEvent]| {
         let Some((paused_card, player, source_id, _)) = parked_discard_batch_owner else {
             return false;
@@ -1471,7 +1508,21 @@ fn handle_replacement_choice_inner(
             // instructions in written order, so later instructions cannot resume
             // until this action has settled and published its terminal result.
             if matches!(waiting_for, WaitingFor::Priority { .. })
-                && state.pending_discard_batch.is_some()
+                && state.pending_discard_batch_is_due()
+                && state.pending_discard_batch.as_ref().is_some_and(|batch| {
+                    parked_discard_batch_owner
+                        == Some((
+                            batch.paused_card,
+                            batch.player,
+                            batch.source_id,
+                            batch.discard_frame,
+                        ))
+                        && {
+                            let mut window = batch.preceding_events.clone();
+                            window.extend_from_slice(events);
+                            is_parked_discard_delivery(&window)
+                        }
+                })
             {
                 if let Some(next) = drain_discard_batch_after_replacement(
                     state,
@@ -1717,6 +1768,21 @@ fn handle_replacement_choice_inner(
             ))
         }
         super::replacement::ReplacementResult::Prevented => {
+            // CR 614.6: only preventing this exact original discard may advance without a departure.
+            if original_discard_response && state.pending_discard_batch_is_due() {
+                state.waiting_for = WaitingFor::Priority {
+                    player: state.active_player,
+                };
+                if let Some(next) = drain_discard_batch_after_replacement(
+                    state,
+                    events,
+                    replacement_action_event_start,
+                )? {
+                    return Ok(next);
+                }
+                super::engine::resume_pending_continuation_if_priority(state, events)?;
+                return Ok(state.waiting_for.clone());
+            }
             if let Some(paused) = parked_zone_change_delivery.as_ref() {
                 state.capture_paused_zone_change_delivery(
                     paused.member,
@@ -1853,6 +1919,7 @@ fn handle_replacement_choice_inner(
                 // whose completed move owns this settled delivery-tail child.
                 if matches!(state.waiting_for, WaitingFor::Priority { .. })
                     && state.active_counter_additions().is_none()
+                    && state.pending_discard_batch_is_due()
                     && state.pending_discard_batch.as_ref().is_some_and(|batch| {
                         parked_affected_object_id == Some(batch.paused_card.object_id)
                             && parked_discard_batch_owner

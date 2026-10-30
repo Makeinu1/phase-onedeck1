@@ -696,8 +696,8 @@ pub(crate) fn finish_or_continue_turn_face_up(
 
 /// CR 702.37e + CR 118.1: Pay one object of a turn-face-up cost move (return to
 /// hand, discard, or sacrifice). Single authority for both the initial selection
-/// and the post-replacement-choice resume loop. Returns the player who must make
-/// a replacement choice when the move pauses, `None` when it completed.
+/// and the resumed delivery loop. Returns the actual delivery prompt when the
+/// move pauses, `None` when it completed.
 fn pay_turn_face_up_cost_object(
     state: &mut GameState,
     player: PlayerId,
@@ -705,7 +705,7 @@ fn pay_turn_face_up_cost_object(
     move_kind: TurnFaceUpMoveKind,
     id: ObjectId,
     events: &mut Vec<GameEvent>,
-) -> Result<Option<PlayerId>, EngineError> {
+) -> Result<Option<WaitingFor>, EngineError> {
     match move_kind {
         TurnFaceUpMoveKind::ReturnToHand => {
             match crate::game::zone_pipeline::move_object(
@@ -715,7 +715,11 @@ fn pay_turn_face_up_cost_object(
             ) {
                 crate::game::zone_pipeline::ZoneMoveResult::Done => Ok(None),
                 crate::game::zone_pipeline::ZoneMoveResult::NeedsChoice(choice_player) => {
-                    Ok(Some(choice_player))
+                    Ok(Some(if state.pending_replacement.is_some() {
+                        super::replacement::replacement_choice_waiting_for(choice_player, state)
+                    } else {
+                        state.waiting_for.clone()
+                    }))
                 }
                 crate::game::zone_pipeline::ZoneMoveResult::NeedsAuraAttachmentChoice => {
                     unreachable!("a cost move to Hand cannot require Aura attachment")
@@ -731,8 +735,8 @@ fn pay_turn_face_up_cost_object(
                 events,
             ) {
                 super::effects::discard::DiscardOutcome::Complete => Ok(None),
-                super::effects::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) => {
-                    Ok(Some(choice_player))
+                super::effects::discard::DiscardOutcome::NeedsChoice(waiting_for) => {
+                    Ok(Some(*waiting_for))
                 }
             }
         }
@@ -743,7 +747,11 @@ fn pay_turn_face_up_cost_object(
             match super::sacrifice::sacrifice_permanent(state, id, player, events)? {
                 super::sacrifice::SacrificeOutcome::Complete => Ok(None),
                 super::sacrifice::SacrificeOutcome::NeedsReplacementChoice(choice_player) => {
-                    Ok(Some(choice_player))
+                    Ok(Some(if state.pending_replacement.is_some() {
+                        super::replacement::replacement_choice_waiting_for(choice_player, state)
+                    } else {
+                        state.waiting_for.clone()
+                    }))
                 }
             }
         }
@@ -921,7 +929,7 @@ pub(crate) fn move_turn_face_up_cost_objects(
         remaining_cost,
     } = request;
     for (index, &object_id) in chosen.iter().enumerate().skip(start_at_index) {
-        let Some(choice_player) =
+        let Some(waiting_for) =
             pay_turn_face_up_cost_object(state, player, source, move_kind, object_id, events)?
         else {
             continue;
@@ -939,9 +947,7 @@ pub(crate) fn move_turn_face_up_cost_objects(
             deferred_cost_events,
             departure_record_indices,
         });
-        if state.pending_replacement.is_some() {
-            super::costs::pause_cost_payment_for_replacement_choice(state, choice_player);
-        }
+        state.waiting_for = waiting_for;
         if !withhold {
             // CR 603.2 + CR 603.3b: No departure group can still form, so retain
             // this fragment's ordinary cost-move observers across the
@@ -1343,6 +1349,75 @@ mod tests {
     use crate::types::ability::QuantityExpr;
     use crate::types::identifiers::CardId;
     use crate::types::mana::ManaColor;
+
+    #[test]
+    fn turn_face_up_discard_cost_keeps_actual_wait_and_exact_move_root() {
+        let (mut state, card, fodder) =
+            crate::game::effects::discard::non_order_discard_fixture_for_test();
+        let source = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Distinct face-down source".into(),
+            Zone::Battlefield,
+        );
+        let source = ObjectIncarnationRef::from_object(&state.objects[&source]);
+        let remaining = Some(Box::new(AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+        }));
+        let waiting = move_turn_face_up_cost_objects(
+            &mut state,
+            TurnFaceUpCostMoveRequest {
+                player: PlayerId(0),
+                source,
+                cost_source: TurnUpCostSource::Morph,
+                move_kind: TurnFaceUpMoveKind::Discard,
+                chosen: vec![card],
+                start_at_index: 0,
+                remaining_cost: remaining.clone(),
+            },
+            CostMoveLedger::default(),
+            0,
+            &mut vec![],
+        )
+        .unwrap();
+        assert!(
+            matches!(waiting, WaitingFor::EffectZoneChoice { player: PlayerId(0), ref cards, .. } if cards.contains(&fodder) && !cards.contains(&card))
+        );
+        let Some(PendingCostMoveResume::TurnFaceUpCostMove {
+            source: bound,
+            chosen,
+            paused_at_index,
+            remaining_cost,
+            ..
+        }) = state.pending_cost_move_resume.as_ref()
+        else {
+            panic!("exact face-up cost root missing")
+        };
+        assert_eq!(*bound, source);
+        assert_eq!(chosen, &[card]);
+        assert_eq!(*paused_at_index, 0);
+        assert_eq!(remaining_cost, &remaining);
+        let (mut complete, card, _) =
+            crate::game::effects::discard::non_order_discard_fixture_for_test();
+        complete
+            .objects
+            .get_mut(&card)
+            .unwrap()
+            .replacement_definitions
+            .clear();
+        assert!(pay_turn_face_up_cost_object(
+            &mut complete,
+            PlayerId(0),
+            source,
+            TurnFaceUpMoveKind::Discard,
+            card,
+            &mut vec![]
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(complete.objects[&card].zone, Zone::Graveyard);
+    }
 
     fn setup_morph_creature(state: &mut GameState, player: PlayerId) -> ObjectId {
         let id = create_object(

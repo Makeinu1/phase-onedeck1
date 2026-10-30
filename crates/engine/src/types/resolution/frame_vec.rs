@@ -245,8 +245,9 @@ impl FrameVec {
 
     /// Insert `frame` so that it sits immediately beneath the frame currently
     /// at `slot`, lifting `slot` and everything above it by one.
-    pub(super) fn insert_below(&mut self, slot: FrameSlot, frame: ResolutionFrame) {
+    pub(super) fn insert_below(&mut self, slot: FrameSlot, frame: ResolutionFrame) -> usize {
         self.frames.insert(slot.0, frame);
+        slot.0
     }
 
     /// Insert `frame` at a stack DEPTH captured before a child producer ran.
@@ -260,17 +261,17 @@ impl FrameVec {
     /// The depth itself is unforgeable now, so both directions are closed: a
     /// scanned `usize` cannot become a depth, and a depth cannot become a slot.
     ///
-    /// Returns `false` when `depth` does not name a boundary with at least one
+    /// Returns `None` when `depth` does not name a boundary with at least one
     /// child frame above it; the caller reports that as a typed error.
     pub(super) fn insert_at_child_boundary(
         &mut self,
         depth: ChildStackDepth,
         frame: ResolutionFrame,
-    ) -> bool {
+    ) -> Option<usize> {
         if depth.0 >= self.frames.len() {
-            return false;
+            return None;
         }
         self.frames.insert(depth.0, frame);
-        true
+        Some(depth.0)
     }
 }

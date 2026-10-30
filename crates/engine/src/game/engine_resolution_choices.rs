@@ -6289,6 +6289,9 @@ pub(super) fn handle_resolution_choice(
             let events_before_effect = events.len();
             for (index, &card_id) in chosen.iter().enumerate() {
                 let paused_card = chosen_refs[index];
+                let delivery_subtree = crate::types::game_state::ReplacementSubtreeBoundary::at(
+                    &state.resolution_stack,
+                );
                 if let effects::discard::DiscardOutcome::NeedsChoice(choice_player) =
                     effects::discard::discard_caused_by_effect_with_source_and_frame(
                         state,
@@ -6313,6 +6316,7 @@ pub(super) fn handle_resolution_choice(
                             source_id,
                             effect_kind,
                             paused_card,
+                            delivery_subtree: Some(delivery_subtree),
                             discard_frame,
                             fan_out: None,
                             preceding_events: events[events_before_effect..].to_vec(),

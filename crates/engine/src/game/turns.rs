@@ -3291,11 +3291,10 @@ pub fn finish_cleanup_discard(
     events: &mut Vec<GameEvent>,
 ) -> bool {
     for &card_id in chosen {
-        if let super::effects::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) =
+        if let super::effects::discard::DiscardOutcome::NeedsChoice(waiting_for) =
             super::effects::discard::discard_as_cost(state, card_id, player, events)
         {
-            state.waiting_for =
-                super::replacement::replacement_choice_waiting_for(choice_player, state);
+            state.waiting_for = *waiting_for;
             // Known limitation: remaining discards and damage clearing (CR 514.2)
             // are skipped when a replacement choice interrupts mid-cleanup.
             return true;
@@ -4110,6 +4109,39 @@ mod tests {
     use crate::types::zones::{EtbTapState, Zone};
     use crate::types::AbilityContinuationFrame;
     use std::sync::Arc;
+
+    #[test]
+    fn cleanup_discard_forwards_actual_delivery_prompt_and_keeps_interrupted_result() {
+        let (mut state, card, fodder) =
+            crate::game::effects::discard::non_order_discard_fixture_for_test();
+        assert!(finish_cleanup_discard(&mut state, P0, &[card], &mut vec![]));
+        assert!(
+            matches!(state.waiting_for, WaitingFor::EffectZoneChoice { player: P0, ref cards, .. } if cards.contains(&fodder) && !cards.contains(&card))
+        );
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![fodder],
+            },
+        )
+        .unwrap();
+        assert_eq!(state.objects[&fodder].zone, Zone::Graveyard);
+        let (mut complete, card, _) =
+            crate::game::effects::discard::non_order_discard_fixture_for_test();
+        complete
+            .objects
+            .get_mut(&card)
+            .unwrap()
+            .replacement_definitions
+            .clear();
+        assert!(!finish_cleanup_discard(
+            &mut complete,
+            P0,
+            &[card],
+            &mut vec![]
+        ));
+        assert_eq!(complete.objects[&card].zone, Zone::Graveyard);
+    }
 
     fn setup() -> GameState {
         let mut state = GameState::new_two_player(42);

@@ -12216,6 +12216,9 @@ mod tests {
                 source_id: ObjectId(9_300),
                 effect_kind: crate::types::ability::EffectKind::Discard,
                 paused_card: crate::types::identifiers::ObjectIncarnationRef::of(hidden, 0),
+                delivery_subtree: Some(crate::types::game_state::ReplacementSubtreeBoundary::at(
+                    &state.resolution_stack,
+                )),
                 discard_frame: None,
                 fan_out: None,
                 preceding_events: Vec::new(),

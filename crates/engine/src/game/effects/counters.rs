@@ -401,6 +401,7 @@ pub(crate) fn park_pending_counter_completion_at_child_boundary(
                 ResolutionFrame::CounterAdditions(queue),
                 child_stack_start,
             )
+            .map(|_| ())
             .expect("a counter completion must be inserted below its complete child stack"),
     }
 }

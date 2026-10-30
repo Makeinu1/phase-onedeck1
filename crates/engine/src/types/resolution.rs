@@ -1698,6 +1698,7 @@ impl ResolutionStack {
             })),
             child_stack_start,
         )
+        .map(|_| ())
     }
 
     /// Replace the exact ChangeZone owner at the captured child boundary or
@@ -2108,6 +2109,7 @@ impl ResolutionStack {
         child_stack_start: ChildStackDepth,
     ) -> Result<(), ResolutionStackError> {
         self.insert_parent_at_child_boundary(ResolutionFrame::CopyToken(pending), child_stack_start)
+            .map(|_| ())
     }
 
     /// Returns the debug-card batch owner only when it owns the stack top.
@@ -2155,6 +2157,7 @@ impl ResolutionStack {
             ResolutionFrame::DebugCardEntries(Box::new(pending)),
             child_stack_start,
         )
+        .map(|_| ())
     }
 
     /// Returns the EachPlayerCopyChosen owner only when its typed frame owns
@@ -2233,6 +2236,7 @@ impl ResolutionStack {
             ResolutionFrame::EachPlayerCopyChosen(pending),
             child_stack_start,
         )
+        .map(|_| ())
     }
 
     /// Mutably accesses only the active repeat-until owner.
@@ -3533,7 +3537,7 @@ impl ResolutionStack {
     pub fn insert_ability_continuation_outside_active_post_replacement_draw(
         &mut self,
         frame: AbilityContinuationFrame,
-    ) -> Result<(), ResolutionStackError> {
+    ) -> Result<usize, ResolutionStackError> {
         if !self.has_active_post_replacement_draw_pair() {
             return match self.last() {
                 None => Err(ResolutionStackError::NoActiveChild),
@@ -3551,11 +3555,10 @@ impl ResolutionStack {
             .frames
             .below(draw_child)
             .expect("the checked adjacent pair has a parent");
-        self.frames.insert_below(
+        Ok(self.frames.insert_below(
             post_replacement,
             ResolutionFrame::AbilityContinuation(frame),
-        );
-        Ok(())
+        ))
     }
 
     /// After the active child draw completes, makes its outer continuation the
@@ -3728,13 +3731,12 @@ impl ResolutionStack {
     pub fn insert_parent_of_active(
         &mut self,
         frame: ResolutionFrame,
-    ) -> Result<(), ResolutionStackError> {
+    ) -> Result<usize, ResolutionStackError> {
         let active = self
             .frames
             .top()
             .ok_or(ResolutionStackError::NoActiveChild)?;
-        self.frames.insert_below(active, frame);
-        Ok(())
+        Ok(self.frames.insert_below(active, frame))
     }
 
     /// The post-replacement parent of a complete paused draw pair `active`
@@ -3803,7 +3805,9 @@ impl ResolutionStack {
         let (placement, slot) = self.park_target();
         match slot {
             None => self.push_inner(frame),
-            Some(slot) => self.frames.insert_below(slot, frame),
+            Some(slot) => {
+                self.frames.insert_below(slot, frame);
+            }
         }
         placement
     }
@@ -3819,21 +3823,17 @@ impl ResolutionStack {
         &mut self,
         frame: ResolutionFrame,
         child_stack_start: ChildStackDepth,
-    ) -> Result<(), ResolutionStackError> {
+    ) -> Result<usize, ResolutionStackError> {
         let stack_len = self.frames.len();
         if stack_len == 0 {
             return Err(ResolutionStackError::NoActiveChild);
         }
-        if !self
-            .frames
+        self.frames
             .insert_at_child_boundary(child_stack_start, frame)
-        {
-            return Err(ResolutionStackError::InvalidChildBoundary {
+            .ok_or(ResolutionStackError::InvalidChildBoundary {
                 child_stack_start,
                 stack_len,
-            });
-        }
-        Ok(())
+            })
     }
 
     /// Consume exactly the active frame expected by one direct prompt handler.
@@ -7596,6 +7596,81 @@ mod tests {
     /// the pair beneath the single direct-choice owner `validate` allows above
     /// it. The second is the one a "below the top" insert gets wrong, and the
     /// last assertion measures exactly that rather than asserting it.
+    #[test]
+    fn discard_boundary_uses_the_real_outside_draw_pair_insertion_offset() {
+        use crate::types::game_state::{
+            DiscardBatchCursor, PendingDiscardBatch, PendingDiscardBatchCompletion,
+            ReplacementSubtreeBoundary,
+        };
+        let mut state = GameState::new_two_player(42);
+        let boundary = ReplacementSubtreeBoundary::at(&state.resolution_stack);
+        state.pending_discard_batch = Some(Box::new(PendingDiscardBatch {
+            player: PlayerId(0),
+            cursor: DiscardBatchCursor::All { remaining: vec![] },
+            completion: PendingDiscardBatchCompletion::Standard,
+            source_id: ObjectId(81),
+            effect_kind: EffectKind::Discard,
+            paused_card: ObjectIncarnationRef::of(ObjectId(82), 0),
+            delivery_subtree: Some(boundary),
+            discard_frame: None,
+            fan_out: None,
+            preceding_events: vec![],
+        }));
+        state
+            .resolution_stack
+            .install_adjacent_post_replacement_draw(
+                paused_post_replacement_frame(),
+                active_multi_draw_frame(),
+            )
+            .unwrap();
+        let pending = PendingContinuation::new(Box::new(resolved_draw(81)), &state);
+        state
+            .insert_ability_continuation_outside_active_post_replacement_draw(pending)
+            .unwrap();
+        assert_eq!(
+            state
+                .pending_discard_batch
+                .as_ref()
+                .unwrap()
+                .delivery_subtree
+                .unwrap()
+                .resolution_depth,
+            1
+        );
+        assert_eq!(
+            state
+                .resolution_stack
+                .iter()
+                .map(ResolutionFrame::kind)
+                .collect::<Vec<_>>(),
+            vec![
+                FrameKind::AbilityContinuation,
+                FrameKind::PostReplacement,
+                FrameKind::MultiDraw
+            ]
+        );
+        assert!(state
+            .resolution_stack
+            .has_active_post_replacement_draw_pair());
+        assert!(!state.pending_discard_batch_is_due());
+        state
+            .resolution_stack
+            .complete_adjacent_post_replacement_draw()
+            .unwrap();
+        state
+            .resolution_stack
+            .take_active_post_replacement()
+            .unwrap()
+            .unwrap();
+        assert!(state.pending_discard_batch_is_due());
+        let before = state.pending_discard_batch.clone();
+        let pending = PendingContinuation::new(Box::new(resolved_draw(81)), &state);
+        assert!(state
+            .insert_ability_continuation_outside_active_post_replacement_draw(pending)
+            .is_err());
+        assert_eq!(state.pending_discard_batch, before);
+    }
+
     #[test]
     fn parking_stays_outside_a_paused_post_replacement_draw_pair() {
         let mut pair_active = ResolutionStack::default();
