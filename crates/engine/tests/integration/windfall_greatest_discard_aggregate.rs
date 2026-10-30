@@ -795,8 +795,7 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                 if delayed {
                     let mut trigger = runner.state().objects[&observer]
                         .trigger_definitions
-                        .iter()
-                        .next()
+                        .first()
                         .expect("real observer parsed")
                         .clone();
                     trigger.execute = None;
