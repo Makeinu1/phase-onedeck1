@@ -742,7 +742,7 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                         .id(),
                 ];
                 let observer = scenario.add_real_card(P1, "Geth's Grimoire", Zone::Battlefield, db);
-                let spell = if let Some(selection) = mode.clone() {
+                let spell = if let Some(selection) = mode {
                     let ability = AbilityDefinition::new(
                         AbilityKind::Spell,
                         Effect::Discard {
@@ -855,7 +855,7 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                     );
                 }
                 let mut delivered = Vec::new();
-                for index in 0..2 {
+                for (index, expected) in fodder.iter().enumerate() {
                     if optional {
                         assert!(matches!(
                             runner.state().waiting_for,
@@ -892,7 +892,7 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                             runner.state().waiting_for
                         )
                     };
-                    assert!(cards.contains(&fodder[index]));
+                    assert!(cards.contains(expected));
                     let batch = runner
                         .state()
                         .pending_discard_batch
@@ -964,11 +964,7 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                             runner.state_mut(),
                             P0,
                             GameAction::SelectCards {
-                                cards: if index == 0 {
-                                    vec![fodder[index]]
-                                } else {
-                                    vec![]
-                                },
+                                cards: if index == 0 { vec![*expected] } else { vec![] },
                             },
                         )
                         .unwrap()
