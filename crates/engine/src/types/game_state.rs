@@ -27894,8 +27894,9 @@ pub struct PendingReplacement {
     pub sacrifice_provenance: Option<PendingSacrificeProvenance>,
     /// CR 701.9a + CR 701.9c: completion of an unperformed, no-frame discard follows its
     /// original owner and source through replacement choices and redirects.
+    /// Boxed to keep this pause-only metadata out of `GameState`'s inline stack budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub discard_provenance: Option<PendingDiscardProvenance>,
+    pub discard_provenance: Option<Box<PendingDiscardProvenance>>,
     pub candidates: Vec<ReplacementId>,
     /// CR 616.1: SearchFound choices snapshot the selected source
     /// incarnation, controller/grantee, modifier, and display data at offer
@@ -53472,13 +53473,17 @@ mod tests {
             serde_json::from_value(legacy_json).expect("legacy record loads");
         assert_eq!(legacy.discard_provenance, None);
         for source_id in [None, Some(ObjectId(99))] {
-            pending.discard_provenance = Some(PendingDiscardProvenance {
+            let provenance = PendingDiscardProvenance {
                 object_id: ObjectId(71),
                 player_id: PlayerId(1),
                 source_id,
-            });
+            };
+            pending.discard_provenance = Some(Box::new(provenance));
             let json = serde_json::to_value(&pending).expect("serialize owned discard");
-            assert!(json.get("discard_provenance").is_some());
+            assert_eq!(
+                json["discard_provenance"],
+                serde_json::to_value(provenance).expect("serialize unboxed provenance")
+            );
             let restored: PendingReplacement =
                 serde_json::from_value(json).expect("owned discard loads");
             assert_eq!(restored, pending);

@@ -13459,7 +13459,7 @@ fn continue_replacement_impl(
         let reparked_depth = pending.depth;
         let reparked_library_placement = pending.library_placement.clone();
         let reparked_sacrifice_provenance = pending.sacrifice_provenance;
-        let reparked_discard_provenance = pending.discard_provenance;
+        let reparked_discard_provenance = pending.discard_provenance.clone();
         let reparked_choice_player = pending.choice_player;
         let reparked_delivery_boundary = pending.delivery_boundary.clone();
         let reparked_unrepresentable_life_change = pending.unrepresentable_life_change;
@@ -13948,7 +13948,7 @@ pub fn continue_replacement(
     let predecessor_discard = state
         .pending_replacement
         .as_ref()
-        .and_then(|pending| pending.discard_provenance);
+        .and_then(|pending| pending.discard_provenance.as_deref().copied());
     let result = continue_replacement_impl(state, chosen_index, events);
     if matches!(result, ReplacementResult::NeedsChoice(_)) {
         if let Some(provenance) = predecessor_discard {
@@ -15779,8 +15779,9 @@ mod tests {
                     .pending_replacement
                     .as_ref()
                     .unwrap()
-                    .discard_provenance,
-                Some(provenance)
+                    .discard_provenance
+                    .as_deref(),
+                Some(&provenance)
             );
             let accepted =
                 apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 }).unwrap();
@@ -15811,7 +15812,10 @@ mod tests {
                     panic!("the same outer replacement must be retained in the cost resume");
                 };
                 assert_eq!(outer_record.proposed.affected_object_id(), Some(outer));
-                assert_eq!(outer_record.discard_provenance, Some(provenance));
+                assert_eq!(
+                    outer_record.discard_provenance.as_deref(),
+                    Some(&provenance)
+                );
                 assert!(outer_record.may_cost_paid);
             } else {
                 assert!(matches!(
@@ -15823,7 +15827,10 @@ mod tests {
                     .as_ref()
                     .expect("unboxed outer record remains installed");
                 assert_eq!(outer_record.proposed.affected_object_id(), Some(outer));
-                assert_eq!(outer_record.discard_provenance, Some(provenance));
+                assert_eq!(
+                    outer_record.discard_provenance.as_deref(),
+                    Some(&provenance)
+                );
                 assert!(outer_record.may_cost_paid);
             }
             let response = if boxed {

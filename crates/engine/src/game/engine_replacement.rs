@@ -477,7 +477,7 @@ fn handle_replacement_choice_inner(
     let parked_discard_provenance = state
         .pending_replacement
         .as_ref()
-        .and_then(|pending| pending.discard_provenance);
+        .and_then(|pending| pending.discard_provenance.as_deref().copied());
     // CR 122.1 + CR 616.1f: the object whose counter placement this resume answers.
     // Captured here, with the file's other `parked_*` reads, because
     // `continue_replacement` below consumes the pending record. The Execute arm's

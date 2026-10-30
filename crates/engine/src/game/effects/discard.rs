@@ -53,7 +53,7 @@ pub(crate) fn retain_pending_discard(state: &mut GameState, provenance: PendingD
             _ => false,
         };
         if same_discard && pending.discard_provenance.is_none() {
-            pending.discard_provenance = Some(provenance);
+            pending.discard_provenance = Some(Box::new(provenance));
         }
     }
 }
@@ -2584,8 +2584,9 @@ mod tests {
                 .pending_replacement
                 .as_ref()
                 .unwrap()
-                .discard_provenance,
-            Some(provenance)
+                .discard_provenance
+                .as_deref(),
+            Some(&provenance)
         );
         let declined =
             apply_as_current(&mut state, GameAction::ChooseReplacement { index: 1 }).unwrap();
@@ -2603,7 +2604,7 @@ mod tests {
             !pending.is_optional,
             "the first inner prompt orders distinct replacements"
         );
-        assert_eq!(pending.discard_provenance, Some(provenance));
+        assert_eq!(pending.discard_provenance.as_deref(), Some(&provenance));
         let exile_index = pending
             .candidates
             .iter()
@@ -2621,7 +2622,7 @@ mod tests {
         let pending = state.pending_replacement.as_ref().unwrap();
         assert!(pending.is_optional);
         assert_eq!(pending.candidates[0].source, exile);
-        assert_eq!(pending.discard_provenance, Some(provenance));
+        assert_eq!(pending.discard_provenance.as_deref(), Some(&provenance));
         assert_eq!(state.objects[&card].zone, Zone::Hand);
         assert_eq!(
             state.cards_discarded_this_turn_by_player.get(&PlayerId(0)),
