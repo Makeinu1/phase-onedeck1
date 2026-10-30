@@ -24,6 +24,7 @@
 use engine::game::engine::apply;
 use engine::game::game_object::ObjectIncarnationRefExt;
 use engine::game::scenario::{GameRunner, GameScenario, Outcome, P0, P1};
+use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::ability::{
     AbilityDefinition, AbilityKind, Effect, FilterProp, QuantityExpr, QuantityModification,
     ReplacementDefinition, ReplacementMode, ResolvedAbility, TargetFilter, TargetRef, TypedFilter,
@@ -667,12 +668,15 @@ fn hand_to_battlefield_with_two_counters(event: ReplacementEvent) -> Replacement
 }
 
 fn assert_windfall_draws_after_counter_pause(accept_redirect: Option<bool>, prevent_counter: bool) {
+    let db = crate::support::shared_card_db()
+        .expect("discard observer regression requires the committed card fixture");
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     for player in [P0, P1] {
         seed_library(&mut scenario, player, LIBRARY_DEPTH);
     }
     let card = scenario.add_card_to_hand(P0, "Counter redirect fixture");
+    let grimoire = scenario.add_real_card(P1, "Geth's Grimoire", Zone::Battlefield, db);
     let windfall = scenario
         .add_spell_to_hand_from_oracle(P0, "Windfall", false, WINDFALL)
         .with_mana_cost(ManaCost::zero())
@@ -788,6 +792,19 @@ fn assert_windfall_draws_after_counter_pause(accept_redirect: Option<bool>, prev
         1,
         "the completed discard must remain in its batch's result window across the counter pause"
     );
+    assert!(
+        runner.state().stack.is_empty(),
+        "observer cannot be placed during resolution"
+    );
+    assert_eq!(
+        runner
+            .state()
+            .deferred_triggers
+            .iter()
+            .filter(|context| context.pending.source_id == grimoire)
+            .count(),
+        1
+    );
 
     let completed = apply(
         runner.state_mut(),
@@ -799,7 +816,13 @@ fn assert_windfall_draws_after_counter_pause(accept_redirect: Option<bool>, prev
     .expect("answer the post-discard counter replacement");
     assert!(matches!(completed.waiting_for, WaitingFor::Priority { .. }));
     assert_eq!(runner.state().objects[&windfall].zone, Zone::Graveyard);
-    assert!(runner.state().stack.is_empty());
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "one observer from the original discard"
+    );
+    assert_eq!(runner.state().stack[0].source_id, grimoire);
+    assert_eq!(runner.state().stack[0].controller, P1);
     assert!(runner.state().resolution_stack.is_empty());
     assert!(runner.state().pending_discard_batch.is_none());
     // CR 608.2i: "discarded this way" reads the completed discard across the counter pause.

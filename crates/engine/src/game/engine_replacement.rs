@@ -620,6 +620,9 @@ fn handle_replacement_choice_inner(
                                 }
                             }
                             retain_paused_discard_batch_events(state, &events[delivery_start..]);
+                            super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
+                                state, events, replacement_action_event_start,
+                            );
                             return Ok(state.waiting_for.clone());
                         }
                     }
@@ -1021,7 +1024,7 @@ fn handle_replacement_choice_inner(
                     ..
                 } => {
                     let delivery_start = events.len();
-                    if let effects::discard::DiscardOutcome::NeedsReplacementChoice(player) =
+                    if let effects::discard::DiscardOutcome::NeedsChoice(player) =
                         effects::discard::complete_discard_to_graveyard(
                             state,
                             object_id,
@@ -1032,9 +1035,13 @@ fn handle_replacement_choice_inner(
                             events,
                         )
                     {
-                        state.waiting_for =
-                            crate::game::replacement::replacement_choice_waiting_for(player, state);
+                        state.waiting_for = *player;
                         retain_paused_discard_batch_events(state, &events[delivery_start..]);
+                        super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
+                            state,
+                            events,
+                            replacement_action_event_start,
+                        );
                         return Ok(state.waiting_for.clone());
                     }
                 }
@@ -1642,6 +1649,17 @@ fn handle_replacement_choice_inner(
                 waiting_for = state.waiting_for.clone();
             }
 
+            if !matches!(waiting_for, WaitingFor::Priority { .. }) {
+                retain_paused_discard_batch_events(
+                    state,
+                    &events[replacement_action_event_start..],
+                );
+                super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
+                    state,
+                    events,
+                    replacement_action_event_start,
+                );
+            }
             Ok(waiting_for)
         }
         super::replacement::ReplacementResult::NeedsChoice(player) => {

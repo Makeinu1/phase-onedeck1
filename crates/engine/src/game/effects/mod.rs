@@ -20018,7 +20018,7 @@ pub(crate) fn drain_pending_discard_batch(
         DiscardBatchCursor::All { remaining } => {
             for (i, obj_id) in remaining.iter().enumerate() {
                 let paused_card = discard::pin_paused_occurrence(state, *obj_id);
-                if let discard::DiscardOutcome::NeedsReplacementChoice(chooser) =
+                if let discard::DiscardOutcome::NeedsChoice(waiting_for) =
                     discard::discard_caused_by_effect_with_source_and_frame(
                         state,
                         *obj_id,
@@ -20035,7 +20035,8 @@ pub(crate) fn drain_pending_discard_batch(
                     // the `Random` arm below already receives from
                     // `discard_at_random`.
                     batch.paused_card = paused_card;
-                    repark_discard_batch(state, batch, events, chooser);
+                    state.waiting_for = *waiting_for;
+                    repark_discard_batch(state, batch, events);
                     return Ok(PendingDiscardBatchOutcome::PausedForReplacement);
                 }
             }
@@ -20045,7 +20046,6 @@ pub(crate) fn drain_pending_discard_batch(
                 remaining_eligible,
                 remaining_count,
                 paused_card,
-                chooser,
                 ..
             } = discard::discard_at_random(
                 state,
@@ -20064,14 +20064,8 @@ pub(crate) fn drain_pending_discard_batch(
                     remaining: remaining_count,
                 };
                 batch.paused_card = paused_card;
-                // The chooser comes from the authority that raised the choice,
-                // exactly as the `All` arm above threads its own.
-                // It was `batch.player` here, which happens to agree today
-                // because a hand card's `affected_player` is its controller —
-                // but `replacement_choice_player`'s commander carve-out proves
-                // the engine already has cases where chooser != affected seat,
-                // and re-deriving at the call site is how those drift.
-                repark_discard_batch(state, batch, events, chooser);
+                // Random discard already installed the actual delivery prompt.
+                repark_discard_batch(state, batch, events);
                 return Ok(PendingDiscardBatchOutcome::PausedForReplacement);
             }
         }
@@ -20084,7 +20078,7 @@ pub(crate) fn drain_pending_discard_batch(
                     continue;
                 }
                 let player = state.objects[&card.object_id].owner;
-                if let discard::DiscardOutcome::NeedsReplacementChoice(chooser) =
+                if let discard::DiscardOutcome::NeedsChoice(waiting_for) =
                     discard::discard_caused_by_effect_with_source_and_frame(
                         state,
                         card.object_id,
@@ -20099,7 +20093,8 @@ pub(crate) fn drain_pending_discard_batch(
                     };
                     batch.player = player;
                     batch.paused_card = *card;
-                    repark_discard_batch(state, batch, events, chooser);
+                    state.waiting_for = *waiting_for;
+                    repark_discard_batch(state, batch, events);
                     return Ok(PendingDiscardBatchOutcome::PausedForReplacement);
                 }
             }
@@ -20304,13 +20299,11 @@ fn repark_discard_batch(
     state: &mut GameState,
     mut batch: Box<crate::types::game_state::PendingDiscardBatch>,
     events: &[GameEvent],
-    chooser: PlayerId,
 ) {
     let mut window = std::mem::take(&mut batch.preceding_events);
     window.extend_from_slice(events);
     batch.preceding_events = window;
     state.pending_discard_batch = Some(batch);
-    state.waiting_for = crate::game::replacement::replacement_choice_waiting_for(chooser, state);
 }
 
 /// Stamp the terminal `Discarded` for the card whose replacement just resolved,

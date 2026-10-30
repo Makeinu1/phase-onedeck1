@@ -15766,7 +15766,7 @@ mod tests {
                     Some(source),
                     &mut events
                 ),
-                DiscardOutcome::NeedsReplacementChoice(_)
+                DiscardOutcome::NeedsChoice(_)
             ));
             state.waiting_for = replacement_choice_waiting_for(PlayerId(0), &state);
             let provenance = PendingDiscardProvenance {

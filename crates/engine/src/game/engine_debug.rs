@@ -983,11 +983,15 @@ fn apply_debug_discard(
             )?;
             state.waiting_for = waiting_for;
         }
-        super::effects::discard::DiscardOutcome::NeedsReplacementChoice(chooser) => {
-            // CR 616.1: the parked choice owns the rest of the discard; the
-            // replacement-choice resume and the reducer's post-action
-            // pipeline own its triggers and state-based actions.
-            state.waiting_for = super::replacement::replacement_choice_waiting_for(chooser, state);
+        super::effects::discard::DiscardOutcome::NeedsChoice(waiting_for) => {
+            // CR 603.2 + CR 603.3: a completed discard triggers now, while
+            // placement waits for the delivery's actual choice to settle.
+            state.waiting_for = *waiting_for;
+            super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
+                state,
+                events,
+                event_start,
+            );
         }
     }
     Ok(())

@@ -1350,8 +1350,8 @@ fn pay_ability_cost_inner(
             ..
         } => match super::effects::discard::discard_as_cost(state, source_id, player, events) {
             super::effects::discard::DiscardOutcome::Complete => {}
-            super::effects::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) => {
-                pause_cost_payment_for_replacement_choice(state, choice_player);
+            super::effects::discard::DiscardOutcome::NeedsChoice(choice_player) => {
+                state.waiting_for = *choice_player;
                 return Ok(PaymentOutcome::Paused {
                     remaining_cost: None,
                 });
@@ -1445,11 +1445,11 @@ fn pay_ability_cost_inner(
             // classifier fact.
             if eligible.len() == count {
                 for card_id in eligible {
-                    if let super::effects::discard::DiscardOutcome::NeedsReplacementChoice(
+                    if let super::effects::discard::DiscardOutcome::NeedsChoice(
                         choice_player,
                     ) = super::effects::discard::discard_as_cost(state, card_id, player, events)
                     {
-                        pause_cost_payment_for_replacement_choice(state, choice_player);
+                        state.waiting_for = *choice_player;
                         return Ok(PaymentOutcome::Paused {
                             remaining_cost: None,
                         });

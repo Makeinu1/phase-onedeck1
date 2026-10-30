@@ -1050,6 +1050,20 @@ pub(crate) fn defer_observer_triggers_for_paused_choice(
     if !trigger_events.is_empty() {
         super::triggers::collect_triggers_into_deferred(state, &trigger_events);
     }
+    super::triggers::claim_events_for_ordinary_collection(state, &events[..owned.end], owned.start);
+    // CR 603.2 + CR 603.3: delayed observers share this pause boundary, but
+    // ordinary-only ownership claims must not hide their event occurrences.
+    let delayed_events = super::triggers::unclaimed_trigger_events_from(
+        &events[..owned.end],
+        owned.start,
+        super::triggers::TriggerCollectionRequester::Delayed,
+        &state.consumed_before_priority_trigger_events,
+    );
+    super::triggers::collect_unclaimed_delayed_triggers_into_deferred(
+        state,
+        &events[..owned.end],
+        &delayed_events,
+    );
 }
 
 /// CR 603.2 + CR 603.3b + CR 701.23: after a search tutor's put/shuffle
@@ -3435,7 +3449,7 @@ pub(super) fn handle_resolution_choice(
                             "Selected card not in hand".to_string(),
                         ));
                     }
-                    if let effects::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) =
+                    if let effects::discard::DiscardOutcome::NeedsChoice(choice_player) =
                         effects::discard::discard_caused_by_effect_with_source(
                             state, card_id, player, None, events,
                         )
@@ -3462,10 +3476,7 @@ pub(super) fn handle_resolution_choice(
                             source_id: ObjectId(0),
                             subject: None,
                         });
-                        state.waiting_for = super::replacement::replacement_choice_waiting_for(
-                            choice_player,
-                            state,
-                        );
+                        state.waiting_for = *choice_player;
                         return Ok(action_result_outcome(events, state.waiting_for.clone()));
                     }
                     let draw_ability = ResolvedAbility::new(
@@ -6278,7 +6289,7 @@ pub(super) fn handle_resolution_choice(
             let events_before_effect = events.len();
             for (index, &card_id) in chosen.iter().enumerate() {
                 let paused_card = chosen_refs[index];
-                if let effects::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) =
+                if let effects::discard::DiscardOutcome::NeedsChoice(choice_player) =
                     effects::discard::discard_caused_by_effect_with_source_and_frame(
                         state,
                         card_id,
@@ -6288,8 +6299,7 @@ pub(super) fn handle_resolution_choice(
                         events,
                     )
                 {
-                    state.waiting_for =
-                        super::replacement::replacement_choice_waiting_for(choice_player, state);
+                    state.waiting_for = *choice_player;
                     state.pending_discard_batch = Some(Box::new(
                         crate::types::game_state::PendingDiscardBatch {
                             player,

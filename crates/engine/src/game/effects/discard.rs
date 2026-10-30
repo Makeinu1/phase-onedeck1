@@ -12,7 +12,7 @@ use crate::types::ability::{
     TargetRef,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::{GameState, PendingDiscardProvenance};
+use crate::types::game_state::{GameState, PendingDiscardProvenance, WaitingFor};
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef, LEGACY_INCARNATION};
 use crate::types::player::PlayerId;
 use crate::types::proposed_event::{AppliedReplacementKey, ProposedEvent};
@@ -22,9 +22,9 @@ use crate::types::zones::Zone;
 pub(crate) enum DiscardOutcome {
     /// Discard completed (normally or via replacement redirect).
     Complete,
-    /// A replacement effect requires player choice before discard can proceed.
-    /// Callers must handle this by surfacing the replacement choice to the player.
-    NeedsReplacementChoice(PlayerId),
+    /// The replacement pipeline or delivery raised this exact new prompt.
+    /// Carry it past the caller's old discard/payment prompt without rebuilding it.
+    NeedsChoice(Box<WaitingFor>),
 }
 
 /// CR 701.9a + CR 616.1f: only the same unperformed discard owns this completion.
@@ -173,11 +173,11 @@ pub(crate) fn complete_discard_to_graveyard(
             {
                 record_completed_discard(state, provenance, events);
             }
-            if let change_zone::ZoneDeliveryResult::NeedsChoice(player) = delivery {
+            if let change_zone::ZoneDeliveryResult::NeedsChoice(_) = delivery {
                 if discard_frame.is_none() {
                     retain_pending_discard(state, provenance);
                 }
-                return DiscardOutcome::NeedsReplacementChoice(player);
+                return DiscardOutcome::NeedsChoice(Box::new(state.waiting_for.clone()));
             }
         }
         ReplacementResult::Prevented => {
@@ -199,7 +199,9 @@ pub(crate) fn complete_discard_to_graveyard(
             if discard_frame.is_none() && was_in_hand {
                 retain_pending_discard(state, provenance);
             }
-            return DiscardOutcome::NeedsReplacementChoice(player);
+            return DiscardOutcome::NeedsChoice(Box::new(
+                replacement::replacement_choice_waiting_for(player, state),
+            ));
         }
     }
     DiscardOutcome::Complete
@@ -543,7 +545,7 @@ pub fn resolve(
                             applied,
                             ..
                         } => {
-                            if let DiscardOutcome::NeedsReplacementChoice(player) =
+                            if let DiscardOutcome::NeedsChoice(waiting_for) =
                                 complete_discard_to_graveyard(
                                     state,
                                     oid,
@@ -554,10 +556,7 @@ pub fn resolve(
                                     events,
                                 )
                             {
-                                state.waiting_for =
-                                    crate::game::replacement::replacement_choice_waiting_for(
-                                        player, state,
-                                    );
+                                state.waiting_for = *waiting_for;
                                 park_discard_batch(
                                     state,
                                     player_id,
@@ -802,7 +801,7 @@ pub fn resolve(
             // When up_to=true, always present the choice (player may discard fewer).
             for (i, obj_id) in hand_cards.iter().enumerate() {
                 let paused_card = pin_paused_occurrence(state, *obj_id);
-                if let DiscardOutcome::NeedsReplacementChoice(player) =
+                if let DiscardOutcome::NeedsChoice(waiting_for) =
                     discard_caused_by_effect_with_source_and_frame(
                         state,
                         *obj_id,
@@ -812,8 +811,7 @@ pub fn resolve(
                         events,
                     )
                 {
-                    state.waiting_for =
-                        crate::game::replacement::replacement_choice_waiting_for(player, state);
+                    state.waiting_for = *waiting_for;
                     // CR 614.1 + CR 701.9a: park the un-iterated tail instead of
                     // abandoning it. `hand_cards[i + 1..]` and not `[i..]`: the
                     // paused card is settled by the replacement itself, exactly
@@ -1011,9 +1009,8 @@ pub(crate) enum RandomDiscardOutcome {
         /// `replacement_choice_player`, where the choice belongs to a seat other
         /// than the affected one. A re-parking caller that assumed
         /// `request.player` would prompt the wrong seat the moment such a case
-        /// reaches a random discard. Mirrors the `chooser` the single-card
-        /// `DiscardOutcome::NeedsReplacementChoice` already carries,
-        /// so both cursor arms read one contract.
+        /// reaches a random discard. Read from the exact newly raised prompt,
+        /// which this authority installs before returning the cursor.
         chooser: PlayerId,
     },
 }
@@ -1107,9 +1104,11 @@ pub(crate) fn discard_at_random(
                 events,
             ),
         };
-        if let DiscardOutcome::NeedsReplacementChoice(chooser) = outcome {
-            state.waiting_for =
-                crate::game::replacement::replacement_choice_waiting_for(chooser, state);
+        if let DiscardOutcome::NeedsChoice(waiting_for) = outcome {
+            let chooser = waiting_for
+                .acting_player()
+                .expect("a discard delivery prompt has a chooser");
+            state.waiting_for = *waiting_for;
             return RandomDiscardOutcome::NeedsReplacementChoice {
                 completed_picks: picks,
                 remaining_eligible: remaining,
@@ -1221,18 +1220,16 @@ fn route_discard(
                 applied,
                 ..
             } => {
-                if let DiscardOutcome::NeedsReplacementChoice(choice_player) =
-                    complete_discard_to_graveyard(
-                        state,
-                        oid,
-                        pid,
-                        source_id,
-                        discard_frame,
-                        applied,
-                        events,
-                    )
-                {
-                    return DiscardOutcome::NeedsReplacementChoice(choice_player);
+                if let DiscardOutcome::NeedsChoice(choice_player) = complete_discard_to_graveyard(
+                    state,
+                    oid,
+                    pid,
+                    source_id,
+                    discard_frame,
+                    applied,
+                    events,
+                ) {
+                    return DiscardOutcome::NeedsChoice(choice_player);
                 }
             }
             zone_event @ ProposedEvent::ZoneChange {
@@ -1277,11 +1274,11 @@ fn route_discard(
                 {
                     record_completed_discard(state, provenance, events);
                 }
-                if let change_zone::ZoneDeliveryResult::NeedsChoice(choice_player) = delivery {
+                if let change_zone::ZoneDeliveryResult::NeedsChoice(_) = delivery {
                     if discard_frame.is_none() && was_in_hand {
                         retain_pending_discard(state, provenance);
                     }
-                    return DiscardOutcome::NeedsReplacementChoice(choice_player);
+                    return DiscardOutcome::NeedsChoice(Box::new(state.waiting_for.clone()));
                 }
             }
             _ => {}
@@ -1291,7 +1288,9 @@ fn route_discard(
             // This is extremely rare during cost payment. The card stays in hand.
         }
         ReplacementResult::NeedsChoice(choice_player) => {
-            return DiscardOutcome::NeedsReplacementChoice(choice_player);
+            return DiscardOutcome::NeedsChoice(Box::new(
+                replacement::replacement_choice_waiting_for(choice_player, state),
+            ));
         }
     }
     DiscardOutcome::Complete
@@ -2350,126 +2349,192 @@ mod tests {
             (ReplacementEvent::Moved, false, false),
             (ReplacementEvent::Discard, false, true),
         ] {
-            for prevent_counter in [false, true] {
-                let mut state = GameState::new_two_player(42);
-                state.phase = crate::types::phase::Phase::PreCombatMain;
-                state.debug_mode = true;
-                let card = create_object(
-                    &mut state,
-                    CardId(1),
-                    PlayerId(0),
-                    "Redirect fixture".into(),
-                    Zone::Hand,
-                );
-                let source = create_object(
-                    &mut state,
-                    CardId(2),
-                    PlayerId(1),
-                    "Discard source".into(),
-                    Zone::Battlefield,
-                );
-                let mut redirect = discard_to_battlefield_with_two_counters_replacement();
-                redirect.event = event.clone();
-                redirect.condition = None;
-                // This typed fixture also exercises a hand-origin Moved redirect.
-                redirect.active_zones = vec![Zone::Hand];
-                if optional {
-                    redirect.mode = ReplacementMode::Optional { decline: None };
-                }
-                let object = state.objects.get_mut(&card).unwrap();
-                object.card_types.core_types.push(CoreType::Artifact);
-                object.replacement_definitions.push(redirect);
-                object.replacement_definitions.push(
-                    ReplacementDefinition::new(ReplacementEvent::AddCounter)
-                        .valid_card(TargetFilter::SelfRef)
-                        .mode(ReplacementMode::Optional { decline: None })
-                        .quantity_modification(QuantityModification::Prevent),
-                );
-                let before = state
-                    .cards_discarded_this_turn_by_player
-                    .get(&PlayerId(0))
-                    .copied()
-                    .unwrap_or(0);
-                let mut events = if targeted {
-                    let ability = ResolvedAbility::new(
-                        Effect::DiscardCard {
-                            count: 1,
-                            target: TargetFilter::ParentTarget,
-                        },
-                        vec![TargetRef::Object(card)],
-                        source,
-                        PlayerId(1),
-                    );
-                    let mut events = Vec::new();
-                    resolve(&mut state, &ability, &mut events).unwrap();
-                    events
-                } else {
-                    apply_as_current(
+            for delayed in [false, true] {
+                for prevent_counter in [false, true] {
+                    let mut state = GameState::new_two_player(42);
+                    state.phase = crate::types::phase::Phase::PreCombatMain;
+                    state.debug_mode = true;
+                    let card = create_object(
                         &mut state,
-                        GameAction::Debug(DebugAction::Discard { object_id: card }),
-                    )
-                    .unwrap()
-                    .events
-                };
-                if optional {
+                        CardId(1),
+                        PlayerId(0),
+                        "Redirect fixture".into(),
+                        Zone::Hand,
+                    );
+                    let source = create_object(
+                        &mut state,
+                        CardId(2),
+                        PlayerId(1),
+                        "Discard source".into(),
+                        Zone::Battlefield,
+                    );
+                    let mut redirect = discard_to_battlefield_with_two_counters_replacement();
+                    redirect.event = event.clone();
+                    redirect.condition = None;
+                    // This typed fixture also exercises a hand-origin Moved redirect.
+                    redirect.active_zones = vec![Zone::Hand];
+                    if optional {
+                        redirect.mode = ReplacementMode::Optional { decline: None };
+                    }
+                    let object = state.objects.get_mut(&card).unwrap();
+                    object.card_types.core_types.push(CoreType::Artifact);
+                    object.replacement_definitions.push(redirect);
+                    object.replacement_definitions.push(
+                        ReplacementDefinition::new(ReplacementEvent::AddCounter)
+                            .valid_card(TargetFilter::SelfRef)
+                            .mode(ReplacementMode::Optional { decline: None })
+                            .quantity_modification(QuantityModification::Prevent),
+                    );
+                    let grimoire = create_object(
+                        &mut state,
+                        CardId(3),
+                        PlayerId(1),
+                        "Geth's Grimoire".into(),
+                        Zone::Battlefield,
+                    );
+                    let mut observer = crate::parser::oracle_trigger::parse_trigger_line(
+                        "Whenever an opponent discards a card, you may draw a card.",
+                        "Geth's Grimoire",
+                    );
+                    if delayed {
+                        observer.execute = None;
+                        crate::game::triggers::install_delayed_trigger(
+                            &mut state,
+                            crate::types::game_state::DelayedTrigger::new(
+                                crate::types::ability::DelayedTriggerCondition::WhenNextEvent {
+                                    trigger: Box::new(observer),
+                                    or_trigger: None,
+                                    lifetime: Default::default(),
+                                },
+                                Box::new(ResolvedAbility::new(
+                                    Effect::Draw {
+                                        count: crate::types::ability::QuantityExpr::Fixed {
+                                            value: 1,
+                                        },
+                                        target: TargetFilter::Controller,
+                                    },
+                                    vec![],
+                                    grimoire,
+                                    PlayerId(1),
+                                )),
+                                PlayerId(1),
+                                grimoire,
+                                true,
+                            ),
+                            &mut Vec::new(),
+                        );
+                    } else {
+                        state
+                            .objects
+                            .get_mut(&grimoire)
+                            .unwrap()
+                            .trigger_definitions
+                            .push(observer);
+                    }
+                    let before = state
+                        .cards_discarded_this_turn_by_player
+                        .get(&PlayerId(0))
+                        .copied()
+                        .unwrap_or(0);
+                    let mut events = if targeted {
+                        let ability = ResolvedAbility::new(
+                            Effect::DiscardCard {
+                                count: 1,
+                                target: TargetFilter::ParentTarget,
+                            },
+                            vec![TargetRef::Object(card)],
+                            source,
+                            PlayerId(1),
+                        );
+                        let mut events = Vec::new();
+                        resolve(&mut state, &ability, &mut events).unwrap();
+                        events
+                    } else {
+                        apply_as_current(
+                            &mut state,
+                            GameAction::Debug(DebugAction::Discard { object_id: card }),
+                        )
+                        .unwrap()
+                        .events
+                    };
+                    if optional {
+                        assert!(matches!(
+                            state.waiting_for,
+                            WaitingFor::ReplacementChoice { .. }
+                        ));
+                        assert_eq!(state.objects[&card].zone, Zone::Hand);
+                        assert!(!events
+                            .iter()
+                            .any(|event| matches!(event, GameEvent::Discarded { .. })));
+                        events.extend(
+                            apply_as_current(
+                                &mut state,
+                                GameAction::ChooseReplacement { index: 0 },
+                            )
+                            .unwrap()
+                            .events,
+                        );
+                    }
+                    // CR 701.9a + CR 701.9c: counters may pause after the actual discard already happened.
+                    assert_eq!(state.objects[&card].zone, Zone::Battlefield);
                     assert!(matches!(
                         state.waiting_for,
                         WaitingFor::ReplacementChoice { .. }
                     ));
-                    assert_eq!(state.objects[&card].zone, Zone::Hand);
-                    assert!(!events
+                    let pending = state
+                        .pending_replacement
+                        .as_ref()
+                        .expect("counter prompt is live");
+                    assert!(matches!(pending.proposed, ProposedEvent::AddCounter { .. }));
+                    assert_eq!(
+                        pending.discard_provenance, None,
+                        "completed discard cannot belong to AddCounter"
+                    );
+                    assert_eq!(
+                        state.cards_discarded_this_turn_by_player[&PlayerId(0)],
+                        before + 1
+                    );
+                    assert_eq!(events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id } if *object_id == card && *source_id == targeted.then_some(source))).count(), 1);
+                    assert!(
+                        state.stack.is_empty(),
+                        "observers wait for the counter answer"
+                    );
+                    assert_eq!(
+                        state
+                            .deferred_triggers
+                            .iter()
+                            .filter(|context| context.pending.source_id == grimoire)
+                            .count(),
+                        1
+                    );
+                    let response = apply_as_current(
+                        &mut state,
+                        GameAction::ChooseReplacement {
+                            index: usize::from(!prevent_counter),
+                        },
+                    )
+                    .unwrap();
+                    assert!(matches!(response.waiting_for, WaitingFor::Priority { .. }));
+                    assert_eq!(
+                        state.objects[&card]
+                            .counters
+                            .get(&CounterType::Plus1Plus1)
+                            .copied()
+                            .unwrap_or(0),
+                        if prevent_counter { 0 } else { 2 }
+                    );
+                    assert_eq!(
+                        state.cards_discarded_this_turn_by_player[&PlayerId(0)],
+                        before + 1
+                    );
+                    assert!(!response
+                        .events
                         .iter()
                         .any(|event| matches!(event, GameEvent::Discarded { .. })));
-                    events.extend(
-                        apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 })
-                            .unwrap()
-                            .events,
-                    );
+                    assert_eq!(state.stack.len(), 1, "one eventual discard observer");
+                    assert_eq!(state.stack[0].source_id, grimoire);
+                    assert_eq!(state.stack[0].controller, PlayerId(1));
                 }
-                // CR 701.9a + CR 701.9c: counters may pause after the actual discard already happened.
-                assert_eq!(state.objects[&card].zone, Zone::Battlefield);
-                assert!(matches!(
-                    state.waiting_for,
-                    WaitingFor::ReplacementChoice { .. }
-                ));
-                let pending = state
-                    .pending_replacement
-                    .as_ref()
-                    .expect("counter prompt is live");
-                assert!(matches!(pending.proposed, ProposedEvent::AddCounter { .. }));
-                assert_eq!(
-                    pending.discard_provenance, None,
-                    "completed discard cannot belong to AddCounter"
-                );
-                assert_eq!(
-                    state.cards_discarded_this_turn_by_player[&PlayerId(0)],
-                    before + 1
-                );
-                assert_eq!(events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id } if *object_id == card && *source_id == targeted.then_some(source))).count(), 1);
-                let response = apply_as_current(
-                    &mut state,
-                    GameAction::ChooseReplacement {
-                        index: usize::from(!prevent_counter),
-                    },
-                )
-                .unwrap();
-                assert!(matches!(response.waiting_for, WaitingFor::Priority { .. }));
-                assert_eq!(
-                    state.objects[&card]
-                        .counters
-                        .get(&CounterType::Plus1Plus1)
-                        .copied()
-                        .unwrap_or(0),
-                    if prevent_counter { 0 } else { 2 }
-                );
-                assert_eq!(
-                    state.cards_discarded_this_turn_by_player[&PlayerId(0)],
-                    before + 1
-                );
-                assert!(!response
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, GameEvent::Discarded { .. })));
             }
         }
     }
@@ -2670,7 +2735,7 @@ mod tests {
         let mut events = Vec::new();
         assert!(matches!(
             discard_caused_by_effect_with_source(&mut state, card, PlayerId(0), None, &mut events),
-            DiscardOutcome::NeedsReplacementChoice(_)
+            DiscardOutcome::NeedsChoice(_)
         ));
         assert!(state
             .pending_replacement
@@ -2755,7 +2820,7 @@ mod tests {
                 Some(frame),
                 &mut events
             ),
-            DiscardOutcome::NeedsReplacementChoice(_)
+            DiscardOutcome::NeedsChoice(_)
         ));
         assert_eq!(
             state
@@ -2827,7 +2892,8 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            DiscardOutcome::NeedsReplacementChoice(PlayerId(0))
+            DiscardOutcome::NeedsChoice(waiting_for)
+                if matches!(*waiting_for, WaitingFor::ReplacementChoice { player: PlayerId(0), .. })
         ));
         assert!(state.players[0].hand.contains(&card));
         assert!(!state.players[0].graveyard.contains(&card));

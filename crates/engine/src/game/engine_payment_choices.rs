@@ -2364,7 +2364,7 @@ pub(super) fn handle_ward_discard_choice(
         ));
     }
 
-    if let effects::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) =
+    if let effects::discard::DiscardOutcome::NeedsChoice(choice_player) =
         effects::discard::complete_discard_to_graveyard(
             state,
             chosen[0],
@@ -2375,8 +2375,7 @@ pub(super) fn handle_ward_discard_choice(
             events,
         )
     {
-        state.waiting_for =
-            crate::game::replacement::replacement_choice_waiting_for(choice_player, state);
+        state.waiting_for = *choice_player;
         return Ok(state.waiting_for.clone());
     }
 

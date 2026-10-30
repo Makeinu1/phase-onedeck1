@@ -4643,7 +4643,9 @@ where
                     state, source_id, player, events,
                 ) {
                     crate::game::effects::discard::DiscardOutcome::Complete => {}
-                    crate::game::effects::discard::DiscardOutcome::NeedsReplacementChoice(_) => {}
+                    crate::game::effects::discard::DiscardOutcome::NeedsChoice(waiting_for) => {
+                        state.waiting_for = *waiting_for;
+                    }
                 }
             } else {
                 let resolved = super::quantity::resolve_quantity(state, count, player, source_id)
@@ -5977,7 +5979,10 @@ fn discard_selected_card_for_mana_cost(
     }
     match crate::game::effects::discard::discard_as_cost(state, chosen_id, player, events) {
         crate::game::effects::discard::DiscardOutcome::Complete => Ok(()),
-        crate::game::effects::discard::DiscardOutcome::NeedsReplacementChoice(_) => Ok(()),
+        crate::game::effects::discard::DiscardOutcome::NeedsChoice(waiting_for) => {
+            state.waiting_for = *waiting_for;
+            Ok(())
+        }
     }
 }
 
