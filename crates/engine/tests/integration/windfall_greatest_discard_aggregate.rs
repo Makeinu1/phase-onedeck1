@@ -797,6 +797,7 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                         .trigger_definitions
                         .first()
                         .expect("real observer parsed")
+                        .definition
                         .clone();
                     trigger.execute = None;
                     runner
