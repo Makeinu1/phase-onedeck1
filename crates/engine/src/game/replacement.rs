@@ -11922,6 +11922,7 @@ fn park_entry_controller_choice(
     state.pending_replacement = Some(PendingReplacement {
         proposed,
         sacrifice_provenance: None,
+        discard_provenance: None,
         candidates: vec![rid],
         search_found_candidates: Vec::new(),
         depth,
@@ -12096,6 +12097,7 @@ fn park_as_enters_named_choice(
     state.pending_replacement = Some(PendingReplacement {
         proposed,
         sacrifice_provenance: None,
+        discard_provenance: None,
         candidates: vec![rid],
         search_found_candidates: Vec::new(),
         depth,
@@ -12306,6 +12308,7 @@ fn park_as_enters_pay_choice(
     state.pending_replacement = Some(PendingReplacement {
         proposed,
         sacrifice_provenance: None,
+        discard_provenance: None,
         candidates: vec![rid],
         search_found_candidates: Vec::new(),
         depth,
@@ -13052,6 +13055,7 @@ fn pipeline_loop(
                 state.pending_replacement = Some(PendingReplacement {
                     proposed,
                     sacrifice_provenance: None,
+                    discard_provenance: None,
                     candidates,
                     search_found_candidates,
                     depth,
@@ -13125,6 +13129,7 @@ fn pipeline_loop(
             state.pending_replacement = Some(PendingReplacement {
                 proposed,
                 sacrifice_provenance: None,
+                discard_provenance: None,
                 candidates,
                 search_found_candidates,
                 depth,
@@ -13192,6 +13197,20 @@ pub fn replace_event(
     proposed: ProposedEvent,
     events: &mut Vec<GameEvent>,
 ) -> ReplacementResult {
+    let discard_provenance = match &proposed {
+        ProposedEvent::Discard {
+            object_id,
+            player_id,
+            source_id,
+            discard_frame: None,
+            ..
+        } => Some(crate::types::game_state::PendingDiscardProvenance {
+            object_id: *object_id,
+            player_id: *player_id,
+            source_id: *source_id,
+        }),
+        _ => None,
+    };
     // A newly proposed (possibly nested) event cannot inherit another event's tail.
     state.replacement_auto_choice_tail = None;
     let registry = replacement_registry();
@@ -13202,6 +13221,11 @@ pub fn replace_event(
     let staged = stage_transformed_entry_projection(state, &proposed);
     prepare_replacement_index_for_pipeline(state);
     let result = pipeline_loop(state, proposed, 0, registry, events);
+    if matches!(result, ReplacementResult::NeedsChoice(_)) {
+        if let Some(provenance) = discard_provenance {
+            crate::game::effects::discard::retain_pending_discard(state, provenance);
+        }
+    }
     clear_replacement_index_pipeline(state);
     release_transformed_entry_projection(state, staged, &result);
     result
@@ -13435,6 +13459,7 @@ fn continue_replacement_impl(
         let reparked_depth = pending.depth;
         let reparked_library_placement = pending.library_placement.clone();
         let reparked_sacrifice_provenance = pending.sacrifice_provenance;
+        let reparked_discard_provenance = pending.discard_provenance;
         let reparked_choice_player = pending.choice_player;
         let reparked_delivery_boundary = pending.delivery_boundary.clone();
         let reparked_unrepresentable_life_change = pending.unrepresentable_life_change;
@@ -13553,6 +13578,7 @@ fn continue_replacement_impl(
                 let outer_replacement = crate::types::game_state::PendingReplacement {
                     proposed: proposed.clone(),
                     sacrifice_provenance: reparked_sacrifice_provenance,
+                    discard_provenance: reparked_discard_provenance,
                     candidates: reparked_candidates,
                     search_found_candidates: Vec::new(),
                     depth: reparked_depth,
@@ -13919,7 +13945,16 @@ pub fn continue_replacement(
         .pending_replacement
         .as_ref()
         .map(|pending| pending.unrepresentable_life_change);
+    let predecessor_discard = state
+        .pending_replacement
+        .as_ref()
+        .and_then(|pending| pending.discard_provenance);
     let result = continue_replacement_impl(state, chosen_index, events);
+    if matches!(result, ReplacementResult::NeedsChoice(_)) {
+        if let Some(provenance) = predecessor_discard {
+            crate::game::effects::discard::retain_pending_discard(state, provenance);
+        }
+    }
     // CR 616.1f: backstop for the stamp — a record re-parked while a stamped
     // record is answered stays stamped (a fresh park already reads the open
     // ingress window; this never downgrades).
@@ -15645,6 +15680,169 @@ mod tests {
     }
 
     #[test]
+    fn pending_discard_owner_survives_boxed_and_unboxed_may_cost_payment() {
+        use crate::game::effects::discard::{discard_caused_by_effect_with_source, DiscardOutcome};
+        use crate::game::engine::apply_as_current;
+        use crate::game::zones::create_object;
+        use crate::types::game_state::{PendingCostMoveResume, PendingDiscardProvenance};
+        for boxed in [false, true] {
+            let mut state = GameState::new_two_player(42);
+            state.phase = crate::types::phase::Phase::PreCombatMain;
+            let outer = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Outer discard fixture".into(),
+                Zone::Hand,
+            );
+            let fuel = create_object(
+                &mut state,
+                CardId(2),
+                PlayerId(0),
+                "Inner exile payment".into(),
+                Zone::Graveyard,
+            );
+            if !boxed {
+                create_object(
+                    &mut state,
+                    CardId(3),
+                    PlayerId(0),
+                    "Other payment choice".into(),
+                    Zone::Graveyard,
+                );
+            }
+            let source = create_object(
+                &mut state,
+                CardId(4),
+                PlayerId(1),
+                "Original discard source".into(),
+                Zone::Battlefield,
+            );
+            let mut redirect = redirect_self_moved_replacement(Zone::Battlefield);
+            redirect.event = ReplacementEvent::Discard;
+            let may_cost = ReplacementDefinition::new(ReplacementEvent::Moved)
+                .valid_card(TargetFilter::SelfRef)
+                .destination_zone(Zone::Battlefield)
+                .mode(ReplacementMode::MayCost {
+                    cost: AbilityCost::Exile {
+                        count: 1,
+                        zone: Some(Zone::Graveyard),
+                        filter: Some(TargetFilter::Any),
+                    },
+                    decline: None,
+                });
+            let object = state.objects.get_mut(&outer).unwrap();
+            object.card_types.core_types.push(CoreType::Artifact);
+            object.replacement_definitions = vec![redirect, may_cost].into();
+            if boxed {
+                let host = create_object(
+                    &mut state,
+                    CardId(5),
+                    PlayerId(0),
+                    "Inner optional redirect".into(),
+                    Zone::Battlefield,
+                );
+                let mut inner_redirect = rip_replacement()
+                    .destination_zone(Zone::Exile)
+                    .mode(ReplacementMode::Optional { decline: None });
+                if let Effect::ChangeZone { destination, .. } =
+                    inner_redirect.execute.as_mut().unwrap().effect.as_mut()
+                {
+                    *destination = Zone::Hand;
+                }
+                state
+                    .objects
+                    .get_mut(&host)
+                    .unwrap()
+                    .replacement_definitions
+                    .push(inner_redirect);
+            }
+            let mut events = Vec::new();
+            assert!(matches!(
+                discard_caused_by_effect_with_source(
+                    &mut state,
+                    outer,
+                    PlayerId(0),
+                    Some(source),
+                    &mut events
+                ),
+                DiscardOutcome::NeedsReplacementChoice(_)
+            ));
+            state.waiting_for = replacement_choice_waiting_for(PlayerId(0), &state);
+            let provenance = PendingDiscardProvenance {
+                object_id: outer,
+                player_id: PlayerId(0),
+                source_id: Some(source),
+            };
+            assert_eq!(
+                state
+                    .pending_replacement
+                    .as_ref()
+                    .unwrap()
+                    .discard_provenance,
+                Some(provenance)
+            );
+            let accepted =
+                apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 }).unwrap();
+            assert_eq!(state.objects[&outer].zone, Zone::Hand);
+            assert!(accepted
+                .events
+                .iter()
+                .all(|event| !matches!(event, GameEvent::Discarded { .. })));
+            if boxed {
+                assert!(matches!(
+                    accepted.waiting_for,
+                    WaitingFor::ReplacementChoice { .. }
+                ));
+                let inner = state
+                    .pending_replacement
+                    .as_ref()
+                    .expect("inner payment owns the prompt");
+                assert_eq!(inner.proposed.affected_object_id(), Some(fuel));
+                assert_eq!(
+                    inner.discard_provenance, None,
+                    "exile payment cannot inherit outer discard"
+                );
+                let Some(PendingCostMoveResume::ReplacementMayCost {
+                    outer_replacement: Some(outer_record),
+                    ..
+                }) = state.pending_cost_move_resume.as_ref()
+                else {
+                    panic!("the same outer replacement must be retained in the cost resume");
+                };
+                assert_eq!(outer_record.proposed.affected_object_id(), Some(outer));
+                assert_eq!(outer_record.discard_provenance, Some(provenance));
+                assert!(outer_record.may_cost_paid);
+            } else {
+                assert!(matches!(
+                    accepted.waiting_for,
+                    WaitingFor::EffectZoneChoice { .. }
+                ));
+                let outer_record = state
+                    .pending_replacement
+                    .as_ref()
+                    .expect("unboxed outer record remains installed");
+                assert_eq!(outer_record.proposed.affected_object_id(), Some(outer));
+                assert_eq!(outer_record.discard_provenance, Some(provenance));
+                assert!(outer_record.may_cost_paid);
+            }
+            let response = if boxed {
+                apply_as_current(&mut state, GameAction::ChooseReplacement { index: 1 }).unwrap()
+            } else {
+                apply_as_current(&mut state, GameAction::SelectCards { cards: vec![fuel] }).unwrap()
+            };
+            // CR 701.9a + CR 701.9c + CR 616.1f: restore and finish only the original outer discard.
+            assert_eq!(state.objects[&fuel].zone, Zone::Exile);
+            assert_eq!(state.objects[&outer].zone, Zone::Battlefield);
+            assert_eq!(state.cards_discarded_this_turn_by_player[&PlayerId(0)], 1);
+            assert_eq!(response.events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id: Some(event_source) } if *object_id == outer && *event_source == source)).count(), 1);
+            assert!(matches!(response.waiting_for, WaitingFor::Priority { .. }));
+            assert!(state.pending_replacement.is_none());
+            assert!(state.pending_cost_move_resume.is_none());
+        }
+    }
+
+    #[test]
     fn may_cost_replacement_decline_applies_decline_branch() {
         let repl = may_cost_tapped_replacement(2);
         let mut state = test_state_with_object(ObjectId(10), Zone::Hand, vec![repl]);
@@ -16918,6 +17116,7 @@ mod tests {
         state.pending_replacement = Some(PendingReplacement {
             proposed: ProposedEvent::zone_change(ObjectId(20), Zone::Hand, Zone::Battlefield, None),
             sacrifice_provenance: None,
+            discard_provenance: None,
             candidates: vec![ReplacementId {
                 source: ObjectId(20),
                 index: 0,
@@ -16986,6 +17185,7 @@ mod tests {
                     None,
                 ),
                 sacrifice_provenance: None,
+                discard_provenance: None,
                 candidates: vec![commander_hand_or_library_return_replacement_id(commander)],
                 search_found_candidates: Vec::new(),
                 depth: 0,
@@ -17067,6 +17267,7 @@ mod tests {
                 applied: HashSet::new(),
             },
             sacrifice_provenance: None,
+            discard_provenance: None,
             // The candidate's own source is the sentinel; `index` addresses the
             // handler list above.
             candidates: vec![ReplacementId {
@@ -22563,6 +22764,7 @@ mod tests {
         state.pending_replacement = Some(PendingReplacement {
             proposed: ProposedEvent::zone_change(ObjectId(20), Zone::Hand, Zone::Battlefield, None),
             sacrifice_provenance: None,
+            discard_provenance: None,
             candidates: vec![],
             search_found_candidates: Vec::new(),
             depth: 0,

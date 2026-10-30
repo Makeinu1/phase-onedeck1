@@ -1826,6 +1826,7 @@ mod paused_search_audience_tests {
         state.pending_replacement = Some(PendingReplacement {
             proposed: original.clone(),
             sacrifice_provenance: None,
+            discard_provenance: None,
             candidates: Vec::new(),
             search_found_candidates: Vec::new(),
             depth: 0,

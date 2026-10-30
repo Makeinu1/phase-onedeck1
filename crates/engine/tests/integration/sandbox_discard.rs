@@ -80,6 +80,29 @@ fn discarded_events(events: &[GameEvent]) -> Vec<(PlayerId, ObjectId)> {
         .collect()
 }
 
+fn discarded_with_sources(events: &[GameEvent]) -> Vec<(PlayerId, ObjectId, Option<ObjectId>)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::Discarded {
+                player_id,
+                object_id,
+                source_id,
+            } => Some((*player_id, *object_id, *source_id)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn discard_count(runner: &GameRunner, player: PlayerId) -> u32 {
+    runner
+        .state()
+        .cards_discarded_this_turn_by_player
+        .get(&player)
+        .copied()
+        .unwrap_or(0)
+}
+
 fn has_debug_used(events: &[GameEvent]) -> bool {
     events
         .iter()
@@ -109,6 +132,9 @@ fn digest(runner: &GameRunner) -> serde_json::Value {
         "stack_len": state.stack.len(),
         "waiting_for": &state.waiting_for,
         "state_revision": state.state_revision,
+        "pending_replacement": &state.pending_replacement,
+        "resolution_stack": &state.resolution_stack,
+        "discard_counts": &state.cards_discarded_this_turn_by_player,
     })
 }
 
@@ -274,21 +300,38 @@ fn r5_madness_offers_cast_then_decline_goes_to_graveyard() {
 /// R6: the cause is Effect, so Library of Leng's replacement applies.
 #[test]
 fn r6_library_of_leng_applies_to_sandbox_discard() {
-    let Some(db) = load_db() else { return };
-    let mut card = None;
+    let db = load_db().expect("Library discard regression requires the committed card fixture");
+    let mut ids = None;
     let mut runner = table(db, |s, db| {
         s.add_real_card(P0, "Library of Leng", Zone::Battlefield, db);
-        card = Some(s.add_real_card(P0, "Grizzly Bears", Zone::Hand, db));
+        let grimoire = s.add_real_card(P1, "Geth's Grimoire", Zone::Battlefield, db);
+        let card = s.add_real_card(P0, "Grizzly Bears", Zone::Hand, db);
+        ids = Some((grimoire, card));
     });
-    let card = card.unwrap();
+    let (grimoire, card) = ids.unwrap();
+    let before = discard_count(&runner, P0);
 
-    runner.act(discard(card)).expect("discard succeeds");
+    let parked = runner.act(discard(card)).expect("discard succeeds");
     match &runner.state().waiting_for {
         WaitingFor::ReplacementChoice { player, .. } => assert_eq!(*player, P0),
         other => panic!("expected the Library of Leng prompt, got {other:?}"),
     }
+    assert_eq!(zone_of(&runner, card), Zone::Hand);
+    assert!(discarded_with_sources(&parked.events).is_empty());
+    assert_eq!(discard_count(&runner, P0), before);
+    assert!(runner.state().stack.is_empty());
 
-    runner
+    // Persist the actual producer-owned prompt before publicly resuming it.
+    assert!(runner
+        .state()
+        .pending_replacement
+        .as_ref()
+        .unwrap()
+        .discard_provenance
+        .is_some());
+    let encoded = serde_json::to_value(runner.state()).expect("serialize Library prompt");
+    *runner.state_mut() = serde_json::from_value(encoded).expect("restore Library prompt");
+    let result = runner
         .act(GameAction::ChooseReplacement { index: 0 })
         .expect("choosing the library option succeeds");
     let state = runner.state();
@@ -299,41 +342,63 @@ fn r6_library_of_leng_applies_to_sandbox_discard() {
         .and_then(|p| p.library.front().copied());
     assert_eq!(top, Some(card));
     assert_eq!(zone_of(&runner, card), Zone::Library);
+    // CR 701.9c + CR 603.2c: a redirected discard is one occurrence.
+    assert_eq!(
+        discarded_with_sources(&result.events),
+        vec![(P0, card, None)]
+    );
+    assert_eq!(discard_count(&runner, P0), before + 1);
+    assert_eq!(runner.state().stack.len(), 1);
+    assert_eq!(runner.state().stack[0].source_id, grimoire);
+    assert!(runner.state().pending_replacement.is_none());
+    assert!(is_priority(&runner));
 }
 
 /// R7: a parked choice refuses a second debug discard; the graveyard option
 /// completes the first.
 #[test]
 fn r7_parked_choice_refuses_second_debug_discard() {
-    let Some(db) = load_db() else { return };
+    let db = load_db().expect("Library discard regression requires the committed card fixture");
     let mut ids = None;
     let mut runner = table(db, |s, db| {
         s.add_real_card(P0, "Library of Leng", Zone::Battlefield, db);
-        s.add_real_card(P1, "Geth's Grimoire", Zone::Battlefield, db);
+        let grimoire = s.add_real_card(P1, "Geth's Grimoire", Zone::Battlefield, db);
         let first = s.add_real_card(P0, "Grizzly Bears", Zone::Hand, db);
         let second = s.add_real_card(P0, "Grizzly Bears", Zone::Hand, db);
-        ids = Some((first, second));
+        ids = Some((grimoire, first, second));
     });
-    let (first, second) = ids.unwrap();
+    let (grimoire, first, second) = ids.unwrap();
+    let count_before = discard_count(&runner, P0);
 
-    runner.act(discard(first)).expect("discard parks a choice");
+    let parked = runner.act(discard(first)).expect("discard parks a choice");
     assert!(matches!(
         runner.state().waiting_for,
         WaitingFor::ReplacementChoice { player: P0, .. }
     ));
     assert!(runner.state().stack.is_empty());
+    assert!(discarded_with_sources(&parked.events).is_empty());
+    assert_eq!(zone_of(&runner, first), Zone::Hand);
+    assert_eq!(discard_count(&runner, P0), count_before);
 
     let before = digest(&runner);
     assert!(runner.act(discard(second)).is_err());
     assert_eq!(digest(&runner), before, "a refused action changes nothing");
 
-    // Pre-existing upstream gap: answering a Library of Leng choice for an
-    // effect-caused discard moves the card but emits no `Discarded` event, so
-    // discard triggers do not fire; no trigger is asserted after the answer.
-    runner
+    let result = runner
         .act(GameAction::ChooseReplacement { index: 1 })
         .expect("choosing the graveyard option succeeds");
     assert_eq!(zone_of(&runner, first), Zone::Graveyard);
+    assert_eq!(zone_of(&runner, second), Zone::Hand);
+    // CR 701.9a + CR 603.2c: declining the redirect still discards once.
+    assert_eq!(
+        discarded_with_sources(&result.events),
+        vec![(P0, first, None)]
+    );
+    assert_eq!(discard_count(&runner, P0), count_before + 1);
+    assert_eq!(runner.state().stack.len(), 1);
+    assert_eq!(runner.state().stack[0].source_id, grimoire);
+    assert!(runner.state().pending_replacement.is_none());
+    assert!(is_priority(&runner));
 }
 
 /// R8: no source object, so "a spell or ability an opponent controls causes you
@@ -371,6 +436,56 @@ fn r9_discarder_is_owner_not_submitter() {
     assert_eq!(discarded_events(&result.events), vec![(P0, card)]);
     assert_eq!(runner.state().stack.len(), 1, "one Grimoire trigger");
     assert_eq!(runner.state().stack[0].source_id, grimoire);
+}
+
+/// CR 701.9a: a paused discard still belongs to its card's owner.
+#[test]
+fn r9_paused_discarder_is_owner_not_submitter_for_both_answers() {
+    let db = load_db().expect("Library owner regression requires the committed card fixture");
+    for index in [0, 1] {
+        let mut ids = None;
+        let mut runner = table(db, |s, db| {
+            s.add_real_card(P0, "Library of Leng", Zone::Battlefield, db);
+            let grimoire = s.add_real_card(P1, "Geth's Grimoire", Zone::Battlefield, db);
+            let card = s.add_real_card(P0, "Grizzly Bears", Zone::Hand, db);
+            ids = Some((grimoire, card));
+        });
+        let (grimoire, card) = ids.unwrap();
+        runner.state_mut().debug_permitted = BTreeSet::from([P0, P1]);
+        let owner_before = discard_count(&runner, P0);
+        let submitter_before = discard_count(&runner, P1);
+        let parked = apply(runner.state_mut(), P1, discard(card)).expect("P1 may submit");
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { player: P0, .. }
+        ));
+        assert_eq!(zone_of(&runner, card), Zone::Hand);
+        assert!(discarded_with_sources(&parked.events).is_empty());
+        let result = apply(
+            runner.state_mut(),
+            P0,
+            GameAction::ChooseReplacement { index },
+        )
+        .expect("owner answers");
+        // CR 701.9a + CR 701.9c + CR 603.2c: owner and absent source survive either answer.
+        assert_eq!(
+            discarded_with_sources(&result.events),
+            vec![(P0, card, None)]
+        );
+        assert_eq!(discard_count(&runner, P0), owner_before + 1);
+        assert_eq!(discard_count(&runner, P1), submitter_before);
+        assert_eq!(
+            zone_of(&runner, card),
+            if index == 0 {
+                Zone::Library
+            } else {
+                Zone::Graveyard
+            }
+        );
+        assert_eq!(runner.state().stack.len(), 1);
+        assert_eq!(runner.state().stack[0].source_id, grimoire);
+        assert!(is_priority(&runner));
+    }
 }
 
 /// R10: rejections leave state unchanged.

@@ -404,6 +404,10 @@ fn handle_replacement_choice_inner(
         .pending_replacement
         .as_ref()
         .and_then(|pending| pending.sacrifice_provenance);
+    let parked_discard_provenance = state
+        .pending_replacement
+        .as_ref()
+        .and_then(|pending| pending.discard_provenance);
     // CR 122.1 + CR 616.1f: the object whose counter placement this resume answers.
     // Captured here, with the file's other `parked_*` reads, because
     // `continue_replacement` below consumes the pending record. The Execute arm's
@@ -465,16 +469,26 @@ fn handle_replacement_choice_inner(
                 //     is restored structurally inside the shared delivery for
                 //     `Stack → Battlefield` events (`CastLinkSnapshot`).
                 event @ ProposedEvent::ZoneChange { .. } => {
-                    let (object_id, to, cause, discard_frame) = match &event {
+                    let (object_id, from, to, cause, discard_frame) = match &event {
                         ProposedEvent::ZoneChange {
                             object_id,
+                            from,
                             to,
                             cause,
                             discard_frame,
                             ..
-                        } => (*object_id, *to, *cause, *discard_frame),
+                        } => (*object_id, *from, *to, *cause, *discard_frame),
                         _ => unreachable!("arm pattern guarantees ZoneChange"),
                     };
+                    let discard_delivery = parked_discard_provenance.filter(|provenance| {
+                        discard_frame.is_none()
+                            && from == Zone::Hand
+                            && provenance.object_id == object_id
+                            && state
+                                .objects
+                                .get(&object_id)
+                                .is_some_and(|object| object.zone == Zone::Hand)
+                    });
                     let Ok(approved) =
                         crate::game::zone_pipeline::ApprovedZoneChange::approve_post_replacement(
                             event,
@@ -483,7 +497,7 @@ fn handle_replacement_choice_inner(
                         unreachable!("arm pattern guarantees a ZoneChange payload");
                     };
                     let delivery_start = events.len();
-                    match crate::game::zone_pipeline::deliver(
+                    let delivery = crate::game::zone_pipeline::deliver(
                         state,
                         approved,
                         crate::game::zone_pipeline::DeliveryCtx {
@@ -502,7 +516,21 @@ fn handle_replacement_choice_inner(
                             library_placement: parked_library_placement.clone(),
                         },
                         events,
-                    ) {
+                    );
+                    // CR 701.9a + CR 701.9c: the discard is complete when its card leaves hand,
+                    // even if counter replacement work subsequently needs a choice.
+                    if let Some(provenance) = discard_delivery {
+                        if state
+                            .objects
+                            .get(&object_id)
+                            .is_some_and(|object| object.zone != Zone::Hand)
+                        {
+                            effects::discard::record_completed_discard(state, provenance, events);
+                        } else {
+                            effects::discard::retain_pending_discard(state, provenance);
+                        }
+                    }
+                    match delivery {
                         crate::game::zone_pipeline::ZoneDeliveryResult::Done => {}
                         // CR 614.1c / CR 614.12a: the delivery tail parked a
                         // counter-replacement or devour prompt and stashed the
@@ -4624,6 +4652,7 @@ mod tests {
                 applied: HashSet::new(),
             },
             sacrifice_provenance: None,
+            discard_provenance: None,
             candidates: vec![ReplacementId {
                 source: candidate,
                 index: 0,
@@ -5302,6 +5331,7 @@ mod tests {
                 applied: std::collections::HashSet::new(),
             },
             sacrifice_provenance: None,
+            discard_provenance: None,
             candidates: vec![ReplacementId {
                 source: bear,
                 index: 0,

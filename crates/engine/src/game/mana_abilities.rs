@@ -6392,6 +6392,7 @@ mod tests {
                 applied: HashSet::new(),
             },
             sacrifice_provenance: None,
+            discard_provenance: None,
             candidates: vec![ReplacementId {
                 source: ObjectId(7),
                 index: 0,

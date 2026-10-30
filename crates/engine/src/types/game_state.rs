@@ -27867,6 +27867,10 @@ pub struct PendingReplacement {
     /// `PermanentSacrificed` event that sacrifice triggers observe (CR 603.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sacrifice_provenance: Option<PendingSacrificeProvenance>,
+    /// CR 701.9a + CR 701.9c: completion of an unperformed, no-frame discard follows its
+    /// original owner and source through replacement choices and redirects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discard_provenance: Option<PendingDiscardProvenance>,
     pub candidates: Vec<ReplacementId>,
     /// CR 616.1: SearchFound choices snapshot the selected source
     /// incarnation, controller/grantee, modifier, and display data at offer
@@ -28077,6 +28081,14 @@ impl PendingReplacement {
 pub struct PendingSacrificeProvenance {
     pub object_id: ObjectId,
     pub player_id: PlayerId,
+}
+
+/// The no-frame discard whose hand departure still awaits replacement delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDiscardProvenance {
+    pub object_id: ObjectId,
+    pub player_id: PlayerId,
+    pub source_id: Option<ObjectId>,
 }
 
 /// CR 703.4q + CR 616.1 + CR 614.1a: One step-end mana handler entry pending
@@ -53201,6 +53213,7 @@ mod tests {
                 applied: HashSet::new(),
             },
             sacrifice_provenance: None,
+            discard_provenance: None,
             candidates: Vec::new(),
             search_found_candidates: Vec::new(),
             depth: 0,
@@ -53249,6 +53262,36 @@ mod tests {
             legacy.unrepresentable_life_change,
             UnrepresentablePolicy::IgnoreImpossible
         );
+    }
+
+    #[test]
+    fn pending_discard_provenance_wire_shape() {
+        let mut pending = pending_life_gain_replacement(UnrepresentablePolicy::IgnoreImpossible);
+        pending.proposed = ProposedEvent::Discard {
+            object_id: ObjectId(71),
+            player_id: PlayerId(1),
+            source_id: None,
+            caused_by_effect: true,
+            discard_frame: None,
+            applied: HashSet::new(),
+        };
+        let legacy_json = serde_json::to_value(&pending).expect("serialize absent provenance");
+        assert!(legacy_json.get("discard_provenance").is_none());
+        let legacy: PendingReplacement =
+            serde_json::from_value(legacy_json).expect("legacy record loads");
+        assert_eq!(legacy.discard_provenance, None);
+        for source_id in [None, Some(ObjectId(99))] {
+            pending.discard_provenance = Some(PendingDiscardProvenance {
+                object_id: ObjectId(71),
+                player_id: PlayerId(1),
+                source_id,
+            });
+            let json = serde_json::to_value(&pending).expect("serialize owned discard");
+            assert!(json.get("discard_provenance").is_some());
+            let restored: PendingReplacement =
+                serde_json::from_value(json).expect("owned discard loads");
+            assert_eq!(restored, pending);
+        }
     }
 
     /// CR 616.1f: a re-parked record copies a `Reject` stamp from its

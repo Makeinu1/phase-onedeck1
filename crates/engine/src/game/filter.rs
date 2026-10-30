@@ -26371,6 +26371,7 @@ mod entry_projection_tests {
         let record = |proposed: ProposedEvent| PendingReplacement {
             proposed,
             sacrifice_provenance: None,
+            discard_provenance: None,
             candidates: Vec::new(),
             search_found_candidates: Vec::new(),
             depth: 0,
