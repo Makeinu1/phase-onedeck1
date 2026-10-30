@@ -24,16 +24,19 @@
 use engine::game::engine::apply;
 use engine::game::scenario::{GameRunner, GameScenario, Outcome, P0, P1};
 use engine::types::ability::{
-    AbilityDefinition, AbilityKind, Effect, FilterProp, ReplacementDefinition, ReplacementMode,
-    ResolvedAbility, TargetFilter, TargetRef, TypedFilter,
+    AbilityDefinition, AbilityKind, Effect, FilterProp, QuantityExpr, QuantityModification,
+    ReplacementDefinition, ReplacementMode, ResolvedAbility, TargetFilter, TargetRef, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
+use engine::types::counter::CounterType;
+use engine::types::events::GameEvent;
 use engine::types::game_state::{PersistedGameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+use engine::types::proposed_event::ProposedEvent;
 use engine::types::replacements::ReplacementEvent;
 use engine::types::zones::Zone;
 
@@ -632,6 +635,194 @@ fn windfall_paused_mid_fan_out_still_draws_the_greatest() {
         "a replacement pause must not truncate the batch (prompts/graveyards) nor split \
          the clause's per-player table (drawn/hands)"
     );
+}
+
+fn hand_to_battlefield_with_two_counters(event: ReplacementEvent) -> ReplacementDefinition {
+    let mut replacement = ReplacementDefinition::new(event)
+        .valid_card(TargetFilter::SelfRef)
+        .execute(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChangeZone {
+                origin: Some(Zone::Hand),
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![(
+                    CounterType::Plus1Plus1,
+                    QuantityExpr::Fixed { value: 2 },
+                )],
+                conditional_enter_with_counters: vec![],
+                enters_modified_if: None,
+                face_down_profile: None,
+            },
+        ));
+    replacement.active_zones = vec![Zone::Hand];
+    replacement
+}
+
+fn assert_windfall_draws_after_counter_pause(accept_redirect: bool, prevent_counter: bool) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    for player in [P0, P1] {
+        seed_library(&mut scenario, player, LIBRARY_DEPTH);
+    }
+    let card = scenario.add_card_to_hand(P0, "Counter redirect fixture");
+    let windfall = scenario
+        .add_spell_to_hand_from_oracle(P0, "Windfall", false, WINDFALL)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    let object = runner.state_mut().objects.get_mut(&card).unwrap();
+    object.card_types.core_types.push(CoreType::Artifact);
+    object.replacement_definitions.push(
+        hand_to_battlefield_with_two_counters(ReplacementEvent::Discard)
+            .mode(ReplacementMode::Optional { decline: None }),
+    );
+    // Declining the outer redirect preserves the accepted Discard payload;
+    // its inner move takes this mandatory redirect before the counter pause.
+    object.replacement_definitions.push(
+        hand_to_battlefield_with_two_counters(ReplacementEvent::Moved)
+            .destination_zone(Zone::Graveyard),
+    );
+    object.replacement_definitions.push(
+        ReplacementDefinition::new(ReplacementEvent::AddCounter)
+            .valid_card(TargetFilter::SelfRef)
+            .mode(ReplacementMode::Optional { decline: None })
+            .quantity_modification(QuantityModification::Prevent),
+    );
+
+    let initial = runner.cast(windfall).resolve();
+    assert!(matches!(
+        initial.final_waiting_for(),
+        WaitingFor::ReplacementChoice { player: P0, .. }
+    ));
+    assert_eq!(runner.state().objects[&card].zone, Zone::Hand);
+    assert!(matches!(
+        runner.state().pending_replacement.as_ref().unwrap().proposed,
+        ProposedEvent::Discard { object_id, source_id: Some(source), .. }
+            if object_id == card && source == windfall
+    ));
+    let batch = runner
+        .state()
+        .pending_discard_batch
+        .as_ref()
+        .expect("Windfall must own a live discard batch at the first prompt");
+    assert_eq!(batch.player, P0);
+    assert_eq!(batch.source_id, windfall);
+    assert_eq!(batch.paused_card.object_id, card);
+    assert_eq!(batch.discard_frame, None);
+    let paused_card = batch.paused_card;
+    assert_eq!(
+        runner
+            .state()
+            .cards_discarded_this_turn_by_player
+            .get(&P0)
+            .copied()
+            .unwrap_or(0),
+        0
+    );
+    assert!(!batch
+        .preceding_events
+        .iter()
+        .any(|event| matches!(event, GameEvent::Discarded { .. })));
+
+    let moved = apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseReplacement {
+            index: usize::from(!accept_redirect),
+        },
+    )
+    .expect("answer Windfall's original discard replacement");
+    assert!(matches!(
+        moved.waiting_for,
+        WaitingFor::ReplacementChoice { player: P0, .. }
+    ));
+    let pending = runner.state().pending_replacement.as_ref().unwrap();
+    assert!(matches!(pending.proposed, ProposedEvent::AddCounter { .. }));
+    assert_eq!(pending.discard_provenance, None);
+    // CR 701.9a + CR 614.6: the redirected hand departure is one completed discard.
+    assert_eq!(runner.state().objects[&card].zone, Zone::Battlefield);
+    assert_eq!(runner.state().cards_discarded_this_turn_by_player[&P0], 1);
+    assert_eq!(
+        moved
+            .events
+            .iter()
+            .filter(|event| matches!(event,
+            GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source) }
+                if *object_id == card && *source == windfall))
+            .count(),
+        1
+    );
+    let batch = runner.state().pending_discard_batch.as_ref().unwrap();
+    assert_eq!(batch.paused_card, paused_card);
+    assert_eq!(batch.source_id, windfall);
+    assert_eq!(
+        batch
+            .preceding_events
+            .iter()
+            .filter(|event| matches!(event,
+            GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source) }
+                if *object_id == card && *source == windfall))
+            .count(),
+        1,
+        "the completed discard must remain in its batch's result window across the counter pause"
+    );
+
+    let completed = apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseReplacement {
+            index: usize::from(!prevent_counter),
+        },
+    )
+    .expect("answer the post-discard counter replacement");
+    assert!(matches!(completed.waiting_for, WaitingFor::Priority { .. }));
+    assert_eq!(runner.state().objects[&windfall].zone, Zone::Graveyard);
+    assert!(runner.state().stack.is_empty());
+    assert!(runner.state().resolution_stack.is_empty());
+    assert!(runner.state().pending_discard_batch.is_none());
+    // CR 608.2i: "discarded this way" reads the completed discard across both pauses.
+    for player in [P0, P1] {
+        assert_eq!(
+            LIBRARY_DEPTH - state_zone_len(&runner, player, Zone::Library),
+            1,
+            "Windfall must draw from its completed discard result after either counter response"
+        );
+        assert_eq!(state_zone_len(&runner, player, Zone::Hand), 1);
+    }
+    assert_eq!(runner.state().cards_discarded_this_turn_by_player[&P0], 1);
+    assert!(!completed
+        .events
+        .iter()
+        .any(|event| matches!(event, GameEvent::Discarded { .. })));
+    assert_eq!(
+        runner.state().objects[&card]
+            .counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
+        if prevent_counter { 0 } else { 2 }
+    );
+}
+
+#[test]
+fn windfall_retains_resumed_zone_change_discard_result_across_counter_pause() {
+    for prevent_counter in [false, true] {
+        assert_windfall_draws_after_counter_pause(true, prevent_counter);
+    }
+}
+
+#[test]
+fn windfall_retains_accepted_discard_result_across_counter_pause() {
+    for prevent_counter in [false, true] {
+        assert_windfall_draws_after_counter_pause(false, prevent_counter);
+    }
 }
 
 #[test]

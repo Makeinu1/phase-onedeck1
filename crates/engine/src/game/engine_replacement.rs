@@ -53,6 +53,34 @@ fn maybe_drain_each_player_copy_chosen(state: &mut GameState, events: &mut Vec<G
     }
 }
 
+/// CR 608.2c + CR 608.2i: finish the paused discard instruction and publish its
+/// whole result before resuming the following instructions. A new prompt keeps
+/// the current action's observer span deferred at the existing choice boundary.
+fn drain_discard_batch_after_replacement(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    action_event_start: usize,
+) -> Result<Option<WaitingFor>, EngineError> {
+    match effects::drain_pending_discard_batch(state, events)
+        .map_err(|error| EngineError::InvalidAction(error.to_string()))?
+    {
+        effects::PendingDiscardBatchOutcome::Idle => return Ok(None),
+        effects::PendingDiscardBatchOutcome::PausedForReplacement => {}
+        effects::PendingDiscardBatchOutcome::Completed => {
+            effects::drain_pending_continuation(state, events);
+            if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                return Ok(None);
+            }
+        }
+    }
+    super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
+        state,
+        events,
+        action_event_start,
+    );
+    Ok(Some(state.waiting_for.clone()))
+}
+
 /// CR 608.3a / CR 608.3c + CR 400.7d + CR 616.1f: complete a permanent spell's
 /// parked resolution frame once the child stack its own entry raised has retired.
 ///
@@ -308,6 +336,48 @@ fn handle_replacement_choice_inner(
         )));
     }
     let replacement_action_event_start = events.len();
+    let parked_discard_batch_owner = state.pending_discard_batch.as_ref().map(|batch| {
+        (
+            batch.paused_card,
+            batch.player,
+            batch.source_id,
+            batch.discard_frame,
+        )
+    });
+    let is_parked_discard_delivery = |events: &[GameEvent]| {
+        let Some((paused_card, player, source_id, _)) = parked_discard_batch_owner else {
+            return false;
+        };
+        let left_hand = events.iter().any(|event| {
+            matches!(event, GameEvent::ZoneChanged { from: Some(Zone::Hand), record, .. }
+                if record.trigger_source_context().is_some_and(|context|
+                    context.identity.reference == paused_card))
+        });
+        let discarded = events.iter().any(|event| {
+            matches!(event, GameEvent::Discarded { player_id, object_id, source_id: event_source }
+                if *player_id == player && *object_id == paused_card.object_id
+                    && *event_source == Some(source_id))
+        });
+        left_hand && discarded
+    };
+    // CR 608.2i: a post-move counter pause must retain this delivery's result
+    // window on the same batch for its later look-back, without republishing it.
+    let retain_paused_discard_batch_events = |state: &mut GameState, events: &[GameEvent]| {
+        let Some(batch) = state.pending_discard_batch.as_mut().filter(|batch| {
+            parked_discard_batch_owner
+                == Some((
+                    batch.paused_card,
+                    batch.player,
+                    batch.source_id,
+                    batch.discard_frame,
+                ))
+        }) else {
+            return;
+        };
+        if is_parked_discard_delivery(events) {
+            batch.preceding_events.extend_from_slice(events);
+        }
+    };
     let parked_search_found_replacement = state
         .pending_replacement
         .as_ref()
@@ -549,6 +619,7 @@ fn handle_replacement_choice_inner(
                                     pending.sacrifice_provenance = Some(provenance);
                                 }
                             }
+                            retain_paused_discard_batch_events(state, &events[delivery_start..]);
                             return Ok(state.waiting_for.clone());
                         }
                     }
@@ -949,6 +1020,7 @@ fn handle_replacement_choice_inner(
                     applied,
                     ..
                 } => {
+                    let delivery_start = events.len();
                     if let effects::discard::DiscardOutcome::NeedsReplacementChoice(player) =
                         effects::discard::complete_discard_to_graveyard(
                             state,
@@ -962,6 +1034,7 @@ fn handle_replacement_choice_inner(
                     {
                         state.waiting_for =
                             crate::game::replacement::replacement_choice_waiting_for(player, state);
+                        retain_paused_discard_batch_events(state, &events[delivery_start..]);
                         return Ok(state.waiting_for.clone());
                     }
                 }
@@ -1393,29 +1466,12 @@ fn handle_replacement_choice_inner(
             if matches!(waiting_for, WaitingFor::Priority { .. })
                 && state.pending_discard_batch.is_some()
             {
-                match effects::drain_pending_discard_batch(state, events)
-                    .map_err(|error| EngineError::InvalidAction(error.to_string()))?
-                {
-                    effects::PendingDiscardBatchOutcome::Idle => {}
-                    effects::PendingDiscardBatchOutcome::PausedForReplacement => {
-                        waiting_for = state.waiting_for.clone();
-                        super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
-                            state,
-                            events,
-                            replacement_action_event_start,
-                        );
-                    }
-                    effects::PendingDiscardBatchOutcome::Completed => {
-                        effects::drain_pending_continuation(state, events);
-                        if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
-                            waiting_for = state.waiting_for.clone();
-                            super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
-                                state,
-                                events,
-                                replacement_action_event_start,
-                            );
-                        }
-                    }
+                if let Some(next) = drain_discard_batch_after_replacement(
+                    state,
+                    events,
+                    replacement_action_event_start,
+                )? {
+                    waiting_for = next;
                 }
             }
 
@@ -1775,15 +1831,39 @@ fn handle_replacement_choice_inner(
                 // CR 101.4 + CR 616.1: resume an `EachPlayerCopyChosen` walk whose
                 // counter placement was prevented — advance to the next player.
                 maybe_drain_each_player_copy_chosen(state, events);
+                // CR 608.2c: preventing counters does not cancel the discard
+                // whose completed move owns this settled delivery-tail child.
+                if matches!(state.waiting_for, WaitingFor::Priority { .. })
+                    && state.active_counter_additions().is_none()
+                    && state.pending_discard_batch.as_ref().is_some_and(|batch| {
+                        parked_affected_object_id == Some(batch.paused_card.object_id)
+                            && parked_discard_batch_owner
+                                == Some((
+                                    batch.paused_card,
+                                    batch.player,
+                                    batch.source_id,
+                                    batch.discard_frame,
+                                ))
+                            && is_parked_discard_delivery(&batch.preceding_events)
+                    })
+                {
+                    let next = drain_discard_batch_after_replacement(
+                        state,
+                        events,
+                        replacement_action_event_start,
+                    )?;
+                    if next.is_none() {
+                        super::engine::resume_pending_continuation_if_priority(state, events)?;
+                    }
+                }
                 // Same position as the Execute arm's call in program terms: this block
                 // RETURNS at the next line, so "after every drain of this arm" and "here"
                 // are the same point.
                 finish_spell_resolution_exposed_by_child(state, parked_affected_object_id, events);
                 // CR 614.12 + CR 616.1: a prevented placement still owes a settled
                 // enter-as-copy entry its fallible tail. Run the engine boundary
-                // (which consumes that tail) only when such a tail is ready; every
-                // other prevented-counter pause keeps its existing, non-resuming
-                // exit.
+                // (which consumes that tail) only when such a tail is ready;
+                // the completed discard owner above has its own resume boundary.
                 if effects::counters::copy_entry_completion_is_ready(state) {
                     super::engine::resume_pending_continuation_if_priority(state, events)?;
                 }
