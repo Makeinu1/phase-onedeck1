@@ -1,0 +1,35 @@
+name: Diag A3a shard 1 (fork-only)
+on:
+  push:
+    branches: ['diag/a3a-shard1']
+jobs:
+  shard3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free runner disk
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: wasm32-unknown-unknown
+          cache-shared-key: rust-debug
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Enable sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Run shard 1/5 and publish failures as annotations
+        run: |
+          set +e
+          cargo nextest run --profile ci --workspace --exclude phase-tauri --features engine/proptest --partition count:1/5 --no-fail-fast --status-level fail --final-status-level fail > out.txt 2>&1
+          code=$?
+          grep -E '^\s*(FAIL|SIGABRT|SIGSEGV|TIMEOUT)\b' out.txt | head -20 | sed 's/^\s*/::error::/'
+          grep -E 'panicked at|assertion|left:|right:|::error::' out.txt | head -40 | sed 's/^\s*/::warning::/'
+          grep -E '^(error(\[E[0-9]+\])?:|  --> )' out.txt | head -20 | sed 's/^/::warning::/'
+          tail -8 out.txt
+          exit $code
