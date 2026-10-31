@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::ai_support::copy_target_mana_value_ceiling;
+use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::types::ability::{
     AbilityDefinition, AttachCardinality, AttachSelection, ChosenAttribute, CopyTargetPurpose,
     Effect, EffectKind, PostReplacementContinuation, ResolvedAbility, TargetFilter, TargetRef,
@@ -50,6 +51,34 @@ fn maybe_drain_each_player_copy_chosen(state: &mut GameState, events: &mut Vec<G
     {
         effects::each_player_copy_chosen::drain_pending(state, events);
     }
+}
+
+/// CR 608.2c + CR 608.2i: finish the paused discard instruction and publish its
+/// whole result before resuming the following instructions. A new prompt keeps
+/// the current action's observer span deferred at the existing choice boundary.
+fn drain_discard_batch_after_replacement(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    action_event_start: usize,
+) -> Result<Option<WaitingFor>, EngineError> {
+    match effects::drain_pending_discard_batch(state, events)
+        .map_err(|error| EngineError::InvalidAction(error.to_string()))?
+    {
+        effects::PendingDiscardBatchOutcome::Idle => return Ok(None),
+        effects::PendingDiscardBatchOutcome::PausedForReplacement => {}
+        effects::PendingDiscardBatchOutcome::Completed => {
+            effects::drain_pending_continuation(state, events);
+            if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                return Ok(None);
+            }
+        }
+    }
+    super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
+        state,
+        events,
+        action_event_start,
+    );
+    Ok(Some(state.waiting_for.clone()))
 }
 
 /// CR 608.3a / CR 608.3c + CR 400.7d + CR 616.1f: complete a permanent spell's
@@ -188,11 +217,11 @@ pub(super) fn handle_replacement_choice(
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     let action_event_start = events.len();
-    // A record stamped for rejection came from an action-ingress life change.
-    // Resume it inside an ingress window so every life settlement the handler
-    // reaches (a substitute's drain, post-replacement continuations, nested
-    // parks) is held to the same rule; the window closes before the combat
-    // lifelink batch resumes.
+    // A record stamped for rejection came from an action-ingress player-resource
+    // change. Resume it inside an ingress window so every life, player-counter
+    // and energy settlement the handler reaches (a substitute's drain,
+    // post-replacement continuations, nested parks) is held to the same rule;
+    // the window closes before the combat lifelink batch resumes.
     let parked_for_rejection = state.pending_replacement.as_ref().is_some_and(|pending| {
         pending.unrepresentable_life_change == UnrepresentablePolicy::Reject
     });
@@ -221,6 +250,75 @@ pub(super) fn handle_replacement_choice(
     )
 }
 
+/// What resuming a parked player-scope sacrifice batch produced.
+pub(crate) struct PausedPlayerScopeSacrificeResume {
+    /// The wait the caller must adopt, when the resume left a prompt open.
+    pub(crate) next_wait: Option<WaitingFor>,
+    /// CR 603.2 + CR 603.10a: the completed batch's own event span in the
+    /// buffer the helper was handed. Its observers belong to whichever
+    /// collector scans that buffer: the replacement action's post-action
+    /// pipeline, or the departure settlement.
+    pub(crate) completed_batch: Option<std::ops::Range<usize>>,
+}
+
+/// CR 101.4 + CR 616.1: resume a simultaneous player-scope sacrifice batch
+/// parked on a CR 616.1 choice. Collects no triggers: it reports the wait the
+/// caller must adopt and the completed batch's own event span, and the caller's
+/// collector observes that span (CR 603.2).
+pub(crate) fn resume_paused_player_scope_sacrifice(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Result<PausedPlayerScopeSacrificeResume, EngineError> {
+    let Some(sacrifice_source_id) = state
+        .pending_player_scope_sacrifice_choice
+        .as_ref()
+        .map(|pending| pending.ability.source_id)
+    else {
+        return Ok(PausedPlayerScopeSacrificeResume {
+            next_wait: None,
+            completed_batch: None,
+        });
+    };
+    match effects::drain_pending_player_scope_sacrifice_after_replacement(state, events)
+        .map_err(|error| EngineError::InvalidAction(error.to_string()))?
+    {
+        effects::PendingPlayerScopeSacrificeOutcome::WaitingForNextChoice => {
+            Ok(PausedPlayerScopeSacrificeResume {
+                next_wait: None,
+                completed_batch: None,
+            })
+        }
+        // The paused members' events stay in the carrier's deferred span, so
+        // nothing of the batch is observable yet.
+        effects::PendingPlayerScopeSacrificeOutcome::PausedForReplacement => {
+            Ok(PausedPlayerScopeSacrificeResume {
+                next_wait: Some(state.waiting_for.clone()),
+                completed_batch: None,
+            })
+        }
+        effects::PendingPlayerScopeSacrificeOutcome::Completed {
+            events_before_sacrifice,
+            events_after_sacrifice,
+            sacrificed_count,
+        } => {
+            effects::stamp_active_player_action_completion(
+                state,
+                sacrifice_source_id,
+                crate::types::ability::EffectResolutionResult {
+                    cause: crate::types::ability::ThisWayCause::Sacrificed,
+                    count: sacrificed_count,
+                },
+            );
+            effects::drain_pending_continuation(state, events);
+            Ok(PausedPlayerScopeSacrificeResume {
+                next_wait: (!matches!(state.waiting_for, WaitingFor::Priority { .. }))
+                    .then(|| state.waiting_for.clone()),
+                completed_batch: Some(events_before_sacrifice..events_after_sacrifice),
+            })
+        }
+    }
+}
+
 fn handle_replacement_choice_inner(
     state: &mut GameState,
     index: usize,
@@ -238,6 +336,151 @@ fn handle_replacement_choice_inner(
         )));
     }
     let replacement_action_event_start = events.len();
+    let parked_discard_batch_owner = state.pending_discard_batch.as_ref().map(|batch| {
+        (
+            batch.paused_card,
+            batch.player,
+            batch.source_id,
+            batch.discard_frame,
+        )
+    });
+    let original_discard_response = state.pending_discard_batch.as_ref().is_some_and(|batch| {
+        batch.paused_card.is_current(state)
+            && state
+                .objects
+                .get(&batch.paused_card.object_id)
+                .is_some_and(|object| object.zone == Zone::Hand && object.owner == batch.player)
+            && state
+                .pending_replacement
+                .as_ref()
+                .is_some_and(|pending| match &pending.proposed {
+                    ProposedEvent::Discard {
+                        player_id,
+                        object_id,
+                        source_id,
+                        discard_frame,
+                        caused_by_effect: true,
+                        ..
+                    } => {
+                        *player_id == batch.player
+                            && *object_id == batch.paused_card.object_id
+                            && *source_id == Some(batch.source_id)
+                            && *discard_frame == batch.discard_frame
+                    }
+                    ProposedEvent::ZoneChange {
+                        object_id,
+                        from: Zone::Hand,
+                        cause,
+                        discard_frame,
+                        ..
+                    } => {
+                        *object_id == batch.paused_card.object_id
+                            && *cause == Some(batch.source_id)
+                            && *discard_frame == batch.discard_frame
+                    }
+                    _ => false,
+                })
+    });
+    let parked_discard_provenance = pending.discard_provenance.as_deref().cloned().or_else(|| {
+        (original_discard_response
+            && state
+                .pending_discard_batch
+                .as_ref()
+                .is_some_and(|batch| batch.discard_frame.is_none()))
+        .then(|| {
+            let batch = state
+                .pending_discard_batch
+                .as_ref()
+                .expect("proven original batch");
+            crate::types::game_state::PendingDiscardProvenance {
+                observation: batch.observation.clone(),
+                original_hand: Some(batch.paused_card),
+                object_id: batch.paused_card.object_id,
+                player_id: batch.player,
+                source_id: Some(batch.source_id),
+            }
+        })
+    });
+    // CR 400.7 + CR 701.9a: an answer cannot discard a later occurrence of this storage id.
+    if let Some(provenance) = parked_discard_provenance.as_ref() {
+        let matching = match &pending.proposed {
+            ProposedEvent::Discard {
+                object_id,
+                player_id,
+                source_id,
+                discard_frame: None,
+                ..
+            } => {
+                *object_id == provenance.object_id
+                    && *player_id == provenance.player_id
+                    && *source_id == provenance.source_id
+            }
+            ProposedEvent::ZoneChange {
+                object_id,
+                from: Zone::Hand,
+                discard_frame: None,
+                ..
+            } => *object_id == provenance.object_id,
+            _ => false,
+        };
+        if !matching
+            || !provenance.original_hand.is_some_and(|pin| {
+                pin.object_id == provenance.object_id
+                    && pin.is_current(state)
+                    && state.objects.get(&pin.object_id).is_some_and(|object| {
+                        object.zone == Zone::Hand && object.owner == provenance.player_id
+                    })
+            })
+        {
+            return Err(EngineError::InvalidAction(
+                "pending discard lacks current original-hand authority".into(),
+            ));
+        }
+    } else if matches!(
+        pending.proposed,
+        ProposedEvent::Discard {
+            discard_frame: None,
+            ..
+        }
+    ) {
+        return Err(EngineError::InvalidAction(
+            "pending discard lacks original-hand authority".into(),
+        ));
+    }
+    let is_parked_discard_delivery = |events: &[GameEvent]| {
+        let Some((paused_card, player, source_id, _)) = parked_discard_batch_owner else {
+            return false;
+        };
+        let left_hand = events.iter().any(|event| {
+            matches!(event, GameEvent::ZoneChanged { from: Some(Zone::Hand), record, .. }
+                if record.trigger_source_context().is_some_and(|context|
+                    context.identity.reference == paused_card))
+        });
+        let discarded = events.iter().any(|event| {
+            matches!(event, GameEvent::Discarded { player_id, object_id, source_id: event_source, .. }
+                if *player_id == player && *object_id == paused_card.object_id
+                    && *event_source == Some(source_id))
+        });
+        left_hand && discarded
+    };
+    // CR 608.2i: a post-move counter pause must retain this delivery's result
+    // window on the same batch for its later look-back, without republishing it.
+    let retain_paused_discard_batch_events = |state: &mut GameState, events: &[GameEvent]| {
+        let Some(batch) = state.pending_discard_batch.as_mut().filter(|batch| {
+            parked_discard_batch_owner
+                == Some((
+                    batch.paused_card,
+                    batch.player,
+                    batch.source_id,
+                    batch.discard_frame,
+                ))
+        }) else {
+            return;
+        };
+        if is_parked_discard_delivery(events) {
+            batch.preceding_events.extend_from_slice(events);
+        }
+    };
     let parked_search_found_replacement = state
         .pending_replacement
         .as_ref()
@@ -317,8 +560,9 @@ fn handle_replacement_choice_inner(
         .as_ref()
         .map(|pending| pending.lifelink_bonus)
         .unwrap_or(0);
-    // The life-change policy the parked record was stamped with, captured with
-    // the file's other `parked_*` reads before `continue_replacement` consumes it.
+    // The player-resource policy the parked record was stamped with, captured
+    // with the file's other `parked_*` reads before `continue_replacement`
+    // consumes it.
     let parked_life_policy = state
         .pending_replacement
         .as_ref()
@@ -347,7 +591,130 @@ fn handle_replacement_choice_inner(
     // pre-move incarnation and the exact proposed event. Capture this before
     // `continue_replacement` consumes the pending record.
     let parked_zone_change_delivery = state.pending_zone_change_delivery_from_replacement();
-    let result = super::replacement::continue_replacement(state, index, events);
+    if let Some(provenance) = parked_discard_provenance.as_ref() {
+        // The exact legacy batch pin also survives any inner replacement re-park.
+        effects::discard::retain_pending_discard(state, provenance.clone());
+    }
+    let discard_frame =
+        state
+            .pending_replacement
+            .as_ref()
+            .and_then(|pending| match &pending.proposed {
+                ProposedEvent::Discard { discard_frame, .. }
+                | ProposedEvent::ZoneChange {
+                    from: Zone::Hand,
+                    discard_frame,
+                    ..
+                } => *discard_frame,
+                _ => None,
+            });
+    let frame_observation = discard_frame.and_then(|id| {
+        state
+            .resolution_stack
+            .active_discard_or_direct_continuation_parent_mut(id)
+            .map(|frame| (frame.source_id, frame.observation.as_deref().cloned()))
+    });
+    if discard_frame.is_some() && frame_observation.is_none() {
+        return Err(EngineError::InvalidAction(
+            "pending discard lacks an active or direct-parent observation owner".into(),
+        ));
+    }
+    let mut discard_observation = parked_discard_provenance
+        .as_ref()
+        .and_then(|provenance| provenance.observation.as_deref())
+        .cloned()
+        .or_else(|| {
+            state
+                .pending_discard_batch
+                .as_ref()
+                .filter(|batch| {
+                    original_discard_response
+                        || (discard_frame.is_some()
+                            && batch.discard_frame == discard_frame
+                            && parked_affected_object_id == Some(batch.paused_card.object_id)
+                            && frame_observation
+                                .as_ref()
+                                .is_some_and(|(source, _)| *source == Some(batch.source_id))
+                            && batch.observation.as_deref().is_some_and(|observation| {
+                                observation.subject.identity == batch.paused_card
+                                    && observation.subject.owner == batch.player
+                            }))
+                })
+                .and_then(|batch| batch.observation.as_deref())
+                .cloned()
+        })
+        .or_else(|| frame_observation.and_then(|(_, observation)| observation));
+    if parked_discard_provenance.is_some() || discard_frame.is_some() || original_discard_response {
+        let observation = discard_observation.as_ref().ok_or_else(|| {
+            EngineError::InvalidAction("pending discard lacks observation authority".into())
+        })?;
+        if !observation.valid_for(
+            observation.subject.identity.object_id,
+            observation.subject.owner,
+        ) || observation.delivered_to.is_some()
+            || !observation.subject.identity.is_current(state)
+            || parked_affected_object_id != Some(observation.subject.identity.object_id)
+            || !state
+                .objects
+                .get(&observation.subject.identity.object_id)
+                .is_some_and(|object| {
+                    object.zone == Zone::Hand && object.owner == observation.subject.owner
+                })
+            || observation.pending_reveal.as_ref().is_some_and(|bound| {
+                !state
+                    .pending_replacement
+                    .as_ref()
+                    .unwrap()
+                    .proposed
+                    .applied_set()
+                    .contains(&bound.replacement)
+            })
+        {
+            return Err(EngineError::InvalidAction(
+                "pending discard lacks observation authority".into(),
+            ));
+        }
+    }
+    let result = match discard_observation.as_mut() {
+        Some(observation) => {
+            super::replacement::continue_discard_replacement(state, index, observation, events)
+        }
+        None => super::replacement::continue_replacement(state, index, events),
+    };
+    if let Some(observation) = discard_observation.as_ref() {
+        let batch_owns = state.pending_discard_batch.as_ref().is_some_and(|batch| {
+            parked_discard_batch_owner
+                == Some((
+                    batch.paused_card,
+                    batch.player,
+                    batch.source_id,
+                    batch.discard_frame,
+                ))
+                && batch.paused_card == observation.subject.identity
+        });
+        if batch_owns {
+            state.pending_discard_batch.as_mut().unwrap().observation =
+                Some(Box::new(observation.clone()));
+        }
+        let frame = discard_frame.and_then(|id| {
+            state
+                .resolution_stack
+                .active_discard_or_direct_continuation_parent_mut(id)
+        });
+        if let Some(frame) = frame {
+            frame.observation = Some(Box::new(observation.clone()));
+        } else if discard_frame.is_some()
+            && !batch_owns
+            && matches!(
+                result,
+                super::replacement::ReplacementResult::NeedsChoice(_)
+            )
+        {
+            return Err(EngineError::InvalidAction(
+                "pending discard lacks an active or direct-parent observation owner".into(),
+            ));
+        }
+    }
     // CR 614.12a: an optional `MayCost` accept whose payment surfaced an
     // interactive sub-choice (e.g. Mox Diamond's "discard a land card" with
     // multiple eligible lands) re-parked the pending replacement with
@@ -394,16 +761,38 @@ fn handle_replacement_choice_inner(
                 //     is restored structurally inside the shared delivery for
                 //     `Stack → Battlefield` events (`CastLinkSnapshot`).
                 event @ ProposedEvent::ZoneChange { .. } => {
-                    let (object_id, to, cause, discard_frame) = match &event {
+                    let (object_id, from, to, cause, discard_frame) = match &event {
                         ProposedEvent::ZoneChange {
                             object_id,
+                            from,
                             to,
                             cause,
                             discard_frame,
                             ..
-                        } => (*object_id, *to, *cause, *discard_frame),
+                        } => (*object_id, *from, *to, *cause, *discard_frame),
                         _ => unreachable!("arm pattern guarantees ZoneChange"),
                     };
+                    let discard_delivery =
+                        if let Some(provenance) = parked_discard_provenance.as_ref() {
+                            if discard_frame.is_some()
+                                || from != Zone::Hand
+                                || provenance.object_id != object_id
+                                || !provenance.original_hand.is_some_and(|pin| {
+                                    pin.is_current(state)
+                                        && state.objects.get(&pin.object_id).is_some_and(|object| {
+                                            object.zone == Zone::Hand
+                                                && object.owner == provenance.player_id
+                                        })
+                                })
+                            {
+                                return Err(EngineError::InvalidAction(
+                                    "discard delivery lacks current original-hand authority".into(),
+                                ));
+                            }
+                            Some(provenance.clone())
+                        } else {
+                            None
+                        };
                     let Ok(approved) =
                         crate::game::zone_pipeline::ApprovedZoneChange::approve_post_replacement(
                             event,
@@ -412,10 +801,8 @@ fn handle_replacement_choice_inner(
                         unreachable!("arm pattern guarantees a ZoneChange payload");
                     };
                     let delivery_start = events.len();
-                    match crate::game::zone_pipeline::deliver(
-                        state,
-                        approved,
-                        crate::game::zone_pipeline::DeliveryCtx {
+                    let delivery = {
+                        let ctx = crate::game::zone_pipeline::DeliveryCtx {
                             source_id: cause,
                             exile_links: crate::game::zone_pipeline::ExileLinkSpec {
                                 duration: parked_exile_duration,
@@ -429,9 +816,45 @@ fn handle_replacement_choice_inner(
                             // requested index instead of the tail auto-shuffling it
                             // away. `None` for every non-library parked event.
                             library_placement: parked_library_placement.clone(),
-                        },
-                        events,
-                    ) {
+                        };
+                        match discard_observation.as_mut() {
+                            Some(observation) => crate::game::zone_pipeline::deliver_discard(
+                                state,
+                                approved,
+                                ctx,
+                                observation,
+                                events,
+                            ),
+                            None => {
+                                crate::game::zone_pipeline::deliver(state, approved, ctx, events)
+                            }
+                        }
+                    };
+                    if let Some(observation) = discard_observation.as_ref() {
+                        if let Some(batch) = state
+                            .pending_discard_batch
+                            .as_mut()
+                            .filter(|batch| batch.paused_card == observation.subject.identity)
+                        {
+                            batch.observation = Some(Box::new(observation.clone()));
+                        }
+                    }
+                    // CR 701.9a + CR 701.9c: the discard is complete when its card leaves hand,
+                    // even if counter replacement work subsequently needs a choice.
+                    if let Some(mut provenance) = discard_delivery {
+                        provenance.observation =
+                            discard_observation.as_ref().cloned().map(Box::new);
+                        if state
+                            .objects
+                            .get(&object_id)
+                            .is_some_and(|object| object.zone != Zone::Hand)
+                        {
+                            effects::discard::record_completed_discard(state, provenance, events);
+                        } else {
+                            effects::discard::retain_pending_discard(state, provenance.clone());
+                        }
+                    }
+                    match delivery {
                         crate::game::zone_pipeline::ZoneDeliveryResult::Done => {}
                         // CR 614.1c / CR 614.12a: the delivery tail parked a
                         // counter-replacement or devour prompt and stashed the
@@ -450,6 +873,10 @@ fn handle_replacement_choice_inner(
                                     pending.sacrifice_provenance = Some(provenance);
                                 }
                             }
+                            retain_paused_discard_batch_events(state, &events[delivery_start..]);
+                            super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
+                                state, events, replacement_action_event_start,
+                            );
                             return Ok(state.waiting_for.clone());
                         }
                     }
@@ -563,6 +990,10 @@ fn handle_replacement_choice_inner(
                 }
                 // CR 122.1: Counter addition accepted after replacement choice (e.g.,
                 // Corpsejack Menace doubler on a prompted counter-placement).
+                // CR 122.1 + CR 616.1: a player or energy placement settles under
+                // the policy the parked record was stamped with: `Reject` fails
+                // the answer (the boundary restores the record and prompt),
+                // `IgnoreImpossible` records into the open window.
                 ProposedEvent::AddCounter {
                     placement, count, ..
                 } => match placement {
@@ -587,10 +1018,17 @@ fn handle_replacement_choice_inner(
                         player_id,
                         counter_kind,
                         count,
+                        parked_life_policy,
                         events,
-                    ),
+                    )?,
                     CounterPlacement::Energy { player_id, .. } => {
-                        effects::energy::apply_energy_addition(state, player_id, count, events)
+                        effects::energy::apply_energy_addition(
+                            state,
+                            player_id,
+                            count,
+                            parked_life_policy,
+                            events,
+                        )?
                     }
                 },
                 // CR 122.1: Counter removal accepted after replacement choice.
@@ -839,10 +1277,41 @@ fn handle_replacement_choice_inner(
                     applied,
                     ..
                 } => {
-                    if let effects::discard::DiscardOutcome::NeedsReplacementChoice(player) =
+                    let (observation, player_id, source_id) = if discard_frame.is_none() {
+                        let provenance = parked_discard_provenance
+                            .as_ref()
+                            .expect("no-frame authority checked before continue");
+                        if provenance.object_id != object_id
+                            || provenance.player_id != player_id
+                            || provenance.source_id != source_id
+                        {
+                            return Err(EngineError::InvalidAction(
+                                "discard delivery mismatches original-hand authority".into(),
+                            ));
+                        }
+                        (
+                            discard_observation
+                                .take()
+                                .expect("validated original discard observation"),
+                            provenance.player_id,
+                            provenance.source_id,
+                        )
+                    } else {
+                        (
+                            discard_observation.take().ok_or_else(|| {
+                                EngineError::InvalidAction(
+                                    "pending discard lacks observation authority".into(),
+                                )
+                            })?,
+                            player_id,
+                            source_id,
+                        )
+                    };
+                    let delivery_start = events.len();
+                    if let effects::discard::DiscardOutcome::NeedsChoice(player) =
                         effects::discard::complete_discard_to_graveyard(
                             state,
-                            object_id,
+                            observation,
                             player_id,
                             source_id,
                             discard_frame,
@@ -850,8 +1319,18 @@ fn handle_replacement_choice_inner(
                             events,
                         )
                     {
-                        state.waiting_for =
-                            crate::game::replacement::replacement_choice_waiting_for(player, state);
+                        if let Some(batch) = state.pending_discard_batch.as_mut().filter(|batch| {
+                            batch.paused_card == player.observation.subject.identity
+                        }) {
+                            batch.observation = Some(Box::new(player.observation));
+                        }
+                        state.waiting_for = player.waiting_for;
+                        retain_paused_discard_batch_events(state, &events[delivery_start..]);
+                        super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
+                            state,
+                            events,
+                            replacement_action_event_start,
+                        );
                         return Ok(state.waiting_for.clone());
                     }
                 }
@@ -1268,35 +1747,10 @@ fn handle_replacement_choice_inner(
                 // CR 101.4: a simultaneous each-player sacrifice paused by a
                 // CR 616.1 replacement choice resumes the already-announced
                 // remaining sacrifices before any parked continuation can run.
-                let sacrifice_source_id = state
-                    .pending_player_scope_sacrifice_choice
-                    .as_ref()
-                    .map(|pending| pending.ability.source_id)
-                    .expect("active sacrifice choice owns its source identity");
-                match effects::drain_pending_player_scope_sacrifice_after_replacement(state, events)
-                    .map_err(|error| EngineError::InvalidAction(error.to_string()))?
-                {
-                    effects::PendingPlayerScopeSacrificeOutcome::WaitingForNextChoice => {}
-                    effects::PendingPlayerScopeSacrificeOutcome::PausedForReplacement => {
-                        waiting_for = state.waiting_for.clone();
-                    }
-                    effects::PendingPlayerScopeSacrificeOutcome::Completed {
-                        sacrificed_count,
-                        ..
-                    } => {
-                        effects::stamp_active_player_action_completion(
-                            state,
-                            sacrifice_source_id,
-                            crate::types::ability::EffectResolutionResult {
-                                cause: crate::types::ability::ThisWayCause::Sacrificed,
-                                count: sacrificed_count,
-                            },
-                        );
-                        effects::drain_pending_continuation(state, events);
-                        if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
-                            waiting_for = state.waiting_for.clone();
-                        }
-                    }
+                // CR 603.2: the completed batch lies inside this action's buffer,
+                // which the post-action pipeline scans; it is not collected here.
+                if let Some(next) = resume_paused_player_scope_sacrifice(state, events)?.next_wait {
+                    waiting_for = next;
                 }
             }
 
@@ -1306,31 +1760,28 @@ fn handle_replacement_choice_inner(
             // instructions in written order, so later instructions cannot resume
             // until this action has settled and published its terminal result.
             if matches!(waiting_for, WaitingFor::Priority { .. })
-                && state.pending_discard_batch.is_some()
-            {
-                match effects::drain_pending_discard_batch(state, events)
-                    .map_err(|error| EngineError::InvalidAction(error.to_string()))?
-                {
-                    effects::PendingDiscardBatchOutcome::Idle => {}
-                    effects::PendingDiscardBatchOutcome::PausedForReplacement => {
-                        waiting_for = state.waiting_for.clone();
-                        super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
-                            state,
-                            events,
-                            replacement_action_event_start,
-                        );
-                    }
-                    effects::PendingDiscardBatchOutcome::Completed => {
-                        effects::drain_pending_continuation(state, events);
-                        if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
-                            waiting_for = state.waiting_for.clone();
-                            super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
-                                state,
-                                events,
-                                replacement_action_event_start,
-                            );
+                && state.pending_discard_batch_is_due()
+                && state.pending_discard_batch.as_ref().is_some_and(|batch| {
+                    parked_discard_batch_owner
+                        == Some((
+                            batch.paused_card,
+                            batch.player,
+                            batch.source_id,
+                            batch.discard_frame,
+                        ))
+                        && {
+                            let mut window = batch.preceding_events.clone();
+                            window.extend_from_slice(events);
+                            is_parked_discard_delivery(&window)
                         }
-                    }
+                })
+            {
+                if let Some(next) = drain_discard_batch_after_replacement(
+                    state,
+                    events,
+                    replacement_action_event_start,
+                )? {
+                    waiting_for = next;
                 }
             }
 
@@ -1501,6 +1952,17 @@ fn handle_replacement_choice_inner(
                 waiting_for = state.waiting_for.clone();
             }
 
+            if !matches!(waiting_for, WaitingFor::Priority { .. }) {
+                retain_paused_discard_batch_events(
+                    state,
+                    &events[replacement_action_event_start..],
+                );
+                super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
+                    state,
+                    events,
+                    replacement_action_event_start,
+                );
+            }
             Ok(waiting_for)
         }
         super::replacement::ReplacementResult::NeedsChoice(player) => {
@@ -1558,6 +2020,21 @@ fn handle_replacement_choice_inner(
             ))
         }
         super::replacement::ReplacementResult::Prevented => {
+            // CR 614.6: only preventing this exact original discard may advance without a departure.
+            if original_discard_response && state.pending_discard_batch_is_due() {
+                state.waiting_for = WaitingFor::Priority {
+                    player: state.active_player,
+                };
+                if let Some(next) = drain_discard_batch_after_replacement(
+                    state,
+                    events,
+                    replacement_action_event_start,
+                )? {
+                    return Ok(next);
+                }
+                super::engine::resume_pending_continuation_if_priority(state, events)?;
+                return Ok(state.waiting_for.clone());
+            }
             if let Some(paused) = parked_zone_change_delivery.as_ref() {
                 state.capture_paused_zone_change_delivery(
                     paused.member,
@@ -1690,15 +2167,40 @@ fn handle_replacement_choice_inner(
                 // CR 101.4 + CR 616.1: resume an `EachPlayerCopyChosen` walk whose
                 // counter placement was prevented — advance to the next player.
                 maybe_drain_each_player_copy_chosen(state, events);
+                // CR 608.2c: preventing counters does not cancel the discard
+                // whose completed move owns this settled delivery-tail child.
+                if matches!(state.waiting_for, WaitingFor::Priority { .. })
+                    && state.active_counter_additions().is_none()
+                    && state.pending_discard_batch_is_due()
+                    && state.pending_discard_batch.as_ref().is_some_and(|batch| {
+                        parked_affected_object_id == Some(batch.paused_card.object_id)
+                            && parked_discard_batch_owner
+                                == Some((
+                                    batch.paused_card,
+                                    batch.player,
+                                    batch.source_id,
+                                    batch.discard_frame,
+                                ))
+                            && is_parked_discard_delivery(&batch.preceding_events)
+                    })
+                {
+                    let next = drain_discard_batch_after_replacement(
+                        state,
+                        events,
+                        replacement_action_event_start,
+                    )?;
+                    if next.is_none() {
+                        super::engine::resume_pending_continuation_if_priority(state, events)?;
+                    }
+                }
                 // Same position as the Execute arm's call in program terms: this block
                 // RETURNS at the next line, so "after every drain of this arm" and "here"
                 // are the same point.
                 finish_spell_resolution_exposed_by_child(state, parked_affected_object_id, events);
                 // CR 614.12 + CR 616.1: a prevented placement still owes a settled
                 // enter-as-copy entry its fallible tail. Run the engine boundary
-                // (which consumes that tail) only when such a tail is ready; every
-                // other prevented-counter pause keeps its existing, non-resuming
-                // exit.
+                // (which consumes that tail) only when such a tail is ready;
+                // the completed discard owner above has its own resume boundary.
                 if effects::counters::copy_entry_completion_is_ready(state) {
                     super::engine::resume_pending_continuation_if_priority(state, events)?;
                 }
@@ -2724,6 +3226,13 @@ pub(super) fn handle_copy_target_choice(
         // only the liminal entry's PRESENCE matters here: it is what says this commit will park
         // an entry that later needs realizing.
         let has_liminal_entry = state.liminal_entries.contains_key(&source_id);
+        // CR 508.4: how many tokens of the batch exist once this entry is
+        // realized; the continuation parked behind a pause counts its own
+        // tokens from zero, so its request has to start past them.
+        let entrants_through_this_entry = state
+            .liminal_entries
+            .get(&source_id)
+            .map_or(0, |entry| entry.created_ids.len() + 1);
         let copy_continuation = state.liminal_entries.get(&source_id).and_then(|entry| {
             entry.copy_resume.as_ref().and_then(|copy| {
                 (entry.remaining_count > 0).then(|| {
@@ -2821,9 +3330,12 @@ pub(super) fn handle_copy_target_choice(
                 },
             );
         }
-        if let Some((owner, copy, enter_tapped, enter_with_counters, remaining_count)) =
+        if let Some((owner, mut copy, enter_tapped, enter_with_counters, remaining_count)) =
             copy_continuation.clone()
         {
+            copy.attack_request = copy
+                .attack_request
+                .after_entrants(entrants_through_this_entry);
             counter_pause_post_actions.push(PendingCounterPostAction::ContinueCopyTokenCreation {
                 owner,
                 copy,
@@ -3915,7 +4427,9 @@ pub(crate) fn apply_pending_post_replacement_effect(
         // CR 614.12a + CR 614.13a: A Devour snapshot created by this completed
         // entry can sit above this just-retired drain. It has no remaining
         // iteration or prompt owner, so retire it before priority is restored.
-        state.clear_completed_active_devour_snapshot();
+        if state.clear_completed_active_devour_snapshot() {
+            state.remove_empty_active_post_replacement_frame();
+        }
     }
     // NOTE: the inherited token-choice applied seed is intentionally NOT cleared
     // here. This drain runs for EVERY replacement continuation — including a
@@ -4557,6 +5071,7 @@ mod tests {
                 applied: HashSet::new(),
             },
             sacrifice_provenance: None,
+            discard_provenance: None,
             candidates: vec![ReplacementId {
                 source: candidate,
                 index: 0,
@@ -5235,6 +5750,7 @@ mod tests {
                 applied: std::collections::HashSet::new(),
             },
             sacrifice_provenance: None,
+            discard_provenance: None,
             candidates: vec![ReplacementId {
                 source: bear,
                 index: 0,
@@ -5836,6 +6352,7 @@ mod tests {
             enter_with_counters: Vec::new(),
             tapped: false,
             enters_attacking: false,
+            attack_request: crate::types::proposed_event::TokenAttackRequest::Unspecified,
             sacrifice_at: None,
             source_id: ObjectId(1),
             controller: PlayerId(0),
@@ -5922,6 +6439,8 @@ mod tests {
                     owner: crate::types::ability::TargetFilter::Controller,
                     attach_to: None,
                     enters_attacking: false,
+                    attack_destination:
+                        crate::types::ability::TokenAttackDestination::ControllerChooses,
                     supertypes: vec![],
                     static_abilities: vec![],
                     enter_with_counters: vec![],
@@ -5964,6 +6483,7 @@ mod tests {
             enter_with_counters: Vec::new(),
             tapped: false,
             enters_attacking: false,
+            attack_request: crate::types::proposed_event::TokenAttackRequest::Unspecified,
             sacrifice_at: None,
             source_id: replacement_source,
             controller: PlayerId(0),
@@ -6067,6 +6587,8 @@ mod tests {
                     owner: crate::types::ability::TargetFilter::Controller,
                     attach_to: None,
                     enters_attacking: false,
+                    attack_destination:
+                        crate::types::ability::TokenAttackDestination::ControllerChooses,
                     supertypes: vec![],
                     static_abilities: vec![],
                     enter_with_counters: vec![],
@@ -6126,6 +6648,7 @@ mod tests {
             enter_with_counters: Vec::new(),
             tapped: false,
             enters_attacking: false,
+            attack_request: crate::types::proposed_event::TokenAttackRequest::Unspecified,
             sacrifice_at: None,
             source_id: replacement_source,
             controller: PlayerId(0),
@@ -6246,6 +6769,8 @@ mod tests {
                     owner: crate::types::ability::TargetFilter::Controller,
                     attach_to: None,
                     enters_attacking: false,
+                    attack_destination:
+                        crate::types::ability::TokenAttackDestination::ControllerChooses,
                     supertypes: vec![],
                     static_abilities: vec![],
                     enter_with_counters: vec![],
@@ -6304,6 +6829,7 @@ mod tests {
             enter_with_counters: Vec::new(),
             tapped: false,
             enters_attacking: false,
+            attack_request: crate::types::proposed_event::TokenAttackRequest::Unspecified,
             sacrifice_at: None,
             source_id: replacement_source,
             controller: PlayerId(0),
@@ -6460,6 +6986,7 @@ mod tests {
             enter_with_counters: Vec::new(),
             tapped: false,
             enters_attacking: false,
+            attack_request: crate::types::proposed_event::TokenAttackRequest::Unspecified,
             sacrifice_at: None,
             source_id: jinnie_source,
             controller: PlayerId(0),
@@ -6536,6 +7063,8 @@ mod tests {
                     owner: crate::types::ability::TargetFilter::Controller,
                     attach_to: None,
                     enters_attacking: false,
+                    attack_destination:
+                        crate::types::ability::TokenAttackDestination::ControllerChooses,
                     supertypes: vec![],
                     static_abilities: vec![],
                     enter_with_counters: vec![],
@@ -6601,6 +7130,7 @@ mod tests {
             enter_with_counters: Vec::new(),
             tapped: false,
             enters_attacking: false,
+            attack_request: crate::types::proposed_event::TokenAttackRequest::Unspecified,
             sacrifice_at: None,
             source_id: jinnie_source,
             controller: PlayerId(0),
@@ -8653,6 +9183,7 @@ mod tests {
                 additional_modifications: Vec::new(),
                 tapped: false,
                 enters_attacking: false,
+                attack_request: crate::types::proposed_event::TokenAttackRequest::Unspecified,
                 sacrifice_at: None,
                 source_id: entering_aura,
                 controller: PlayerId(0),
@@ -9315,6 +9846,7 @@ mod tests {
                 source_id: ObjectId(999),
                 controller: PlayerId(0),
                 enters_attacking: false,
+                attack_destination: crate::types::ability::EntryAttackDestination::AnyDefender,
                 attach_to: None,
                 sacrifice_at: None,
                 remaining_count: 0,

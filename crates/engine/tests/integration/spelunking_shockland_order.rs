@@ -388,6 +388,7 @@ fn legacy_save_restores_a_search_found_prompt_as_search_found_not_ordering() {
             applied: Default::default(),
         },
         sacrifice_provenance: None,
+        discard_provenance: None,
         candidates: vec![rid],
         search_found_candidates: vec![candidate],
         depth: 0,

@@ -2364,10 +2364,11 @@ pub(super) fn handle_ward_discard_choice(
         ));
     }
 
-    if let effects::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) =
+    let observation = effects::discard::capture_discard_observation(state, chosen[0]);
+    if let effects::discard::DiscardOutcome::NeedsChoice(choice_player) =
         effects::discard::complete_discard_to_graveyard(
             state,
-            chosen[0],
+            observation,
             player,
             Some(pending_effect.source_id),
             None,
@@ -2375,8 +2376,7 @@ pub(super) fn handle_ward_discard_choice(
             events,
         )
     {
-        state.waiting_for =
-            crate::game::replacement::replacement_choice_waiting_for(choice_player, state);
+        state.waiting_for = choice_player.waiting_for;
         return Ok(state.waiting_for.clone());
     }
 
