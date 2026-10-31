@@ -1035,35 +1035,68 @@ fn batch_or_drain_observer_triggers(
 /// `events` is the current action buffer. Under a live announcement only the
 /// span it does not own is collected here (CR 601.2h + CR 603.3), and an event
 /// another collector already claimed this action is not collected again
-/// (CR 603.2c).
+/// (CR 603.2c). Only completed discard occurrences belong to this hook;
+/// zone groups and entry observers retain their existing collection owners.
 pub(crate) fn defer_observer_triggers_for_paused_choice(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
     event_start: usize,
 ) {
     let owned = super::announcement_triggers::take_inline_trigger_span(state, events, event_start);
-    let trigger_events: Vec<GameEvent> =
-        unclaimed_observer_events(state, events, owned.start, owned.end)
-            .into_iter()
-            .filter(|event| !matches!(event, GameEvent::PhaseChanged { .. }))
-            .collect();
+    let buffer = &events[..owned.end];
+    let selected: Vec<_> = (owned.start..owned.end)
+        .filter(|&index| {
+            matches!(buffer[index], GameEvent::Discarded { .. })
+                && !state
+                    .consumed_before_priority_trigger_events
+                    .iter()
+                    .any(|claim| {
+                        claim.event == buffer[index]
+                            && claim.occurrence
+                                == super::triggers::trigger_event_occurrence(buffer, index)
+                            && claim
+                                .scope
+                                .consumes(super::triggers::TriggerCollectionRequester::Ordinary)
+                    })
+        })
+        .collect();
+    let trigger_events: Vec<_> = selected
+        .iter()
+        .map(|&index| buffer[index].clone())
+        .collect();
     if !trigger_events.is_empty() {
         super::triggers::collect_triggers_into_deferred(state, &trigger_events);
+        let occurrences = selected
+            .into_iter()
+            .map(|index| super::triggers::ConsumedTriggerEventOccurrence {
+                event: buffer[index].clone(),
+                occurrence: super::triggers::trigger_event_occurrence(buffer, index),
+                scope: super::triggers::ConsumedTriggerEventScope::OrdinaryCollectorsOnly,
+            })
+            .collect();
+        super::triggers::resolve_and_apply_trigger_collection(
+            state,
+            crate::types::resolved_commands::ResolvedTriggerCollection::ConsumeBeforePriority {
+                occurrences,
+            },
+        )
+        .expect("completed discard observer claims have a live journal cause");
     }
-    super::triggers::claim_events_for_ordinary_collection(state, &events[..owned.end], owned.start);
-    // CR 603.2 + CR 603.3: delayed observers share this pause boundary, but
-    // ordinary-only ownership claims must not hide their event occurrences.
-    let delayed_events = super::triggers::unclaimed_trigger_events_from(
-        &events[..owned.end],
+    // CR 603.2c: delayed observers retain the same full-buffer occurrence identity.
+    let mut delayed_events = super::triggers::unclaimed_trigger_events_from(
+        buffer,
         owned.start,
         super::triggers::TriggerCollectionRequester::Delayed,
         &state.consumed_before_priority_trigger_events,
     );
-    super::triggers::collect_unclaimed_delayed_triggers_into_deferred(
-        state,
-        &events[..owned.end],
-        &delayed_events,
-    );
+    delayed_events.retain(|event| matches!(event, GameEvent::Discarded { .. }));
+    if !delayed_events.events.is_empty() {
+        super::triggers::collect_unclaimed_delayed_triggers_into_deferred(
+            state,
+            buffer,
+            &delayed_events,
+        );
+    }
 }
 
 /// CR 603.2 + CR 603.3b + CR 701.23: after a search tutor's put/shuffle
@@ -6950,6 +6983,11 @@ pub(super) fn handle_resolution_choice(
                 };
                 if let Some(result) = result {
                     effects::stamp_active_player_action_completion(state, source_id, result);
+                }
+                if matches!(effect_kind, EffectKind::Sacrifice)
+                    && state.active_ability_continuation().is_none()
+                {
+                    state.finish_active_paused_post_replacement_dispatch();
                 }
                 set_priority(state, player);
                 resume_with_error_propagation(state, events)?;

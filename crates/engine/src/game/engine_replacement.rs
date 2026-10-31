@@ -381,6 +381,71 @@ fn handle_replacement_choice_inner(
                     _ => false,
                 })
     });
+    let parked_discard_provenance = pending.discard_provenance.as_deref().copied().or_else(|| {
+        (original_discard_response
+            && state
+                .pending_discard_batch
+                .as_ref()
+                .is_some_and(|batch| batch.discard_frame.is_none()))
+        .then(|| {
+            let batch = state
+                .pending_discard_batch
+                .as_ref()
+                .expect("proven original batch");
+            crate::types::game_state::PendingDiscardProvenance {
+                original_hand: Some(batch.paused_card),
+                object_id: batch.paused_card.object_id,
+                player_id: batch.player,
+                source_id: Some(batch.source_id),
+            }
+        })
+    });
+    // CR 400.7 + CR 701.9a: an answer cannot discard a later occurrence of this storage id.
+    if let Some(provenance) = parked_discard_provenance {
+        let matching = match &pending.proposed {
+            ProposedEvent::Discard {
+                object_id,
+                player_id,
+                source_id,
+                discard_frame: None,
+                ..
+            } => {
+                *object_id == provenance.object_id
+                    && *player_id == provenance.player_id
+                    && *source_id == provenance.source_id
+            }
+            ProposedEvent::ZoneChange {
+                object_id,
+                from: Zone::Hand,
+                discard_frame: None,
+                ..
+            } => *object_id == provenance.object_id,
+            _ => false,
+        };
+        if !matching
+            || !provenance.original_hand.is_some_and(|pin| {
+                pin.object_id == provenance.object_id
+                    && pin.is_current(state)
+                    && state.objects.get(&pin.object_id).is_some_and(|object| {
+                        object.zone == Zone::Hand && object.owner == provenance.player_id
+                    })
+            })
+        {
+            return Err(EngineError::InvalidAction(
+                "pending discard lacks current original-hand authority".into(),
+            ));
+        }
+    } else if matches!(
+        pending.proposed,
+        ProposedEvent::Discard {
+            discard_frame: None,
+            ..
+        }
+    ) {
+        return Err(EngineError::InvalidAction(
+            "pending discard lacks original-hand authority".into(),
+        ));
+    }
     let is_parked_discard_delivery = |events: &[GameEvent]| {
         let Some((paused_card, player, source_id, _)) = parked_discard_batch_owner else {
             return false;
@@ -511,10 +576,6 @@ fn handle_replacement_choice_inner(
         .pending_replacement
         .as_ref()
         .and_then(|pending| pending.sacrifice_provenance);
-    let parked_discard_provenance = state
-        .pending_replacement
-        .as_ref()
-        .and_then(|pending| pending.discard_provenance.as_deref().copied());
     // CR 122.1 + CR 616.1f: the object whose counter placement this resume answers.
     // Captured here, with the file's other `parked_*` reads, because
     // `continue_replacement` below consumes the pending record. The Execute arm's
@@ -529,6 +590,10 @@ fn handle_replacement_choice_inner(
     // pre-move incarnation and the exact proposed event. Capture this before
     // `continue_replacement` consumes the pending record.
     let parked_zone_change_delivery = state.pending_zone_change_delivery_from_replacement();
+    if let Some(provenance) = parked_discard_provenance {
+        // The exact legacy batch pin also survives any inner replacement re-park.
+        effects::discard::retain_pending_discard(state, provenance);
+    }
     let result = super::replacement::continue_replacement(state, index, events);
     // CR 614.12a: an optional `MayCost` accept whose payment surfaced an
     // interactive sub-choice (e.g. Mox Diamond's "discard a land card" with
@@ -587,15 +652,26 @@ fn handle_replacement_choice_inner(
                         } => (*object_id, *from, *to, *cause, *discard_frame),
                         _ => unreachable!("arm pattern guarantees ZoneChange"),
                     };
-                    let discard_delivery = parked_discard_provenance.filter(|provenance| {
-                        discard_frame.is_none()
-                            && from == Zone::Hand
-                            && provenance.object_id == object_id
-                            && state
-                                .objects
-                                .get(&object_id)
-                                .is_some_and(|object| object.zone == Zone::Hand)
-                    });
+                    let discard_delivery = if let Some(provenance) = parked_discard_provenance {
+                        if discard_frame.is_some()
+                            || from != Zone::Hand
+                            || provenance.object_id != object_id
+                            || !provenance.original_hand.is_some_and(|pin| {
+                                pin.is_current(state)
+                                    && state.objects.get(&pin.object_id).is_some_and(|object| {
+                                        object.zone == Zone::Hand
+                                            && object.owner == provenance.player_id
+                                    })
+                            })
+                        {
+                            return Err(EngineError::InvalidAction(
+                                "discard delivery lacks current original-hand authority".into(),
+                            ));
+                        }
+                        Some(provenance)
+                    } else {
+                        None
+                    };
                     let Ok(approved) =
                         crate::game::zone_pipeline::ApprovedZoneChange::approve_post_replacement(
                             event,
@@ -1060,11 +1136,39 @@ fn handle_replacement_choice_inner(
                     applied,
                     ..
                 } => {
+                    let (original_hand, player_id, source_id) = if discard_frame.is_none() {
+                        let provenance = parked_discard_provenance
+                            .expect("no-frame authority checked before continue");
+                        if provenance.object_id != object_id
+                            || provenance.player_id != player_id
+                            || provenance.source_id != source_id
+                        {
+                            return Err(EngineError::InvalidAction(
+                                "discard delivery mismatches original-hand authority".into(),
+                            ));
+                        }
+                        (
+                            provenance.original_hand.expect("validated original pin"),
+                            provenance.player_id,
+                            provenance.source_id,
+                        )
+                    } else {
+                        let pin = state
+                            .objects
+                            .get(&object_id)
+                            .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
+                            .ok_or_else(|| {
+                                EngineError::InvalidAction(
+                                    "discard subject no longer exists".into(),
+                                )
+                            })?;
+                        (pin, player_id, source_id)
+                    };
                     let delivery_start = events.len();
                     if let effects::discard::DiscardOutcome::NeedsChoice(player) =
                         effects::discard::complete_discard_to_graveyard(
                             state,
-                            object_id,
+                            original_hand,
                             player_id,
                             source_id,
                             discard_frame,
@@ -4175,7 +4279,9 @@ pub(crate) fn apply_pending_post_replacement_effect(
         // CR 614.12a + CR 614.13a: A Devour snapshot created by this completed
         // entry can sit above this just-retired drain. It has no remaining
         // iteration or prompt owner, so retire it before priority is restored.
-        state.clear_completed_active_devour_snapshot();
+        if state.clear_completed_active_devour_snapshot() {
+            state.remove_empty_active_post_replacement_frame();
+        }
     }
     // NOTE: the inherited token-choice applied seed is intentionally NOT cleared
     // here. This drain runs for EVERY replacement continuation — including a

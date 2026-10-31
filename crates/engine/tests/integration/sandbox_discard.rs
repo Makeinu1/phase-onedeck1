@@ -441,6 +441,8 @@ fn r9_discarder_is_owner_not_submitter() {
 /// CR 701.9a: a paused discard still belongs to its card's owner.
 #[test]
 fn r9_paused_discarder_is_owner_not_submitter_for_both_answers() {
+    use engine::game::game_object::ObjectIncarnationRefExt;
+    use engine::types::identifiers::ObjectIncarnationRef;
     let db = load_db().expect("Library owner regression requires the committed card fixture");
     for index in [0, 1] {
         let mut ids = None;
@@ -454,12 +456,25 @@ fn r9_paused_discarder_is_owner_not_submitter_for_both_answers() {
         runner.state_mut().debug_permitted = BTreeSet::from([P0, P1]);
         let owner_before = discard_count(&runner, P0);
         let submitter_before = discard_count(&runner, P1);
+        let original = ObjectIncarnationRef::from_object(&runner.state().objects[&card]);
         let parked = apply(runner.state_mut(), P1, discard(card)).expect("P1 may submit");
         assert!(matches!(
             runner.state().waiting_for,
             WaitingFor::ReplacementChoice { player: P0, .. }
         ));
         assert_eq!(zone_of(&runner, card), Zone::Hand);
+        assert_eq!(
+            runner
+                .state()
+                .pending_replacement
+                .as_ref()
+                .unwrap()
+                .discard_provenance
+                .as_deref()
+                .unwrap()
+                .original_hand,
+            Some(original)
+        );
         assert!(discarded_with_sources(&parked.events).is_empty());
         let result = apply(
             runner.state_mut(),
@@ -566,4 +581,289 @@ fn r10_non_priority_window_rejects_discard() {
     let before = digest(&runner);
     assert!(runner.act(discard(second)).is_err());
     assert_eq!(digest(&runner), before);
+}
+
+fn original_library_choice() -> (GameRunner, ObjectId, ObjectId) {
+    let db = load_db().expect("required real Library and Grimoire fixture");
+    let mut ids = None;
+    let mut runner = table(db, |scenario, db| {
+        scenario.add_real_card(P0, "Library of Leng", Zone::Battlefield, db);
+        let observer = scenario.add_real_card(P1, "Geth's Grimoire", Zone::Battlefield, db);
+        let card = scenario.add_real_card(P0, "Grizzly Bears", Zone::Hand, db);
+        ids = Some((card, observer));
+    });
+    let (card, observer) = ids.unwrap();
+    let first = runner
+        .act(discard(card))
+        .expect("real Library producer parks");
+    assert!(matches!(
+        first.waiting_for,
+        WaitingFor::ReplacementChoice { player: P0, .. }
+    ));
+    assert!(discarded_events(&first.events).is_empty());
+    assert!(
+        runner.state().pending_discard_batch.is_none(),
+        "this is the no-frame public route"
+    );
+    (runner, card, observer)
+}
+
+#[test]
+fn r11_library_old_answers_reject_out_of_hand_and_returned_incarnations_after_restore() {
+    use engine::game::game_object::ObjectIncarnationRefExt;
+    use engine::types::game_state::{GameState, PersistedGameState};
+    use engine::types::identifiers::ObjectIncarnationRef;
+    for index in [0, 1] {
+        for round_trip in [false, true] {
+            let (mut runner, card, observer) = original_library_choice();
+            let original = ObjectIncarnationRef::from_object(&runner.state().objects[&card]);
+            assert_eq!(
+                runner
+                    .state()
+                    .pending_replacement
+                    .as_ref()
+                    .unwrap()
+                    .discard_provenance
+                    .as_deref()
+                    .unwrap()
+                    .original_hand,
+                Some(original)
+            );
+            for to_zone in [Zone::Graveyard]
+                .into_iter()
+                .chain(round_trip.then_some(Zone::Hand))
+            {
+                let moved = runner
+                    .act(GameAction::Debug(DebugAction::MoveToZone {
+                        object_id: card,
+                        to_zone,
+                        library_position: None,
+                        simulate: false,
+                    }))
+                    .expect("public raw debug movement remains allowed during the prompt");
+                assert!(matches!(
+                    moved.waiting_for,
+                    WaitingFor::ReplacementChoice { .. }
+                ));
+                assert!(discarded_events(&moved.events).is_empty());
+            }
+            assert!(!original.is_current(runner.state()));
+            assert_ne!(
+                runner.state().objects[&card].incarnation,
+                original.incarnation
+            );
+            for ingress in 0..4 {
+                let state: GameState = match ingress {
+                    0 => runner.state().clone(),
+                    1 => serde_json::from_value(serde_json::to_value(runner.state()).unwrap())
+                        .unwrap(),
+                    _ => {
+                        let saved = if ingress == 2 {
+                            PersistedGameState::Raw(Box::new(runner.state().clone()))
+                        } else {
+                            PersistedGameState::capture(runner.state().clone())
+                        };
+                        serde_json::from_value::<PersistedGameState>(
+                            serde_json::to_value(saved).unwrap(),
+                        )
+                        .expect("known stale authority restores without rebinding")
+                        .into_game_state()
+                        .unwrap()
+                    }
+                };
+                let mut restored = GameRunner::from_state(state);
+                let before = serde_json::to_value(restored.state()).unwrap();
+                let journal = restored.state().resolved_rules_journal.clone();
+                let error = apply(
+                    restored.state_mut(),
+                    P0,
+                    GameAction::ChooseReplacement { index },
+                )
+                .expect_err("old Library answer cannot move a new occurrence");
+                assert!(error.to_string().contains("original-hand authority"));
+                assert_eq!(serde_json::to_value(restored.state()).unwrap(), before);
+                assert_eq!(restored.state().resolved_rules_journal, journal);
+                assert_eq!(
+                    zone_of(&restored, card),
+                    if round_trip {
+                        Zone::Hand
+                    } else {
+                        Zone::Graveyard
+                    }
+                );
+                assert_eq!(discard_count(&restored, P0), 0);
+                assert!(restored
+                    .state()
+                    .stack
+                    .iter()
+                    .all(|entry| entry.source_id != observer));
+                assert!(restored.state().deferred_triggers.is_empty());
+                assert_eq!(
+                    restored
+                        .state()
+                        .pending_replacement
+                        .as_ref()
+                        .unwrap()
+                        .discard_provenance
+                        .as_deref()
+                        .unwrap()
+                        .original_hand,
+                    Some(original)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn r12_library_current_pin_restores_and_both_original_answers_complete_once() {
+    use engine::types::game_state::{GameState, PersistedGameState};
+    for index in [0, 1] {
+        let (runner, card, observer) = original_library_choice();
+        for ingress in 0..3 {
+            let state: GameState = if ingress == 0 {
+                serde_json::from_value(serde_json::to_value(runner.state()).unwrap()).unwrap()
+            } else {
+                let saved = if ingress == 1 {
+                    PersistedGameState::Raw(Box::new(runner.state().clone()))
+                } else {
+                    PersistedGameState::capture(runner.state().clone())
+                };
+                serde_json::from_value::<PersistedGameState>(serde_json::to_value(saved).unwrap())
+                    .unwrap()
+                    .into_game_state()
+                    .unwrap()
+            };
+            let mut restored = GameRunner::from_state(state);
+            let result = restored
+                .act(GameAction::ChooseReplacement { index })
+                .unwrap();
+            assert_eq!(
+                discarded_with_sources(&result.events),
+                vec![(P0, card, None)]
+            );
+            assert_eq!(discard_count(&restored, P0), 1);
+            assert_eq!(
+                zone_of(&restored, card),
+                if index == 0 {
+                    Zone::Library
+                } else {
+                    Zone::Graveyard
+                }
+            );
+            assert_eq!(restored.state().stack.len(), 1);
+            assert_eq!(restored.state().stack[0].source_id, observer);
+            assert!(is_priority(&restored));
+            assert!(restored.state().pending_discard_batch.is_none());
+            assert!(restored.state().resolution_stack.is_empty());
+        }
+    }
+}
+
+#[test]
+fn r13_unknown_original_pin_rejects_load_live_simulation_and_zero_count_atomically() {
+    use engine::game::engine::apply_for_simulation;
+    use engine::types::game_state::{GameState, PendingCostMoveResume, PersistedGameState};
+    use engine::types::identifiers::{ObjectIncarnationRef, LEGACY_INCARNATION};
+    let (runner, card, _) = original_library_choice();
+    for boxed in [false, true] {
+        for malformed in 0..3 {
+            let mut bad = runner.state().clone();
+            let pending = bad.pending_replacement.as_mut().unwrap();
+            let provenance = pending.discard_provenance.as_deref_mut().unwrap();
+            provenance.original_hand = match malformed {
+                0 => None,
+                1 => Some(ObjectIncarnationRef::of(card, LEGACY_INCARNATION)),
+                _ => Some(ObjectIncarnationRef::of(ObjectId(card.0 + 1000), 0)),
+            };
+            if boxed {
+                bad.pending_cost_move_resume = Some(PendingCostMoveResume::ReplacementMayCost {
+                    source_id: card,
+                    current: card,
+                    remaining: vec![],
+                    paid_count: 0,
+                    outer_replacement: bad.pending_replacement.take().map(Box::new),
+                });
+            }
+            for ingress in 0..3 {
+                let error = if ingress == 0 {
+                    serde_json::from_value::<GameState>(serde_json::to_value(&bad).unwrap())
+                        .unwrap_err()
+                        .to_string()
+                } else {
+                    let saved = if ingress == 1 {
+                        PersistedGameState::Raw(Box::new(bad.clone()))
+                    } else {
+                        PersistedGameState::capture(bad.clone())
+                    };
+                    serde_json::from_value::<PersistedGameState>(
+                        serde_json::to_value(saved).unwrap(),
+                    )
+                    .unwrap_err()
+                    .to_string()
+                };
+                assert!(error.contains("original-hand authority"), "{error}");
+            }
+            for simulation in [false, true] {
+                for action in [
+                    GameAction::ChooseReplacement { index: 0 },
+                    GameAction::Debug(DebugAction::CreateCard {
+                        card_name: "unused zero-count admission".into(),
+                        owner: P0,
+                        zone: Zone::Hand,
+                        count: 0,
+                        attach_to: None,
+                        run_etb: false,
+                        nonlegendary: false,
+                        creation_kind: Default::default(),
+                    }),
+                ] {
+                    let mut live = bad.clone();
+                    let before = serde_json::to_value(&live).unwrap();
+                    let journal = live.resolved_rules_journal.clone();
+                    let result = if simulation {
+                        apply_for_simulation(&mut live, P0, action)
+                    } else {
+                        apply(&mut live, P0, action)
+                    };
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("original-hand authority"));
+                    assert_eq!(serde_json::to_value(&live).unwrap(), before);
+                    assert_eq!(live.resolved_rules_journal, journal);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn r14_carrierless_no_frame_choice_never_recaptures_current_hand_authority() {
+    use engine::types::game_state::GameState;
+    let (runner, card, _) = original_library_choice();
+    let mut encoded = serde_json::to_value(runner.state()).unwrap();
+    encoded["pending_replacement"]
+        .as_object_mut()
+        .unwrap()
+        .remove("discard_provenance");
+    let mut state: GameState =
+        serde_json::from_value(encoded).expect("absent whole optional carrier stays absent");
+    assert!(state
+        .pending_replacement
+        .as_ref()
+        .unwrap()
+        .discard_provenance
+        .is_none());
+    let before = serde_json::to_value(&state).unwrap();
+    let journal = state.resolved_rules_journal.clone();
+    assert!(
+        apply(&mut state, P0, GameAction::ChooseReplacement { index: 0 })
+            .unwrap_err()
+            .to_string()
+            .contains("original-hand authority")
+    );
+    assert_eq!(serde_json::to_value(&state).unwrap(), before);
+    assert_eq!(state.resolved_rules_journal, journal);
+    assert_eq!(state.objects[&card].zone, Zone::Hand);
 }

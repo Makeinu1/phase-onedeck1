@@ -26677,6 +26677,7 @@ impl GameStateDecode {
         normalize_delayed_trigger_allocators(&mut state)?;
         normalize_resolution_cast_offer_allocator(&mut state)?;
         normalize_pending_discard_delivery_subtree(&mut state)?;
+        state.validate_pending_discard_provenance_authority()?;
         // The PERSISTED half of the projection gate; `decode` below carries the other.
         // See the pairing comment there for why one site is not enough.
         reject_viewer_projection_as_authority(&state)?;
@@ -26720,6 +26721,7 @@ impl GameStateDecode {
         normalize_delayed_trigger_allocators(&mut state)?;
         normalize_resolution_cast_offer_allocator(&mut state)?;
         normalize_pending_discard_delivery_subtree(&mut state)?;
+        state.validate_pending_discard_provenance_authority()?;
         // NO viewer-projection guard here, deliberately. This is the TRANSPORT decode
         // path as much as a restore path: `ServerMessage::GameStarted { state, .. }`
         // (`server-core/src/protocol.rs`) carries a `filter_state_for_viewer` projection
@@ -28166,6 +28168,8 @@ pub struct PendingSacrificeProvenance {
 /// The no-frame discard whose hand departure still awaits replacement delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingDiscardProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_hand: Option<ObjectIncarnationRef>,
     pub object_id: ObjectId,
     pub player_id: PlayerId,
     pub source_id: Option<ObjectId>,
@@ -28767,7 +28771,31 @@ impl GameState {
         })
     }
 
+    pub(crate) fn validate_pending_discard_provenance_authority(&self) -> Result<(), String> {
+        if self.viewer_projection.is_some() {
+            return Ok(());
+        }
+        let outer = match self.pending_cost_move_resume.as_ref() {
+            Some(PendingCostMoveResume::ReplacementMayCost {
+                outer_replacement, ..
+            }) => outer_replacement.as_deref(),
+            _ => None,
+        };
+        for pending in self.pending_replacement.as_ref().into_iter().chain(outer) {
+            if let Some(provenance) = pending.discard_provenance.as_deref() {
+                if !provenance.original_hand.is_some_and(|pin| {
+                    pin.object_id == provenance.object_id
+                        && pin.incarnation != crate::types::identifiers::LEGACY_INCARNATION
+                }) {
+                    return Err("pending discard lacks original-hand authority".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_pending_discard_batch_authority(&self) -> Result<(), String> {
+        self.validate_pending_discard_provenance_authority()?;
         if self
             .pending_discard_batch
             .as_ref()
@@ -30173,7 +30201,9 @@ impl GameState {
             // child is retired, the snapshot is again the active owner and its
             // single-entry lifetime ends. A pending iteration keeps its snapshot
             // for the remaining co-arrivers.
-            self.clear_completed_active_devour_snapshot();
+            if self.clear_completed_active_devour_snapshot() {
+                self.remove_empty_active_post_replacement_frame();
+            }
         }
     }
 
@@ -53616,6 +53646,7 @@ mod tests {
         assert_eq!(legacy.discard_provenance, None);
         for source_id in [None, Some(ObjectId(99))] {
             let provenance = PendingDiscardProvenance {
+                original_hand: Some(ObjectIncarnationRef::of(ObjectId(71), 3)),
                 object_id: ObjectId(71),
                 player_id: PlayerId(1),
                 source_id,
@@ -53625,6 +53656,32 @@ mod tests {
             assert_eq!(
                 json["discard_provenance"],
                 serde_json::to_value(provenance).expect("serialize unboxed provenance")
+            );
+            assert_eq!(
+                json["discard_provenance"]["original_hand"],
+                serde_json::json!({"object_id": 71, "incarnation": 3})
+            );
+            let mut missing_pin = json.clone();
+            missing_pin["discard_provenance"]
+                .as_object_mut()
+                .unwrap()
+                .remove("original_hand");
+            let leaf: PendingReplacement = serde_json::from_value(missing_pin).unwrap();
+            assert_eq!(
+                leaf.discard_provenance.unwrap().original_hand,
+                None,
+                "leaf serde never recaptures authority"
+            );
+            let mut legacy_pin = json.clone();
+            legacy_pin["discard_provenance"]["original_hand"] = serde_json::json!(71);
+            let leaf: PendingReplacement = serde_json::from_value(legacy_pin).unwrap();
+            assert_eq!(
+                leaf.discard_provenance
+                    .unwrap()
+                    .original_hand
+                    .unwrap()
+                    .incarnation,
+                crate::types::identifiers::LEGACY_INCARNATION
             );
             let restored: PendingReplacement =
                 serde_json::from_value(json).expect("owned discard loads");
@@ -55887,17 +55944,37 @@ mod replacement_subtree_boundary_tests {
         state.park_ability_continuation(same_source_pending(&state));
         state.pending_discard_batch = Some(discard_batch_at(&state));
         state.park_ability_continuation(same_source_pending(&state));
+        let cause = state.resolved_rules_journal.begin_proposal().unwrap();
         let mut replay = state.clone();
         let before = state.resolved_rules_journal.entries().len();
-        state
-            .insert_ability_continuation_parent_of_active(same_source_pending(&state))
-            .unwrap();
+        state.with_rules_execution_node(cause, |state| {
+            state
+                .insert_ability_continuation_parent_of_active(same_source_pending(state))
+                .unwrap();
+        });
         assert_eq!(state.resolved_rules_journal.entries().len(), before + 1);
         let entry = state.resolved_rules_journal.entries().back().unwrap();
         let Some(ResolvedRulesCommand::FrameTransition(command)) = entry.command.as_ref() else {
             panic!("one real frame transition must be journaled")
         };
+        assert_eq!(entry.node, cause);
+        assert_eq!(command.cause, cause);
+        assert_eq!(
+            state
+                .resolved_rules_journal
+                .entries()
+                .iter()
+                .skip(before)
+                .filter(|entry| matches!(
+                    entry.command,
+                    Some(ResolvedRulesCommand::FrameTransition(_))
+                ))
+                .count(),
+            1
+        );
+        let replay_journal = replay.resolved_rules_journal.clone();
         replay.apply_resolved_frame_transition(command).unwrap();
+        assert_eq!(replay.resolved_rules_journal, replay_journal);
         assert_eq!(replay.resolution_stack, state.resolution_stack);
         assert_eq!(replay.pending_discard_batch, state.pending_discard_batch);
         assert_eq!(
@@ -55914,7 +55991,7 @@ mod replacement_subtree_boundary_tests {
         let prior_batch = state.pending_discard_batch.clone();
         let prior_journal = state.resolved_rules_journal.clone();
         // A direct-choice owner under an unrelated Priority fails candidate validation.
-        assert!(state
+        assert!(state.with_rules_execution_node(cause, |state| state
             .resolve_and_apply_frame_transition(ResolvedFrameTransition::InsertParentOfActive {
                 frame: ResolutionFrame::OptionalEffect(OptionalEffectFrame {
                     ability: same_source_pending(&state).chain,
@@ -55924,7 +56001,7 @@ mod replacement_subtree_boundary_tests {
                     return_result_occurrence: None,
                 }),
             })
-            .is_err());
+            .is_err()));
         assert_eq!(state.resolution_stack, prior_stack);
         assert_eq!(state.pending_discard_batch, prior_batch);
         assert_eq!(state.resolved_rules_journal, prior_journal);
@@ -55983,6 +56060,49 @@ mod replacement_subtree_boundary_tests {
             .expect("the outer drain dispatches");
         assert!(state.pause_post_replacement_dispatch(outer));
         state
+    }
+
+    #[test]
+    fn completed_devour_snapshot_exposes_only_its_empty_top_drain() {
+        use crate::types::zones::Zone;
+        let mut state = state_with_paused_enclosing_frame();
+        state.push_devour_change_zone_snapshot(std::collections::HashSet::new());
+        assert_eq!(state.resolution_stack.len(), 2);
+        state.finish_active_paused_post_replacement_dispatch();
+        assert!(
+            state.resolution_stack.is_empty(),
+            "snapshot retirement exposes and removes the exact empty drain"
+        );
+
+        let mut state = state_with_paused_enclosing_frame();
+        state.push_devour_change_zone_snapshot(std::collections::HashSet::new());
+        let group = state.allocate_logical_zone_change_group(&[]);
+        state.push_change_zone_iteration(super::PendingChangeZoneIteration {
+            logical_zone_change_group: group,
+            pending_return_result_producer: None,
+            paused_current: None,
+            remaining: vec![],
+            source_id: ObjectId(70),
+            controller: PlayerId(0),
+            origin: Some(Zone::Hand),
+            destination: Zone::Battlefield,
+            enter_transformed: false,
+            enters_under_player: None,
+            duration: None,
+            track_exiled_by_source: false,
+            face_down_in_exile: crate::types::ability::ExileConcealment::Public,
+            moved_count: None,
+            face_down_profile: None,
+            library_placement: None,
+            enter_attached_to: None,
+            effect_kind: crate::types::ability::EffectKind::ChangeZone,
+        });
+        let before = state.resolution_stack.clone();
+        assert!(
+            !state.clear_completed_active_devour_snapshot(),
+            "a live iteration still owns its snapshot"
+        );
+        assert_eq!(state.resolution_stack, before);
     }
 
     #[test]

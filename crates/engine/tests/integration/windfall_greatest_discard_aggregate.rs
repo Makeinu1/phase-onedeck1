@@ -1052,52 +1052,61 @@ fn initial_legacy_library_batch_restores_and_finishes_the_original_public_choice
         .unwrap()
         .delivery_subtree
         .unwrap();
-    for ingress in 0..3 {
-        let mut encoded = if ingress == 0 {
-            serde_json::to_value(runner.state()).unwrap()
-        } else if ingress == 1 {
-            serde_json::to_value(PersistedGameState::Raw(Box::new(runner.state().clone()))).unwrap()
-        } else {
-            serde_json::to_value(PersistedGameState::capture(runner.state().clone())).unwrap()
-        };
-        let payload = if ingress == 2 {
-            &mut encoded["state"]
-        } else {
-            &mut encoded
-        };
-        payload["pending_discard_batch"]
-            .as_object_mut()
-            .unwrap()
-            .remove("delivery_subtree");
-        let state: GameState = if ingress == 0 {
-            serde_json::from_value(encoded).unwrap()
-        } else {
-            serde_json::from_value::<PersistedGameState>(encoded)
+    for carrierless in [false, true] {
+        for ingress in 0..3 {
+            let mut encoded = if ingress == 0 {
+                serde_json::to_value(runner.state()).unwrap()
+            } else if ingress == 1 {
+                serde_json::to_value(PersistedGameState::Raw(Box::new(runner.state().clone())))
+                    .unwrap()
+            } else {
+                serde_json::to_value(PersistedGameState::capture(runner.state().clone())).unwrap()
+            };
+            let payload = if ingress == 2 {
+                &mut encoded["state"]
+            } else {
+                &mut encoded
+            };
+            if carrierless {
+                payload["pending_replacement"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("discard_provenance");
+            }
+            payload["pending_discard_batch"]
+                .as_object_mut()
                 .unwrap()
-                .into_game_state()
-                .unwrap()
-        };
-        assert_eq!(
-            state
-                .pending_discard_batch
-                .as_ref()
-                .unwrap()
-                .delivery_subtree,
-            Some(expected)
-        );
-        let mut restored = GameRunner::from_state(state);
-        assert_eq!(answer_every_replacement_choice(&mut restored, "Decline"), 2);
-        assert!(matches!(
-            restored.state().waiting_for,
-            WaitingFor::Priority { .. }
-        ));
-        assert!(restored.state().pending_discard_batch.is_none());
-        assert!(restored.state().resolution_stack.is_empty());
-        // CR 608.2c + CR 608.2i: restored original choices retain the completed (2,1) instruction.
-        assert_eq!(restored.state().cards_discarded_this_turn_by_player[&P0], 2);
-        assert_eq!(restored.state().cards_discarded_this_turn_by_player[&P1], 1);
-        assert_eq!(restored.state().players[0].library.len(), LIBRARY_DEPTH - 2);
-        assert_eq!(restored.state().players[1].library.len(), LIBRARY_DEPTH - 2);
+                .remove("delivery_subtree");
+            let state: GameState = if ingress == 0 {
+                serde_json::from_value(encoded).unwrap()
+            } else {
+                serde_json::from_value::<PersistedGameState>(encoded)
+                    .unwrap()
+                    .into_game_state()
+                    .unwrap()
+            };
+            assert_eq!(
+                state
+                    .pending_discard_batch
+                    .as_ref()
+                    .unwrap()
+                    .delivery_subtree,
+                Some(expected)
+            );
+            let mut restored = GameRunner::from_state(state);
+            assert_eq!(answer_every_replacement_choice(&mut restored, "Decline"), 2);
+            assert!(matches!(
+                restored.state().waiting_for,
+                WaitingFor::Priority { .. }
+            ));
+            assert!(restored.state().pending_discard_batch.is_none());
+            assert!(restored.state().resolution_stack.is_empty());
+            // CR 608.2c + CR 608.2i: restored original choices retain the completed (2,1) instruction.
+            assert_eq!(restored.state().cards_discarded_this_turn_by_player[&P0], 2);
+            assert_eq!(restored.state().cards_discarded_this_turn_by_player[&P1], 1);
+            assert_eq!(restored.state().players[0].library.len(), LIBRARY_DEPTH - 2);
+            assert_eq!(restored.state().players[1].library.len(), LIBRARY_DEPTH - 2);
+        }
     }
 }
 

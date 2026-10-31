@@ -13205,6 +13205,11 @@ pub fn replace_event(
             discard_frame: None,
             ..
         } => Some(crate::types::game_state::PendingDiscardProvenance {
+            original_hand: state
+                .objects
+                .get(object_id)
+                .filter(|object| object.zone == Zone::Hand && object.owner == *player_id)
+                .map(ObjectIncarnationRef::from_object),
             object_id: *object_id,
             player_id: *player_id,
             source_id: *source_id,
@@ -15770,6 +15775,7 @@ mod tests {
             ));
             state.waiting_for = replacement_choice_waiting_for(PlayerId(0), &state);
             let provenance = PendingDiscardProvenance {
+                original_hand: Some(ObjectIncarnationRef::from_object(&state.objects[&outer])),
                 object_id: outer,
                 player_id: PlayerId(0),
                 source_id: Some(source),
@@ -15832,6 +15838,44 @@ mod tests {
                     Some(&provenance)
                 );
                 assert!(outer_record.may_cost_paid);
+            }
+            // Both real MayCost storage paths retain the populated original pin through save/load.
+            for ingress in 0..3 {
+                use crate::types::game_state::PersistedGameState;
+                let restored: GameState = if ingress == 0 {
+                    serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap()
+                } else {
+                    let saved = if ingress == 1 {
+                        PersistedGameState::Raw(Box::new(state.clone()))
+                    } else {
+                        PersistedGameState::capture(state.clone())
+                    };
+                    serde_json::from_value::<PersistedGameState>(
+                        serde_json::to_value(saved).unwrap(),
+                    )
+                    .unwrap()
+                    .into_game_state()
+                    .unwrap()
+                };
+                let restored_outer = if boxed {
+                    let Some(PendingCostMoveResume::ReplacementMayCost {
+                        outer_replacement: Some(outer),
+                        ..
+                    }) = restored.pending_cost_move_resume.as_ref()
+                    else {
+                        panic!("boxed outer survives authoritative restore");
+                    };
+                    outer.as_ref()
+                } else {
+                    restored.pending_replacement.as_ref().unwrap()
+                };
+                assert_eq!(
+                    restored_outer.discard_provenance.as_deref(),
+                    Some(&provenance)
+                );
+                if ingress == 2 {
+                    state = restored;
+                }
             }
             let response = if boxed {
                 apply_as_current(&mut state, GameAction::ChooseReplacement { index: 1 }).unwrap()

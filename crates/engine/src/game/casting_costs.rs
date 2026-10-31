@@ -23637,6 +23637,9 @@ mod tests {
                             &runner.state().objects[&id],
                         )
                     });
+                    let sibling_pin = crate::types::identifiers::ObjectIncarnationRef::from_object(
+                        &runner.state().objects[&sibling],
+                    );
                     let mut expected_rng = runner.state().rng.clone();
                     let mut pool = originals.to_vec();
                     let picks = if random {
@@ -23721,20 +23724,23 @@ mod tests {
                             payment_mode: CastPaymentMode::Auto,
                         })
                         .unwrap();
-                    if matches!(
-                        runner.state().waiting_for,
-                        WaitingFor::PayCost {
-                            kind: PayCostKind::Sacrifice,
-                            ..
-                        }
-                    ) {
-                        runner
-                            .act(GameAction::SelectCards {
-                                cards: vec![sibling],
-                            })
-                            .unwrap();
-                    }
-                    assert_eq!(runner.state().objects[&sibling].zone, Zone::Graveyard);
+                    let WaitingFor::PayCost {
+                        player: P0,
+                        kind: PayCostKind::Sacrifice,
+                        ref choices,
+                        ..
+                    } = runner.state().waiting_for
+                    else {
+                        panic!("earlier sacrifice must require its public selection");
+                    };
+                    assert_eq!(choices, &[sibling]);
+                    runner
+                        .act(GameAction::SelectCards {
+                            cards: vec![sibling],
+                        })
+                        .unwrap();
+                    assert_eq!(runner.state().objects[&sibling].zone, Zone::Battlefield);
+                    assert!(sibling_pin.is_current(runner.state()));
                     if !random {
                         assert!(matches!(
                             runner.state().waiting_for,
@@ -23772,6 +23778,7 @@ mod tests {
                         assert!(runner.state().pending_discard_for_cost.is_none());
                         assert_eq!(runner.state().objects[&spell].zone, Zone::Stack);
                         assert_eq!(runner.state().stack.len(), 1);
+                        assert_eq!(runner.state().objects[&sibling].zone, Zone::Graveyard);
                         continue;
                     }
                     let WaitingFor::EffectZoneChoice {
@@ -23824,6 +23831,29 @@ mod tests {
                             pending
                         }
                     };
+                    assert_eq!(
+                        pending.deferred_sacrificed_permanents,
+                        vec![DeferredSacrificeSelection {
+                            object_id: sibling,
+                            filter: TargetFilter::SpecificObject { id: sibling },
+                        }]
+                    );
+                    assert_eq!(runner.state().objects[&sibling].zone, Zone::Battlefield);
+                    assert!(sibling_pin.is_current(runner.state()));
+                    let sibling_record = pending
+                        .ability
+                        .cost_paid_objects
+                        .iter()
+                        .find(|record| record.object_id() == sibling)
+                        .expect("earlier sacrifice selected snapshot is retained");
+                    assert_eq!(
+                        sibling_record
+                            .snapshot()
+                            .expect("selected cost snapshot")
+                            .incarnation,
+                        sibling_pin.incarnation
+                    );
+                    let sibling_snapshot = sibling_record.snapshot().unwrap().clone();
                     assert_eq!(pending.object_id, spell);
                     assert_eq!(pending.ability.source_id, spell);
                     assert!(pending
@@ -23859,20 +23889,50 @@ mod tests {
                         runner.state().rng.outcome_draws(),
                         rng_at_pause.outcome_draws()
                     );
-                    let ability = match runner.state().pending_discard_for_cost.as_deref() {
+                    let surviving_pending = match runner.state().pending_discard_for_cost.as_deref()
+                    {
                         Some(
                             PendingDiscardForCostResume::Chosen { pending, .. }
                             | PendingDiscardForCostResume::Random { pending, .. },
-                        ) => pending.ability.as_ref(),
+                        ) => Some(pending),
                         None => runner
+                            .state()
+                            .pending_cast
+                            .as_deref()
+                            .or_else(|| runner.state().waiting_for.pending_cast_ref()),
+                    };
+                    let ability = if let Some(pending) = surviving_pending {
+                        assert_eq!(pending.object_id, spell);
+                        assert_eq!(
+                            pending.deferred_sacrificed_permanents,
+                            vec![DeferredSacrificeSelection {
+                                object_id: sibling,
+                                filter: TargetFilter::SpecificObject { id: sibling },
+                            }]
+                        );
+                        assert_eq!(runner.state().objects[&sibling].zone, Zone::Battlefield);
+                        assert!(sibling_pin.is_current(runner.state()));
+                        pending.ability.as_ref()
+                    } else {
+                        assert_eq!(runner.state().objects[&sibling].zone, Zone::Graveyard);
+                        runner
                             .state()
                             .stack
                             .iter()
                             .find(|entry| entry.source_id == spell)
                             .expect("same ability survives in stack carrier")
                             .ability()
-                            .expect("spell carries its original resolved ability"),
+                            .expect("spell carries its original resolved ability")
                     };
+                    assert_eq!(
+                        ability
+                            .cost_paid_objects
+                            .iter()
+                            .find(|record| record.object_id() == sibling)
+                            .expect("earlier sibling retains exact snapshot through child answer")
+                            .snapshot(),
+                        Some(&sibling_snapshot)
+                    );
                     assert_eq!(ability.source_id, spell);
                     assert!(ability
                         .cost_paid_objects

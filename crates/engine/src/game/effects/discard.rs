@@ -29,24 +29,31 @@ pub(crate) enum DiscardOutcome {
     NeedsChoice(Box<WaitingFor>),
 }
 
-/// CR 701.9a + CR 616.1f: only the same unperformed discard owns this completion.
+/// CR 400.7 + CR 701.9a + CR 616.1f: only the same unperformed discard owns this completion.
 pub(crate) fn retain_pending_discard(state: &mut GameState, provenance: PendingDiscardProvenance) {
-    if state
-        .objects
-        .get(&provenance.object_id)
-        .map(|object| object.zone)
-        != Some(Zone::Hand)
-    {
+    if !provenance.original_hand.is_some_and(|pin| {
+        pin.object_id == provenance.object_id
+            && pin.is_current(state)
+            && state.objects.get(&pin.object_id).is_some_and(|object| {
+                object.zone == Zone::Hand && object.owner == provenance.player_id
+            })
+    }) {
         return;
     }
     if let Some(pending) = state.pending_replacement.as_mut() {
         let same_discard = match &pending.proposed {
             ProposedEvent::Discard {
                 object_id,
+                player_id,
+                source_id,
                 discard_frame: None,
                 ..
+            } => {
+                *object_id == provenance.object_id
+                    && *player_id == provenance.player_id
+                    && *source_id == provenance.source_id
             }
-            | ProposedEvent::ZoneChange {
+            ProposedEvent::ZoneChange {
                 object_id,
                 from: Zone::Hand,
                 discard_frame: None,
@@ -71,6 +78,7 @@ pub(crate) fn record_completed_discard(
         object_id,
         player_id,
         source_id,
+        original_hand: _,
     } = provenance;
     crate::game::restrictions::record_discard(state, player_id);
     if state.objects.get(&object_id).map(|object| object.zone) == Some(Zone::Graveyard) {
@@ -107,15 +115,28 @@ fn retire_discard_frame(
 /// (madness) that already applied — this mirrors `discard_applier`'s lowering.
 pub(crate) fn complete_discard_to_graveyard(
     state: &mut GameState,
-    object_id: ObjectId,
+    original_hand: ObjectIncarnationRef,
     player_id: PlayerId,
     source_id: Option<ObjectId>,
     discard_frame: Option<crate::types::identifiers::DiscardFrameId>,
     applied: HashSet<AppliedReplacementKey>,
     events: &mut Vec<GameEvent>,
 ) -> DiscardOutcome {
-    let was_in_hand = state.objects.get(&object_id).map(|object| object.zone) == Some(Zone::Hand);
+    let object_id = original_hand.object_id;
+    // CR 400.7 + CR 701.9a: only the original occurrence in its owner's hand can depart.
+    let was_in_hand = original_hand.is_current(state)
+        && state
+            .objects
+            .get(&object_id)
+            .is_some_and(|object| object.zone == Zone::Hand && object.owner == player_id);
+    if !was_in_hand {
+        if let Some(frame_id) = discard_frame {
+            retire_discard_frame(state, frame_id);
+        }
+        return DiscardOutcome::Complete;
+    }
     let provenance = PendingDiscardProvenance {
+        original_hand: Some(original_hand),
         object_id,
         player_id,
         source_id,
@@ -153,6 +174,7 @@ pub(crate) fn complete_discard_to_graveyard(
                 .objects
                 .get(&object_id)
                 .is_some_and(|object| object.zone == Zone::Hand);
+            let delivery_start = events.len();
             let delivery = change_zone::deliver_replaced_zone_change(
                 state,
                 event,
@@ -176,6 +198,9 @@ pub(crate) fn complete_discard_to_graveyard(
                 record_completed_discard(state, provenance, events);
             }
             if let change_zone::ZoneDeliveryResult::NeedsChoice(_) = delivery {
+                if discard_frame.is_none() {
+                    crate::game::engine_resolution_choices::defer_observer_triggers_for_paused_choice(state, events, delivery_start);
+                }
                 if discard_frame.is_none() {
                     retain_pending_discard(state, provenance);
                 }
@@ -545,7 +570,7 @@ pub fn resolve(
                     match event {
                         ProposedEvent::Discard {
                             player_id: pid,
-                            object_id: oid,
+                            object_id: _,
                             discard_frame,
                             applied,
                             ..
@@ -553,7 +578,7 @@ pub fn resolve(
                             if let DiscardOutcome::NeedsChoice(waiting_for) =
                                 complete_discard_to_graveyard(
                                     state,
-                                    oid,
+                                    paused_card,
                                     pid,
                                     Some(ability.source_id),
                                     discard_frame,
@@ -600,10 +625,12 @@ pub fn resolve(
                                     .get(&oid)
                                     .is_some_and(|object| object.zone == Zone::Hand);
                             let provenance = PendingDiscardProvenance {
+                                original_hand: Some(paused_card),
                                 object_id: oid,
                                 player_id,
                                 source_id: Some(ability.source_id),
                             };
+                            let delivery_start = events.len();
                             let delivery = change_zone::deliver_replaced_zone_change(
                                 state,
                                 zone_event,
@@ -625,6 +652,9 @@ pub fn resolve(
                                 record_completed_discard(state, provenance, events);
                             }
                             if let change_zone::ZoneDeliveryResult::NeedsChoice(_) = delivery {
+                                if discard_frame.is_none() {
+                                    crate::game::engine_resolution_choices::defer_observer_triggers_for_paused_choice(state, events, delivery_start);
+                                }
                                 if discard_frame.is_none() && was_in_hand {
                                     retain_pending_discard(state, provenance);
                                 }
@@ -1203,6 +1233,7 @@ fn route_discard(
         }
         return DiscardOutcome::Complete;
     }
+    let original_hand = ObjectIncarnationRef::from_object(&state.objects[&object_id]);
     let proposed = ProposedEvent::Discard {
         player_id: player,
         object_id,
@@ -1215,14 +1246,14 @@ fn route_discard(
         ReplacementResult::Execute(event) => match event {
             ProposedEvent::Discard {
                 player_id: pid,
-                object_id: oid,
+                object_id: _,
                 discard_frame,
                 applied,
                 ..
             } => {
                 if let DiscardOutcome::NeedsChoice(choice_player) = complete_discard_to_graveyard(
                     state,
-                    oid,
+                    original_hand,
                     pid,
                     source_id,
                     discard_frame,
@@ -1250,10 +1281,12 @@ fn route_discard(
                         .get(&oid)
                         .is_some_and(|object| object.zone == Zone::Hand);
                 let provenance = PendingDiscardProvenance {
+                    original_hand: Some(original_hand),
                     object_id: oid,
                     player_id: player,
                     source_id,
                 };
+                let delivery_start = events.len();
                 let delivery = change_zone::deliver_replaced_zone_change(
                     state,
                     zone_event,
@@ -1275,6 +1308,9 @@ fn route_discard(
                     record_completed_discard(state, provenance, events);
                 }
                 if let change_zone::ZoneDeliveryResult::NeedsChoice(_) = delivery {
+                    if discard_frame.is_none() {
+                        crate::game::engine_resolution_choices::defer_observer_triggers_for_paused_choice(state, events, delivery_start);
+                    }
                     if discard_frame.is_none() && was_in_hand {
                         retain_pending_discard(state, provenance);
                     }
@@ -2007,6 +2043,9 @@ mod tests {
                     fuel.card_types.core_types.push(CoreType::Creature);
                     fuel.power = Some(1);
                     fuel.toughness = Some(1);
+                    fuel.base_card_types = fuel.card_types.clone();
+                    fuel.base_power = fuel.power;
+                    fuel.base_toughness = fuel.toughness;
                     let mut redirect = discard_to_battlefield_with_two_counters_replacement();
                     redirect.event = ReplacementEvent::Moved;
                     redirect.condition = None;
@@ -2071,8 +2110,22 @@ mod tests {
                             .objects
                             .get_mut(&observer)
                             .unwrap()
+                            .install_trigger_base_definitions(std::sync::Arc::new(vec![trigger]))
+                            .expect("printed Grimoire trigger baseline installs");
+                        crate::game::layers::mark_layers_full(&mut state);
+                        crate::game::layers::flush_layers(&mut state);
+                        assert_eq!(
+                            state.objects[&observer].trigger_definitions.len(),
+                            1,
+                            "ordinary Grimoire observer survives production layer preparation"
+                        );
+                        assert!(state.objects[&observer]
                             .trigger_definitions
-                            .push(trigger);
+                            .first()
+                            .expect("printed observer remains installed")
+                            .definition
+                            .execute
+                            .is_some());
                     }
                     let mut events = crate::game::engine::apply(
                         &mut state,
@@ -2706,14 +2759,29 @@ mod tests {
                             .objects
                             .get_mut(&grimoire)
                             .unwrap()
+                            .install_trigger_base_definitions(std::sync::Arc::new(vec![observer]))
+                            .expect("printed Grimoire trigger baseline installs");
+                        crate::game::layers::mark_layers_full(&mut state);
+                        crate::game::layers::flush_layers(&mut state);
+                        assert_eq!(
+                            state.objects[&grimoire].trigger_definitions.len(),
+                            1,
+                            "ordinary observer survives production layer preparation"
+                        );
+                        assert!(state.objects[&grimoire]
                             .trigger_definitions
-                            .push(observer);
+                            .first()
+                            .expect("printed observer remains installed")
+                            .definition
+                            .execute
+                            .is_some());
                     }
                     let before = state
                         .cards_discarded_this_turn_by_player
                         .get(&PlayerId(0))
                         .copied()
                         .unwrap_or(0);
+                    // The targeted resolver is supplementary; public Debug and Windfall cover support.
                     let mut events = if targeted {
                         let ability = ResolvedAbility::new(
                             Effect::DiscardCard {
@@ -2918,6 +2986,7 @@ mod tests {
             .iter()
             .all(|event| !matches!(event, GameEvent::Discarded { .. })));
         let provenance = PendingDiscardProvenance {
+            original_hand: Some(ObjectIncarnationRef::from_object(&state.objects[&card])),
             object_id: card,
             player_id: PlayerId(0),
             source_id: None,

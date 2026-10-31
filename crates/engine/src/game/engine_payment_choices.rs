@@ -1,4 +1,5 @@
 use crate::game::filter;
+use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::game::replacement::{self, ReplacementResult};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, Effect, EffectKind, EffectScope, ResolvedAbility,
@@ -2364,10 +2365,15 @@ pub(super) fn handle_ward_discard_choice(
         ));
     }
 
+    let original_hand = state
+        .objects
+        .get(&chosen[0])
+        .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
+        .ok_or_else(|| EngineError::InvalidAction("ward discard card no longer exists".into()))?;
     if let effects::discard::DiscardOutcome::NeedsChoice(choice_player) =
         effects::discard::complete_discard_to_graveyard(
             state,
-            chosen[0],
+            original_hand,
             player,
             Some(pending_effect.source_id),
             None,
