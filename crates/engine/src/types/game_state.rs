@@ -55994,7 +55994,7 @@ mod replacement_subtree_boundary_tests {
         assert!(state.with_rules_execution_node(cause, |state| state
             .resolve_and_apply_frame_transition(ResolvedFrameTransition::InsertParentOfActive {
                 frame: ResolutionFrame::OptionalEffect(OptionalEffectFrame {
-                    ability: same_source_pending(&state).chain,
+                    ability: same_source_pending(state).chain,
                     trigger_event: None,
                     trigger_events: vec![],
                     trigger_match_count: None,
