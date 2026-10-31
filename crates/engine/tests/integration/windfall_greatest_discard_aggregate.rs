@@ -717,6 +717,7 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
     ] {
         for delayed in [false, true] {
             for optional in [false, true] {
+                let branch = format!("mode={mode:?} delayed={delayed} optional={optional}");
                 let db = crate::support::shared_card_db()
                     .expect("required committed discard observer fixture");
                 let mut scenario = GameScenario::new();
@@ -807,6 +808,33 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                         .unwrap()
                         .install_trigger_base_definitions(std::sync::Arc::new(Vec::new()))
                         .expect("delayed-only observer has no printed ordinary triggers");
+                    let source_context = engine::game::triggers::trigger_source_context_for_latch(
+                        runner.state(),
+                        &runner.state().objects[&observer],
+                    );
+                    let mut delayed_ability = ResolvedAbility::new(
+                        Effect::Draw {
+                            count: QuantityExpr::Fixed { value: 1 },
+                            target: TargetFilter::Controller,
+                        },
+                        vec![],
+                        observer,
+                        P1,
+                    );
+                    delayed_ability.set_trigger_source_recursive(source_context.clone());
+                    assert_eq!(
+                        delayed_ability.trigger_source.as_ref(),
+                        Some(&source_context),
+                        "{branch}"
+                    );
+                    assert_eq!(source_context.lki.controller, P1, "{branch}");
+                    assert_eq!(
+                        source_context.identity.reference,
+                        engine::types::identifiers::ObjectIncarnationRef::from_object(
+                            &runner.state().objects[&observer]
+                        ),
+                        "{branch}"
+                    );
                     engine::game::triggers::install_delayed_trigger(
                         runner.state_mut(),
                         engine::types::game_state::DelayedTrigger::new(
@@ -815,15 +843,7 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                                 or_trigger: None,
                                 lifetime: Default::default(),
                             },
-                            Box::new(ResolvedAbility::new(
-                                Effect::Draw {
-                                    count: QuantityExpr::Fixed { value: 1 },
-                                    target: TargetFilter::Controller,
-                                },
-                                vec![],
-                                observer,
-                                P1,
-                            )),
+                            Box::new(delayed_ability),
                             P1,
                             observer,
                             true,
@@ -836,7 +856,10 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                         runner.state().objects[&observer]
                             .trigger_definitions
                             .is_empty(),
-                        "ordinary observer remains absent after production layer preparation"
+                        "{branch}: {}",
+                        format_args!(
+                            "ordinary observer remains absent after production layer preparation"
+                        )
                     );
                     assert_eq!(
                         runner
@@ -847,6 +870,8 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                                 trigger.source_id == observer
                                     && trigger.controller == P1
                                     && trigger.one_shot
+                                    && trigger.ability.trigger_source.as_ref()
+                                        == Some(&source_context)
                                     && matches!(
                                         trigger.condition,
                                         DelayedTriggerCondition::WhenNextEvent { .. }
@@ -854,20 +879,26 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                             })
                             .count(),
                         1,
-                        "definition-derived one-shot delayed observer survives the layer flush"
+                        "{branch}: {}",
+                        format_args!(
+                            "definition-derived one-shot delayed observer survives the layer flush"
+                        )
                     );
                 }
                 let initial = runner.cast(spell).resolve();
                 let mut events = initial.events().to_vec();
                 if mode == Some(CardSelectionMode::Chosen) {
-                    assert!(matches!(
-                        runner.state().waiting_for,
-                        WaitingFor::DiscardChoice {
-                            player: P0,
-                            count: 2,
-                            ..
-                        }
-                    ));
+                    assert!(
+                        matches!(
+                            runner.state().waiting_for,
+                            WaitingFor::DiscardChoice {
+                                player: P0,
+                                count: 2,
+                                ..
+                            }
+                        ),
+                        "{branch}"
+                    );
                     events.extend(
                         apply(
                             runner.state_mut(),
@@ -883,10 +914,13 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                 let mut delivered = Vec::new();
                 for (index, expected) in fodder.iter().enumerate() {
                     if optional {
-                        assert!(matches!(
-                            runner.state().waiting_for,
-                            WaitingFor::ReplacementChoice { player: P0, .. }
-                        ));
+                        assert!(
+                            matches!(
+                                runner.state().waiting_for,
+                                WaitingFor::ReplacementChoice { player: P0, .. }
+                            ),
+                            "{branch}"
+                        );
                         let batch = runner
                             .state()
                             .pending_discard_batch
@@ -894,9 +928,10 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                             .expect("original order choice owns batch");
                         assert_eq!(
                             runner.state().objects[&batch.paused_card.object_id].zone,
-                            Zone::Hand
+                            Zone::Hand,
+                            "{branch}"
                         );
-                        assert!(batch.delivery_subtree.is_some());
+                        assert!(batch.delivery_subtree.is_some(), "{branch}");
                         events.extend(
                             apply(
                                 runner.state_mut(),
@@ -914,47 +949,56 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                     } = runner.state().waiting_for
                     else {
                         panic!(
-                            "delivery {index} lost actual wait: {:?}",
-                            runner.state().waiting_for
+                            "{branch}: {}",
+                            format_args!(
+                                "delivery {index} lost actual wait: {:?}",
+                                runner.state().waiting_for
+                            )
                         )
                     };
-                    assert!(cards.contains(expected));
+                    assert!(cards.contains(expected), "{branch}");
                     let batch = runner
                         .state()
                         .pending_discard_batch
                         .as_ref()
                         .expect("non-order delivery retains cursor");
                     let paused = batch.paused_card;
-                    assert!(original.iter().any(|(_, pin)| *pin == paused));
-                    assert!(!delivered.contains(&paused.object_id));
+                    assert!(original.iter().any(|(_, pin)| *pin == paused), "{branch}");
+                    assert!(!delivered.contains(&paused.object_id), "{branch}");
                     match &batch.cursor {
                         engine::types::game_state::DiscardBatchCursor::All { remaining } => {
-                            assert_eq!(remaining.len(), 1 - index)
+                            assert_eq!(remaining.len(), 1 - index, "{branch}")
                         }
                         engine::types::game_state::DiscardBatchCursor::Ordered { remaining } => {
-                            assert_eq!(remaining.len(), 1 - index)
+                            assert_eq!(remaining.len(), 1 - index, "{branch}")
                         }
                         engine::types::game_state::DiscardBatchCursor::Random {
                             pool,
                             remaining,
                         } => {
-                            assert_eq!(*remaining, 1 - index);
-                            assert!(!pool.contains(&paused.object_id));
-                            assert!(delivered.iter().all(|id| !pool.contains(id)));
+                            assert_eq!(*remaining, 1 - index, "{branch}");
+                            assert!(!pool.contains(&paused.object_id), "{branch}");
+                            assert!(delivered.iter().all(|id| !pool.contains(id)), "{branch}");
                         }
                     }
                     delivered.push(paused.object_id);
-                    assert!(!cards.contains(&paused.object_id));
-                    assert!(batch.delivery_subtree.is_some());
+                    assert!(!cards.contains(&paused.object_id), "{branch}");
+                    assert!(batch.delivery_subtree.is_some(), "{branch}");
                     assert_eq!(
                         runner.state().players[0].library.len(),
                         LIBRARY_DEPTH,
-                        "draw waits for whole cursor"
+                        "{branch}: {}",
+                        format_args!("draw waits for whole cursor")
                     );
-                    assert_eq!(runner.state().players[1].library.len(), LIBRARY_DEPTH);
+                    assert_eq!(
+                        runner.state().players[1].library.len(),
+                        LIBRARY_DEPTH,
+                        "{branch}"
+                    );
                     assert_eq!(
                         runner.state().objects[&paused.object_id].zone,
-                        Zone::Battlefield
+                        Zone::Battlefield,
+                        "{branch}"
                     );
                     // Current non-order snapshots retain the exact subtree in all decode ingresses.
                     for ingress in 0..3 {
@@ -982,7 +1026,8 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                                 .as_ref()
                                 .unwrap()
                                 .delivery_subtree,
-                            batch.delivery_subtree
+                            batch.delivery_subtree,
+                            "{branch}"
                         );
                     }
                     events.extend(
@@ -998,28 +1043,49 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                     );
                 }
                 // CR 608.2c + CR 608.2i: the complete (2,1) instruction supplies Windfall's draw2.
-                assert!(matches!(
-                    runner.state().waiting_for,
-                    WaitingFor::Priority { .. }
-                ));
-                assert!(runner.state().pending_discard_batch.is_none());
-                assert!(runner.state().resolution_stack.is_empty());
-                assert_eq!(runner.state().objects[&spell].zone, Zone::Graveyard);
-                assert_eq!(runner.state().cards_discarded_this_turn_by_player[&P0], 2);
+                assert!(
+                    matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+                    "{branch}"
+                );
+                assert!(runner.state().pending_discard_batch.is_none(), "{branch}");
+                assert!(runner.state().resolution_stack.is_empty(), "{branch}");
+                assert_eq!(
+                    runner.state().objects[&spell].zone,
+                    Zone::Graveyard,
+                    "{branch}"
+                );
+                assert_eq!(
+                    runner.state().cards_discarded_this_turn_by_player[&P0],
+                    2,
+                    "{branch}"
+                );
                 assert_eq!(
                     runner.state().players[0].library.len(),
-                    LIBRARY_DEPTH - if mode.is_none() { 2 } else { 1 }
+                    LIBRARY_DEPTH - if mode.is_none() { 2 } else { 1 },
+                    "{branch}"
                 );
                 if mode.is_none() {
-                    assert_eq!(runner.state().cards_discarded_this_turn_by_player[&P1], 1);
-                    assert_eq!(runner.state().objects[&other].zone, Zone::Graveyard);
-                    assert_eq!(runner.state().players[1].library.len(), LIBRARY_DEPTH - 2);
+                    assert_eq!(
+                        runner.state().cards_discarded_this_turn_by_player[&P1],
+                        1,
+                        "{branch}"
+                    );
+                    assert_eq!(
+                        runner.state().objects[&other].zone,
+                        Zone::Graveyard,
+                        "{branch}"
+                    );
+                    assert_eq!(
+                        runner.state().players[1].library.len(),
+                        LIBRARY_DEPTH - 2,
+                        "{branch}"
+                    );
                 } else if mode == Some(CardSelectionMode::Chosen) {
-                    assert_eq!(runner.state().objects[&other].zone, Zone::Hand);
+                    assert_eq!(runner.state().objects[&other].zone, Zone::Hand, "{branch}");
                 }
                 // CR 701.9a + CR 603.2c: each selected original has one source-bound discard and observer.
                 for id in delivered {
-                    assert_eq!(events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source) } if *object_id == id && *source == spell)).count(), 1);
+                    assert_eq!(events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source), .. } if *object_id == id && *source == spell)).count(), 1, "{branch}");
                 }
                 assert_eq!(
                     runner
@@ -1028,10 +1094,61 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                         .iter()
                         .filter(|entry| entry.source_id == observer && entry.controller == P1)
                         .count(),
-                    if delayed { 1 } else { 2 }
+                    if delayed { 1 } else { 2 },
+                    "{branch}"
                 );
-                assert_eq!(runner.state().objects[&fodder[0]].zone, Zone::Graveyard);
-                assert_eq!(runner.state().objects[&fodder[1]].zone, Zone::Battlefield);
+                for entry in runner
+                    .state()
+                    .stack
+                    .iter()
+                    .filter(|entry| entry.source_id == observer)
+                {
+                    let engine::types::game_state::StackEntryKind::TriggeredAbility {
+                        trigger_event: Some(event),
+                        ..
+                    } = &entry.kind
+                    else {
+                        panic!(
+                            "{branch}: {}",
+                            format_args!("actual observer retains event")
+                        )
+                    };
+                    let GameEvent::Discarded {
+                        object_id,
+                        observation: Some(observation),
+                        ..
+                    } = event
+                    else {
+                        panic!(
+                            "{branch}: {}",
+                            format_args!("current observer retains completed discard receipt")
+                        )
+                    };
+                    assert!(events.iter().any(|emitted| emitted == event), "{branch}");
+                    assert!(
+                        original.iter().any(
+                            |(id, pin)| id == object_id && *pin == observation.subject.identity
+                        ),
+                        "{branch}"
+                    );
+                    assert_eq!(observation.subject.zone, Zone::Hand, "{branch}");
+                    assert_eq!(
+                        observation.delivered_to,
+                        Some(Zone::Battlefield),
+                        "{branch}"
+                    );
+                    assert!(observation.pending_reveal.is_none(), "{branch}");
+                }
+                assert_eq!(
+                    runner.state().objects[&fodder[0]].zone,
+                    Zone::Graveyard,
+                    "{branch}"
+                );
+                assert_eq!(
+                    runner.state().objects[&fodder[1]].zone,
+                    Zone::Battlefield,
+                    "{branch}"
+                );
             }
         }
     }
@@ -1473,7 +1590,7 @@ fn assert_windfall_draws_after_counter_pause(accept_redirect: Option<bool>, prev
         moved_events
             .iter()
             .filter(|event| matches!(event,
-            GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source) }
+            GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source), .. }
                 if *object_id == card && *source == windfall))
             .count(),
         1
@@ -1486,7 +1603,7 @@ fn assert_windfall_draws_after_counter_pause(accept_redirect: Option<bool>, prev
             .preceding_events
             .iter()
             .filter(|event| matches!(event,
-            GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source) }
+            GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source), .. }
                 if *object_id == card && *source == windfall))
             .count(),
         1,
@@ -1673,7 +1790,7 @@ fn windfall_pins_each_immediate_discard_before_reparking_its_all_cursor() {
                 events
                     .iter()
                     .filter(|event| matches!(event,
-                GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source) }
+                GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source), .. }
                     if *object_id == card && *source == windfall))
                     .count(),
                 1
@@ -1791,7 +1908,7 @@ fn targeted_and_selected_discards_pin_the_hand_occurrence_before_counter_deliver
                     events
                         .iter()
                         .filter(|event| matches!(event,
-                    GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source) }
+                    GameEvent::Discarded { player_id: P0, object_id, source_id: Some(source), .. }
                         if *object_id == card && *source == spell))
                         .count(),
                     1

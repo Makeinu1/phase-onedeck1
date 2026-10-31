@@ -3294,7 +3294,7 @@ pub fn finish_cleanup_discard(
         if let super::effects::discard::DiscardOutcome::NeedsChoice(waiting_for) =
             super::effects::discard::discard_as_cost(state, card_id, player, events)
         {
-            state.waiting_for = *waiting_for;
+            state.waiting_for = waiting_for.waiting_for;
             // Known limitation: remaining discards and damage clearing (CR 514.2)
             // are skipped when a replacement choice interrupts mid-cleanup.
             return true;

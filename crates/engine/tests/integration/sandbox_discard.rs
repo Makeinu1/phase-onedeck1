@@ -88,6 +88,7 @@ fn discarded_with_sources(events: &[GameEvent]) -> Vec<(PlayerId, ObjectId, Opti
                 player_id,
                 object_id,
                 source_id,
+                ..
             } => Some((*player_id, *object_id, *source_id)),
             _ => None,
         })
@@ -329,6 +330,19 @@ fn r6_library_of_leng_applies_to_sandbox_discard() {
         .unwrap()
         .discard_provenance
         .is_some());
+    let original = runner
+        .state()
+        .pending_replacement
+        .as_ref()
+        .unwrap()
+        .discard_provenance
+        .as_deref()
+        .unwrap()
+        .observation
+        .as_deref()
+        .unwrap()
+        .subject
+        .identity;
     let encoded = serde_json::to_value(runner.state()).expect("serialize Library prompt");
     *runner.state_mut() = serde_json::from_value(encoded).expect("restore Library prompt");
     let result = runner
@@ -351,6 +365,15 @@ fn r6_library_of_leng_applies_to_sandbox_discard() {
     assert_eq!(runner.state().stack.len(), 1);
     assert_eq!(runner.state().stack[0].source_id, grimoire);
     assert!(runner.state().pending_replacement.is_none());
+    assert_discard_receipt(
+        &runner,
+        &result.events,
+        card,
+        original,
+        Zone::Library,
+        false,
+        grimoire,
+    );
     assert!(is_priority(&runner));
 }
 
@@ -384,6 +407,19 @@ fn r7_parked_choice_refuses_second_debug_discard() {
     assert!(runner.act(discard(second)).is_err());
     assert_eq!(digest(&runner), before, "a refused action changes nothing");
 
+    let original = runner
+        .state()
+        .pending_replacement
+        .as_ref()
+        .unwrap()
+        .discard_provenance
+        .as_deref()
+        .unwrap()
+        .observation
+        .as_deref()
+        .unwrap()
+        .subject
+        .identity;
     let result = runner
         .act(GameAction::ChooseReplacement { index: 1 })
         .expect("choosing the graveyard option succeeds");
@@ -398,6 +434,15 @@ fn r7_parked_choice_refuses_second_debug_discard() {
     assert_eq!(runner.state().stack.len(), 1);
     assert_eq!(runner.state().stack[0].source_id, grimoire);
     assert!(runner.state().pending_replacement.is_none());
+    assert_discard_receipt(
+        &runner,
+        &result.events,
+        first,
+        original,
+        Zone::Graveyard,
+        false,
+        grimoire,
+    );
     assert!(is_priority(&runner));
 }
 
@@ -499,6 +544,19 @@ fn r9_paused_discarder_is_owner_not_submitter_for_both_answers() {
         );
         assert_eq!(runner.state().stack.len(), 1);
         assert_eq!(runner.state().stack[0].source_id, grimoire);
+        assert_discard_receipt(
+            &runner,
+            &result.events,
+            card,
+            original,
+            if index == 0 {
+                Zone::Library
+            } else {
+                Zone::Graveyard
+            },
+            false,
+            grimoire,
+        );
         assert!(is_priority(&runner));
     }
 }
@@ -866,4 +924,486 @@ fn r14_carrierless_no_frame_choice_never_recaptures_current_hand_authority() {
     assert_eq!(serde_json::to_value(&state).unwrap(), before);
     assert_eq!(state.resolved_rules_journal, journal);
     assert_eq!(state.objects[&card].zone, Zone::Hand);
+}
+
+fn order_discard_observers(runner: &mut GameRunner) {
+    if let WaitingFor::OrderTriggers { triggers, .. } = &runner.state().waiting_for {
+        let order = (0..triggers.len()).collect();
+        runner
+            .act(GameAction::OrderTriggers { order })
+            .expect("public observer order");
+    }
+    assert!(
+        is_priority(runner),
+        "observers reach Priority: {:?}",
+        runner.state().waiting_for
+    );
+}
+
+fn assert_discard_receipt(
+    runner: &GameRunner,
+    events: &[GameEvent],
+    card: ObjectId,
+    original: engine::types::identifiers::ObjectIncarnationRef,
+    destination: Zone,
+    revealed: bool,
+    grimoire: ObjectId,
+) {
+    use engine::types::game_state::StackEntryKind;
+    let event = events
+        .iter()
+        .find(|event| matches!(event, GameEvent::Discarded { object_id, .. } if *object_id == card))
+        .expect("actual completed discard");
+    let GameEvent::Discarded {
+        player_id,
+        object_id,
+        source_id,
+        observation: Some(observation),
+    } = event
+    else {
+        panic!("current publisher requires observation")
+    };
+    assert_eq!((*player_id, *object_id, *source_id), (P0, card, None));
+    assert_eq!(observation.subject.identity, original);
+    assert_eq!(observation.subject.zone, Zone::Hand);
+    assert_eq!(observation.subject.owner, P0);
+    assert_eq!(observation.delivered_to, Some(destination));
+    assert!(observation.pending_reveal.is_none());
+    assert_eq!(observation.revealed_by.is_some(), revealed);
+    let retained = runner
+        .state()
+        .stack
+        .iter()
+        .find(|entry| entry.source_id == grimoire)
+        .expect("actual Grimoire observer");
+    assert!(
+        matches!(&retained.kind, StackEntryKind::TriggeredAbility { trigger_event: Some(retained), .. } if retained == event)
+    );
+}
+
+fn resolve_waste_not_and_decline_grimoire(runner: &mut GameRunner) {
+    for _ in 0..8 {
+        if runner.state().stack.is_empty() && is_priority(runner) {
+            return;
+        }
+        match runner.state().waiting_for {
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: false })
+                    .expect("decline Grimoire draw");
+            }
+            WaitingFor::Priority { .. } => runner.resolve_top(),
+            _ => panic!(
+                "unexpected observer prompt: {:?}",
+                runner.state().waiting_for
+            ),
+        }
+    }
+    panic!("discard observers did not finish");
+}
+
+/// CR 701.9c: hidden unrevealed characteristics, including their negations, are undefined.
+#[test]
+fn r15_library_hidden_discard_masks_all_waste_not_branches() {
+    use engine::game::game_object::ObjectIncarnationRefExt;
+    use engine::types::identifiers::ObjectIncarnationRef;
+    use engine::types::mana::ManaType;
+    let db = load_db().expect("printed hidden-discard regressions require the committed fixture");
+    for (name, branch) in [("Grizzly Bears", 0), ("Swamp", 1), ("Opt", 2)] {
+        for index in [0, 1] {
+            let mut ids = None;
+            let mut runner = table(db, |s, db| {
+                s.add_real_card(P0, "Library of Leng", Zone::Battlefield, db);
+                let waste = s.add_real_card(P1, "Waste Not", Zone::Battlefield, db);
+                let grimoire = s.add_real_card(P1, "Geth's Grimoire", Zone::Battlefield, db);
+                let card = s.add_real_card(P0, name, Zone::Hand, db);
+                ids = Some((waste, grimoire, card));
+            });
+            let (waste, grimoire, card) = ids.unwrap();
+            let original = ObjectIncarnationRef::from_object(&runner.state().objects[&card]);
+            let before_count = discard_count(&runner, P0);
+            let before_hand = runner.state().players[1].hand.len();
+            let before_black = runner.state().players[1]
+                .mana_pool
+                .count_color(ManaType::Black);
+            let before_zombies = count_named_on_battlefield(&runner, P1, "Zombie");
+            let parked = runner
+                .act(discard(card))
+                .expect("public discard reaches Library");
+            assert!(
+                matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::ReplacementChoice { player: P0, .. }
+                ),
+                "name={name} index={index}"
+            );
+            assert_eq!(zone_of(&runner, card), Zone::Hand);
+            assert!(discarded_with_sources(&parked.events).is_empty());
+            assert_eq!(discard_count(&runner, P0), before_count);
+            let result = runner
+                .act(GameAction::ChooseReplacement { index })
+                .expect("public Library answer");
+            order_discard_observers(&mut runner);
+            let destination = if index == 0 {
+                Zone::Library
+            } else {
+                Zone::Graveyard
+            };
+            assert_eq!(zone_of(&runner, card), destination);
+            assert_eq!(
+                discarded_with_sources(&result.events),
+                vec![(P0, card, None)]
+            );
+            assert_eq!(discard_count(&runner, P0), before_count + 1);
+            assert_discard_receipt(
+                &runner,
+                &result.events,
+                card,
+                original,
+                destination,
+                false,
+                grimoire,
+            );
+            assert_eq!(
+                runner
+                    .state()
+                    .stack
+                    .iter()
+                    .filter(|entry| entry.source_id == grimoire)
+                    .count(),
+                1,
+                "name={name} index={index}"
+            );
+            assert_eq!(
+                runner
+                    .state()
+                    .stack
+                    .iter()
+                    .filter(|entry| entry.source_id == waste)
+                    .count(),
+                usize::from(index == 1),
+                "name={name} index={index}"
+            );
+            resolve_waste_not_and_decline_grimoire(&mut runner);
+            assert_eq!(
+                count_named_on_battlefield(&runner, P1, "Zombie") - before_zombies,
+                usize::from(index == 1 && branch == 0),
+                "name={name} index={index}"
+            );
+            assert_eq!(
+                runner.state().players[1]
+                    .mana_pool
+                    .count_color(ManaType::Black)
+                    - before_black,
+                if index == 1 && branch == 1 { 2 } else { 0 },
+                "name={name} index={index}"
+            );
+            assert_eq!(
+                runner.state().players[1].hand.len() - before_hand,
+                usize::from(index == 1 && branch == 2),
+                "name={name} index={index}"
+            );
+            assert!(runner.state().pending_discard_batch.is_none());
+            assert!(runner.state().resolution_stack.is_empty());
+            assert!(is_priority(&runner));
+        }
+    }
+}
+
+/// CR 701.9c + CR 614.6: the selected printed mandatory reveal precedes the original move.
+#[test]
+fn r16_printed_shuffle_back_reveal_preserves_typed_discard_observers() {
+    use engine::game::game_object::ObjectIncarnationRefExt;
+    use engine::types::events::PlayerActionKind;
+    use engine::types::identifiers::ObjectIncarnationRef;
+    let db = load_db().expect("printed shuffle-back regressions require committed cards");
+    for name in ["Nexus of Fate", "Darksteel Colossus"] {
+        for rip_count in [0, 2] {
+            for select_reveal in [false, true] {
+                if rip_count == 0 && !select_reveal {
+                    continue;
+                }
+                let mut ids = None;
+                let mut runner = table(db, |s, db| {
+                    let waste = s.add_real_card(P1, "Waste Not", Zone::Battlefield, db);
+                    let grimoire = s.add_real_card(P1, "Geth's Grimoire", Zone::Battlefield, db);
+                    let rips = (0..rip_count)
+                        .map(|_| s.add_real_card(P1, "Rest in Peace", Zone::Battlefield, db))
+                        .collect::<Vec<_>>();
+                    let card = s.add_real_card(P0, name, Zone::Hand, db);
+                    ids = Some((waste, grimoire, card, rips));
+                });
+                let (waste, grimoire, card, rips) = ids.unwrap();
+                let original = ObjectIncarnationRef::from_object(&runner.state().objects[&card]);
+                let mut events = runner
+                    .act(discard(card))
+                    .expect("printed discard producer")
+                    .events;
+                if rip_count != 0 {
+                    assert!(matches!(
+                        runner.state().waiting_for,
+                        WaitingFor::ReplacementChoice { player: P0, .. }
+                    ));
+                    let pending = runner
+                        .state()
+                        .pending_replacement
+                        .as_ref()
+                        .expect("actual inner Moved ordering");
+                    assert!(
+                        pending.candidates.len() >= 3,
+                        "two printed RIP candidates and printed shuffle-back: {name}"
+                    );
+                    assert!(pending
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.source == card));
+                    for rip in &rips {
+                        assert!(pending
+                            .candidates
+                            .iter()
+                            .any(|candidate| candidate.source == *rip));
+                    }
+                    assert_eq!(zone_of(&runner, card), Zone::Hand);
+                    assert!(!events.iter().any(|event| matches!(
+                        event,
+                        GameEvent::CardsRevealed { .. } | GameEvent::Discarded { .. }
+                    )));
+                    let chosen = if select_reveal { card } else { rips[0] };
+                    let index = pending
+                        .candidates
+                        .iter()
+                        .position(|candidate| candidate.source == chosen)
+                        .unwrap();
+                    events.extend(
+                        runner
+                            .act(GameAction::ChooseReplacement { index })
+                            .expect("select exact printed replacement")
+                            .events,
+                    );
+                }
+                order_discard_observers(&mut runner);
+                let destination = if select_reveal {
+                    Zone::Library
+                } else {
+                    Zone::Exile
+                };
+                assert_eq!(zone_of(&runner, card), destination);
+                assert_eq!(discarded_with_sources(&events), vec![(P0, card, None)]);
+                assert_eq!(discard_count(&runner, P0), 1);
+                assert_eq!(
+                    runner
+                        .state()
+                        .stack
+                        .iter()
+                        .filter(|entry| entry.source_id == waste)
+                        .count(),
+                    1,
+                    "typed printed observer: {name} rip={rip_count} reveal={select_reveal}"
+                );
+                assert_discard_receipt(
+                    &runner,
+                    &events,
+                    card,
+                    original,
+                    destination,
+                    select_reveal,
+                    grimoire,
+                );
+                let reveals = events.iter().enumerate().filter(|(_, event)| matches!(event, GameEvent::CardsRevealed { card_ids, .. } if card_ids == &[card])).map(|(index, _)| index).collect::<Vec<_>>();
+                assert_eq!(reveals.len(), usize::from(select_reveal));
+                if select_reveal {
+                    let moved = events.iter().position(|event| matches!(event, GameEvent::ZoneChanged { object_id, from: Some(Zone::Hand), record, .. } if *object_id == card && record.trigger_source_context().is_some_and(|context| context.identity.reference == original))).expect("original hand departure");
+                    assert!(reveals[0] < moved);
+                    assert!(
+                        events.iter().any(|event| matches!(
+                            event,
+                            GameEvent::PlayerPerformedAction {
+                                player_id: P0,
+                                action: PlayerActionKind::ShuffledLibrary,
+                                ..
+                            }
+                        )),
+                        "selected Shuffle suffix runs"
+                    );
+                }
+                assert!(runner.state().pending_replacement.is_none());
+                assert!(runner.state().pending_discard_batch.is_none());
+                assert!(runner.state().resolution_stack.is_empty());
+                assert!(is_priority(&runner));
+            }
+        }
+    }
+}
+
+#[test]
+fn discard_observation_current_legacy_and_malformed_wire_shapes() {
+    use engine::types::game_state::{GameState, PersistedGameState};
+    for ingress in 0..3 {
+        let (runner, card, observer) = original_library_choice();
+        let original = runner
+            .state()
+            .pending_replacement
+            .as_ref()
+            .unwrap()
+            .discard_provenance
+            .as_deref()
+            .unwrap()
+            .observation
+            .as_deref()
+            .unwrap()
+            .clone();
+        for missing in [false, true] {
+            let mut input = runner.state().clone();
+            if missing {
+                input
+                    .pending_replacement
+                    .as_mut()
+                    .unwrap()
+                    .discard_provenance
+                    .as_deref_mut()
+                    .unwrap()
+                    .observation = None;
+            }
+            let state: GameState = if ingress == 0 {
+                serde_json::from_value(serde_json::to_value(input).unwrap()).unwrap()
+            } else {
+                let saved = if ingress == 1 {
+                    PersistedGameState::Raw(Box::new(input))
+                } else {
+                    PersistedGameState::capture(input)
+                };
+                serde_json::from_value::<PersistedGameState>(serde_json::to_value(saved).unwrap())
+                    .unwrap()
+                    .into_game_state()
+                    .unwrap()
+            };
+            assert_eq!(
+                state
+                    .pending_replacement
+                    .as_ref()
+                    .unwrap()
+                    .discard_provenance
+                    .as_deref()
+                    .unwrap()
+                    .observation
+                    .as_deref(),
+                Some(&original),
+                "ingress={ingress} missing={missing}"
+            );
+            let mut restored = GameRunner::from_state(state);
+            let result = restored
+                .act(GameAction::ChooseReplacement { index: 0 })
+                .unwrap();
+            assert_discard_receipt(
+                &restored,
+                &result.events,
+                card,
+                original.subject.identity,
+                Zone::Library,
+                false,
+                observer,
+            );
+            let settled = serde_json::to_value(restored.state()).unwrap();
+            let retained: GameState = serde_json::from_value(settled)
+                .expect("completed hidden observation restores without live fallback");
+            assert_eq!(retained.stack, restored.state().stack);
+            let mut malformed_event = retained.clone();
+            if let engine::types::game_state::StackEntryKind::TriggeredAbility {
+                trigger_event:
+                    Some(GameEvent::Discarded {
+                        observation: Some(observation),
+                        ..
+                    }),
+                ..
+            } = &mut malformed_event.stack.front_mut().unwrap().kind
+            {
+                observation.delivered_to = None;
+            } else {
+                panic!("retained completed event reaches validation")
+            }
+            assert!(serde_json::from_value::<GameState>(
+                serde_json::to_value(malformed_event).unwrap()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("completed discard lacks observation authority"));
+            let mut legacy = retained.clone();
+            for entry in legacy.stack.iter_mut() {
+                if let engine::types::game_state::StackEntryKind::TriggeredAbility {
+                    trigger_event: Some(GameEvent::Discarded { observation, .. }),
+                    ..
+                } = &mut entry.kind
+                {
+                    *observation = None;
+                }
+            }
+            let unknown: GameState = serde_json::from_value(serde_json::to_value(legacy).unwrap())
+                .expect("whole legacy event absence remains explicit unknown");
+            assert!(unknown.stack.iter().any(|entry| matches!(
+                &entry.kind,
+                engine::types::game_state::StackEntryKind::TriggeredAbility {
+                    trigger_event: Some(GameEvent::Discarded {
+                        observation: None,
+                        ..
+                    }),
+                    ..
+                }
+            )));
+        }
+        for malformed in 0..4 {
+            let mut input = runner.state().clone();
+            let pending = input.pending_replacement.as_mut().unwrap();
+            let observation = pending
+                .discard_provenance
+                .as_deref_mut()
+                .unwrap()
+                .observation
+                .as_deref_mut()
+                .unwrap();
+            match malformed {
+                0 => observation.subject.zone = Zone::Graveyard,
+                1 => observation.subject.owner = P1,
+                2 => observation.subject.identity.object_id = observer,
+                3 => {
+                    observation.delivered_to = Some(Zone::Library);
+                }
+                _ => unreachable!(),
+            }
+            let json = serde_json::to_value(&input).unwrap();
+            let error = serde_json::from_value::<GameState>(json).unwrap_err();
+            assert!(
+                error.to_string().contains("observation authority"),
+                "{error}"
+            );
+            let before = serde_json::to_value(&input).unwrap();
+            assert!(apply(&mut input, P0, GameAction::ChooseReplacement { index: 0 }).is_err());
+            assert_eq!(serde_json::to_value(&input).unwrap(), before);
+            let saved = if ingress == 1 {
+                PersistedGameState::Raw(Box::new(input))
+            } else {
+                PersistedGameState::capture(input)
+            };
+            assert!(serde_json::from_value::<PersistedGameState>(
+                serde_json::to_value(saved).unwrap()
+            )
+            .and_then(|saved| saved.into_game_state().map_err(serde::de::Error::custom))
+            .is_err());
+        }
+        let mut ambiguous = runner.state().clone();
+        ambiguous
+            .pending_replacement
+            .as_mut()
+            .unwrap()
+            .discard_provenance
+            .as_deref_mut()
+            .unwrap()
+            .observation = None;
+        ambiguous.pending_replacement.as_mut().unwrap().depth = 1;
+        assert!(
+            serde_json::from_value::<GameState>(serde_json::to_value(ambiguous).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("observation authority")
+        );
+    }
 }

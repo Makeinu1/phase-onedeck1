@@ -382,6 +382,75 @@ pub struct EventObjectSnapshot {
     pub relations: EventObjectRelationSnapshot,
 }
 
+/// A mandatory reveal bound by the replacement that actually selected it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundDiscardReveal {
+    pub replacement: super::proposed_event::AppliedReplacementKey,
+    pub source: Option<ObjectIncarnationRef>,
+    pub controller: PlayerId,
+}
+
+/// CR 701.9c: facts of the original hand occurrence and its actual delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscardObservation {
+    pub subject: EventObjectSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_to: Option<Zone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reveal: Option<BoundDiscardReveal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revealed_by: Option<super::proposed_event::AppliedReplacementKey>,
+}
+
+impl DiscardObservation {
+    pub fn new(subject: EventObjectSnapshot) -> Self {
+        Self {
+            subject,
+            delivered_to: None,
+            pending_reveal: None,
+            revealed_by: None,
+        }
+    }
+
+    pub(crate) fn valid_for(&self, object_id: ObjectId, player: PlayerId) -> bool {
+        self.subject.identity.object_id == object_id
+            && self.subject.identity.incarnation != super::identifiers::LEGACY_INCARNATION
+            && self.subject.zone == Zone::Hand
+            && self.subject.owner == player
+            && !(self.pending_reveal.is_some() && self.revealed_by.is_some())
+            && (self.delivered_to.is_none() || self.pending_reveal.is_none())
+            && self.pending_reveal.as_ref().is_none_or(|bound| {
+                use super::proposed_event::AppliedReplacementKey;
+                match (&bound.replacement, bound.source) {
+                    (
+                        AppliedReplacementKey::Object { source, .. }
+                        | AppliedReplacementKey::EntryControllerChoice { source, .. },
+                        Some(pin),
+                    ) => {
+                        pin.object_id == *source
+                            && pin.incarnation != super::identifiers::LEGACY_INCARNATION
+                    }
+                    (
+                        AppliedReplacementKey::Floating { .. }
+                        | AppliedReplacementKey::StepEndMana { .. },
+                        None,
+                    ) => true,
+                    _ => false,
+                }
+            })
+    }
+
+    pub(crate) fn completed_for(&self, object_id: ObjectId, player: PlayerId) -> bool {
+        self.valid_for(object_id, player)
+            && self.delivered_to.is_some()
+            && self.pending_reveal.is_none()
+    }
+
+    pub(crate) fn characteristics_defined(&self) -> bool {
+        self.delivered_to.is_some_and(Zone::is_public) || self.revealed_by.is_some()
+    }
+}
+
 /// How an [`EventObjectSnapshot`] can answer a given [`TargetFilter`] shape.
 ///
 /// This is a *structural* classification, computed without a game state, so a parser gate
@@ -1211,6 +1280,8 @@ pub enum GameEvent {
     Discarded {
         player_id: PlayerId,
         object_id: ObjectId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observation: Option<Box<DiscardObservation>>,
         /// CR 603.2 + CR 109.5: The spell/ability that caused this discard, if any
         /// (effect- or cost-driven discards). `None` for a player's own
         /// turn-based / hand-size discards. Carried from `ProposedEvent::Discard`

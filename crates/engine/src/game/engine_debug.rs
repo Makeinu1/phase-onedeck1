@@ -986,7 +986,7 @@ fn apply_debug_discard(
         super::effects::discard::DiscardOutcome::NeedsChoice(waiting_for) => {
             // CR 603.2 + CR 603.3: a completed discard triggers now, while
             // placement waits for the delivery's actual choice to settle.
-            state.waiting_for = *waiting_for;
+            state.waiting_for = waiting_for.waiting_for;
             super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
                 state,
                 events,

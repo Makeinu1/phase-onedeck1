@@ -60,6 +60,8 @@ pub struct MultiDrawFrame {
 /// may append the captured hand-time result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscardFrame {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<Box<crate::types::events::DiscardObservation>>,
     pub id: DiscardFrameId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<ObjectId>,
@@ -1148,6 +1150,7 @@ impl ResolutionStack {
         let id = DiscardFrameId(self.next_discard_frame_id);
         self.next_discard_frame_id = self.next_discard_frame_id.saturating_add(1);
         self.push_discard(DiscardFrame {
+            observation: None,
             id,
             source_id,
             results: Vec::new(),
@@ -3608,6 +3611,7 @@ impl ResolutionStack {
     pub(crate) fn holds_unsettled_delivery_frame(&self) -> bool {
         self.frames.iter().any(|frame| match frame {
             ResolutionFrame::ChangeZone(_) | ResolutionFrame::BatchDelivery(_) => true,
+            ResolutionFrame::Discard(frame) => frame.observation.is_some(),
             ResolutionFrame::AbilityContinuation(_)
             | ResolutionFrame::RepeatFor(_)
             | ResolutionFrame::RepeatUntil(_)
@@ -3627,7 +3631,6 @@ impl ResolutionStack {
             | ResolutionFrame::DieRoll(_)
             | ResolutionFrame::Proliferate(_)
             | ResolutionFrame::MultiDraw(_)
-            | ResolutionFrame::Discard(_)
             | ResolutionFrame::ConniveReentry(_)
             | ResolutionFrame::LifeTotalAssignment(_)
             | ResolutionFrame::SpellResolution(_)
@@ -3955,6 +3958,17 @@ impl ResolutionStack {
                 }
             }
             if let ResolutionFrame::Discard(discard) = frame {
+                if discard.observation.as_deref().is_some_and(|observation| {
+                    !observation.valid_for(
+                        observation.subject.identity.object_id,
+                        observation.subject.owner,
+                    )
+                }) {
+                    return Err(ResolutionStackError::InvalidPayload {
+                        frame: FrameKind::Discard,
+                        message: "pending discard lacks observation authority".into(),
+                    });
+                }
                 if !discard_ids.insert(discard.id) {
                     return Err(ResolutionStackError::InvalidPayload {
                         frame: FrameKind::Discard,
@@ -7605,6 +7619,8 @@ mod tests {
         let mut state = GameState::new_two_player(42);
         let boundary = ReplacementSubtreeBoundary::at(&state.resolution_stack);
         state.pending_discard_batch = Some(Box::new(PendingDiscardBatch {
+            observation: None, // Structural cursor/insertion fixture; it does not authenticate a current save or delivery.
+
             player: PlayerId(0),
             cursor: DiscardBatchCursor::All { remaining: vec![] },
             completion: PendingDiscardBatchCompletion::Standard,

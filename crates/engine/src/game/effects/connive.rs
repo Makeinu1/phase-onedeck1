@@ -236,7 +236,7 @@ pub(crate) fn discard_all_and_count_nonlands(
                 state, card_id, player, None, events,
             )
         {
-            state.waiting_for = *waiting_for;
+            state.waiting_for = waiting_for.waiting_for;
             return None;
         }
         if is_nonland {

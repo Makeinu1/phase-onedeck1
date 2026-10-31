@@ -6538,6 +6538,114 @@ pub(crate) fn matches_target_filter_on_event_snapshot(
     )
 }
 
+/// CR 701.9c: unknown characteristics compose without making negation true.
+pub(crate) fn matches_undefined_discard_filter(
+    state: &GameState,
+    object_id: ObjectId,
+    snapshot: Option<&EventObjectSnapshot>,
+    filter: &TargetFilter,
+    ctx: &FilterContext<'_>,
+) -> Option<bool> {
+    fn atom(
+        state: &GameState,
+        snapshot: Option<&EventObjectSnapshot>,
+        filter: &TargetFilter,
+        ctx: &FilterContext<'_>,
+    ) -> Option<bool> {
+        if !target_filter_characteristic_reads(filter)
+            .without(CharacteristicKinds::CONTROLLER)
+            .is_empty()
+        {
+            return None;
+        }
+        snapshot.map(|subject| matches_target_filter_on_event_snapshot(state, subject, filter, ctx))
+    }
+    fn ty(value: &TypeFilter) -> Option<bool> {
+        match value {
+            TypeFilter::Card | TypeFilter::Any => Some(true),
+            TypeFilter::Non(inner) => ty(inner).map(|value| !value),
+            TypeFilter::AnyOf(inners) => kleene_or(inners.iter().map(ty)),
+            _ => {
+                debug_assert!(!type_filter_characteristic_reads(value).is_empty());
+                None
+            }
+        }
+    }
+    fn prop(
+        state: &GameState,
+        snapshot: Option<&EventObjectSnapshot>,
+        value: &FilterProp,
+        ctx: &FilterContext<'_>,
+    ) -> Option<bool> {
+        match value {
+            FilterProp::Not { prop: inner } => {
+                prop(state, snapshot, inner, ctx).map(|value| !value)
+            }
+            FilterProp::AnyOf { props } => {
+                kleene_or(props.iter().map(|value| prop(state, snapshot, value, ctx)))
+            }
+            _ => {
+                if !filter_prop_characteristic_reads_at(value, CHARACTERISTIC_READ_DEPTH)
+                    .without(CharacteristicKinds::CONTROLLER)
+                    .is_empty()
+                {
+                    return None;
+                }
+                atom(
+                    state,
+                    snapshot,
+                    &TargetFilter::Typed(TypedFilter {
+                        type_filters: vec![],
+                        controller: None,
+                        properties: vec![value.clone()],
+                    }),
+                    ctx,
+                )
+            }
+        }
+    }
+    match filter {
+        TargetFilter::Any => Some(true),
+        TargetFilter::None => Some(false),
+        TargetFilter::SpecificObject { id } => Some(*id == object_id),
+        TargetFilter::Not { filter } => {
+            matches_undefined_discard_filter(state, object_id, snapshot, filter, ctx)
+                .map(|value| !value)
+        }
+        TargetFilter::Or { filters } => kleene_or(filters.iter().map(|filter| {
+            matches_undefined_discard_filter(state, object_id, snapshot, filter, ctx)
+        })),
+        TargetFilter::And { filters } => kleene_and(filters.iter().map(|filter| {
+            matches_undefined_discard_filter(state, object_id, snapshot, filter, ctx)
+        })),
+        TargetFilter::Typed(typed) => {
+            let types = kleene_and(typed.type_filters.iter().map(ty));
+            let controller = if typed.controller.is_some() {
+                atom(
+                    state,
+                    snapshot,
+                    &TargetFilter::Typed(TypedFilter {
+                        type_filters: vec![],
+                        controller: typed.controller.clone(),
+                        properties: vec![],
+                    }),
+                    ctx,
+                )
+            } else {
+                Some(true)
+            };
+            let properties = kleene_and(
+                typed
+                    .properties
+                    .iter()
+                    .map(|value| prop(state, snapshot, value, ctx)),
+            );
+            kleene_and([types, controller, properties])
+        }
+        _ => atom(state, snapshot, filter, ctx),
+    }
+}
+
 /// CR 603.4 + CR 603.6 + CR 603.10: Evaluate a trigger condition whose
 /// subject is the object from a zone-change event.
 ///
@@ -14051,6 +14159,98 @@ mod tests {
         )
     }
 
+    #[test]
+    fn undefined_discard_filters_keep_kleene_identity_branches() {
+        let mut state = GameState::new_two_player(42);
+        let card = crate::game::zones::create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Original Hand creature".into(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&card)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let subject = state.capture_event_object_snapshot(card).unwrap();
+        let ctx = FilterContext::from_source(&state, card);
+        let creature = TargetFilter::Typed(TypedFilter::creature());
+        let identity = TargetFilter::SpecificObject { id: card };
+        let other = TargetFilter::SpecificObject { id: ObjectId(999) };
+        let card_filter = TargetFilter::Typed(TypedFilter::new(TypeFilter::Card));
+        let typed_non = TargetFilter::Typed(TypedFilter::new(TypeFilter::Non(Box::new(
+            TypeFilter::Creature,
+        ))));
+        let nested = TargetFilter::Typed(TypedFilter::new(TypeFilter::AnyOf(vec![
+            TypeFilter::Non(Box::new(TypeFilter::Land)),
+            TypeFilter::Creature,
+        ])));
+        let property = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Card],
+            controller: None,
+            properties: vec![FilterProp::Not {
+                prop: Box::new(FilterProp::AnyOf {
+                    props: vec![FilterProp::HasSupertype {
+                        value: Supertype::Legendary,
+                    }],
+                }),
+            }],
+        });
+        assert!(matches_target_filter_on_event_snapshot(
+            &state, &subject, &creature, &ctx
+        ));
+        assert!(!matches_target_filter_on_event_snapshot(
+            &state, &subject, &typed_non, &ctx
+        ));
+        assert!(matches_target_filter_on_event_snapshot(
+            &state, &subject, &property, &ctx
+        ));
+        for snapshot in [Some(&subject), None] {
+            let evaluate = |filter: &TargetFilter| {
+                matches_undefined_discard_filter(&state, card, snapshot, filter, &ctx)
+            };
+            assert_eq!(evaluate(&card_filter), Some(true));
+            assert_eq!(evaluate(&TargetFilter::Any), Some(true));
+            assert_eq!(evaluate(&creature), None);
+            assert_eq!(evaluate(&typed_non), None);
+            assert_eq!(evaluate(&nested), None);
+            assert_eq!(evaluate(&property), None);
+            assert_eq!(
+                evaluate(&TargetFilter::Or {
+                    filters: vec![identity.clone(), creature.clone()]
+                }),
+                Some(true)
+            );
+            assert_eq!(
+                evaluate(&TargetFilter::And {
+                    filters: vec![other.clone(), creature.clone()]
+                }),
+                Some(false)
+            );
+            assert_eq!(
+                evaluate(&TargetFilter::Not {
+                    filter: Box::new(creature.clone())
+                }),
+                None
+            );
+            assert_eq!(
+                evaluate(&TargetFilter::Not {
+                    filter: Box::new(other.clone())
+                }),
+                Some(true)
+            );
+            let with_known_type = TargetFilter::Typed(TypedFilter::new(TypeFilter::AnyOf(vec![
+                TypeFilter::Creature,
+                TypeFilter::Card,
+            ])));
+            assert_eq!(evaluate(&with_known_type), Some(true));
+        }
+    }
+
     fn setup() -> GameState {
         GameState::new_two_player(42)
     }
@@ -18636,7 +18836,7 @@ mod tests {
             CardId(10),
             PlayerId(0),
             "Discarded Instant".to_string(),
-            Zone::Graveyard,
+            Zone::Hand,
         );
         state
             .objects
@@ -18673,7 +18873,13 @@ mod tests {
             .card_types
             .core_types
             .push(CoreType::Sorcery);
+        let mut discarded_observation =
+            crate::game::effects::discard::capture_discard_observation(&state, discarded);
+        crate::game::zones::move_to_zone(&mut state, discarded, Zone::Graveyard, &mut Vec::new());
+        discarded_observation.delivered_to = Some(Zone::Graveyard);
         state.current_trigger_event = Some(GameEvent::Discarded {
+            observation: Some(Box::new(discarded_observation.clone())),
+
             player_id: PlayerId(0),
             object_id: discarded,
             source_id: None,
@@ -18701,7 +18907,7 @@ mod tests {
             CardId(10),
             PlayerId(0),
             "Discarded Creature".to_string(),
-            Zone::Graveyard,
+            Zone::Hand,
         );
         state
             .objects
@@ -18715,7 +18921,7 @@ mod tests {
             CardId(11),
             PlayerId(0),
             "Discarded Instant".to_string(),
-            Zone::Graveyard,
+            Zone::Hand,
         );
         state
             .objects
@@ -18752,18 +18958,42 @@ mod tests {
             .card_types
             .core_types
             .push(CoreType::Sorcery);
+        let mut discarded_creature_observation =
+            crate::game::effects::discard::capture_discard_observation(&state, discarded_creature);
+        crate::game::zones::move_to_zone(
+            &mut state,
+            discarded_creature,
+            Zone::Graveyard,
+            &mut Vec::new(),
+        );
+        discarded_creature_observation.delivered_to = Some(Zone::Graveyard);
+        let mut discarded_instant_observation =
+            crate::game::effects::discard::capture_discard_observation(&state, discarded_instant);
+        crate::game::zones::move_to_zone(
+            &mut state,
+            discarded_instant,
+            Zone::Graveyard,
+            &mut Vec::new(),
+        );
+        discarded_instant_observation.delivered_to = Some(Zone::Graveyard);
         state.current_trigger_event = Some(GameEvent::Discarded {
+            observation: Some(Box::new(discarded_creature_observation.clone())),
+
             player_id: PlayerId(0),
             object_id: discarded_creature,
             source_id: None,
         });
         state.current_trigger_events = vec![
             GameEvent::Discarded {
+                observation: Some(Box::new(discarded_creature_observation.clone())),
+
                 player_id: PlayerId(0),
                 object_id: discarded_creature,
                 source_id: None,
             },
             GameEvent::Discarded {
+                observation: Some(Box::new(discarded_instant_observation.clone())),
+
                 player_id: PlayerId(0),
                 object_id: discarded_instant,
                 source_id: None,

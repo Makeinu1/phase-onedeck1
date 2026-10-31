@@ -20063,7 +20063,8 @@ pub(crate) fn drain_pending_discard_batch(
                     // `discard_at_random`.
                     batch.paused_card = paused_card;
                     batch.delivery_subtree = Some(delivery_subtree);
-                    state.waiting_for = *waiting_for;
+                    batch.observation = Some(Box::new(waiting_for.observation));
+                    state.waiting_for = waiting_for.waiting_for;
                     repark_discard_batch(state, batch, events);
                     return Ok(PendingDiscardBatchOutcome::PausedForReplacement);
                 }
@@ -20074,6 +20075,7 @@ pub(crate) fn drain_pending_discard_batch(
                 remaining_eligible,
                 remaining_count,
                 paused_card,
+                observation,
                 delivery_subtree,
                 ..
             } = discard::discard_at_random(
@@ -20093,6 +20095,7 @@ pub(crate) fn drain_pending_discard_batch(
                     remaining: remaining_count,
                 };
                 batch.paused_card = paused_card;
+                batch.observation = Some(observation);
                 batch.delivery_subtree = Some(delivery_subtree);
                 // Random discard already installed the actual delivery prompt.
                 repark_discard_batch(state, batch, events);
@@ -20127,7 +20130,8 @@ pub(crate) fn drain_pending_discard_batch(
                     batch.player = player;
                     batch.paused_card = *card;
                     batch.delivery_subtree = Some(delivery_subtree);
-                    state.waiting_for = *waiting_for;
+                    batch.observation = Some(Box::new(waiting_for.observation));
+                    state.waiting_for = waiting_for.waiting_for;
                     repark_discard_batch(state, batch, events);
                     return Ok(PendingDiscardBatchOutcome::PausedForReplacement);
                 }
@@ -20409,10 +20413,36 @@ fn stamp_resumed_discard_if_unrecorded(
     if state.objects.get(&card).map(|o| o.zone) == Some(crate::types::zones::Zone::Graveyard) {
         crate::game::restrictions::record_card_discarded(state, card);
     }
+    let mut observation = batch
+        .observation
+        .as_deref()
+        .expect("resumed discard requires its original observation")
+        .clone();
+    if observation.delivered_to.is_none() {
+        observation.delivered_to = events.iter().find_map(|event| match event {
+            GameEvent::ZoneChanged {
+                from: Some(Zone::Hand),
+                to,
+                record,
+                ..
+            } if record
+                .trigger_source_context()
+                .is_some_and(|context| context.identity.reference == paused) =>
+            {
+                Some(*to)
+            }
+            _ => None,
+        });
+    }
+    assert!(
+        observation.completed_for(card, batch.player),
+        "resumed discard observation must prove completed phase"
+    );
     events.push(GameEvent::Discarded {
         player_id: batch.player,
         object_id: card,
         source_id: Some(batch.source_id),
+        observation: Some(Box::new(observation)),
     });
 }
 
@@ -41923,6 +41953,8 @@ mod tests {
     ) {
         state.pending_discard_batch =
             Some(Box::new(crate::types::game_state::PendingDiscardBatch {
+                observation: None, // Structural cursor/insertion fixture; it does not authenticate a current save or delivery.
+
                 player,
                 cursor: DiscardBatchCursor::All { remaining },
                 completion: crate::types::game_state::PendingDiscardBatchCompletion::Standard,
@@ -41987,6 +42019,9 @@ mod tests {
             .as_mut()
             .unwrap()
             .preceding_events = vec![GameEvent::Discarded {
+            // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+            observation: None,
+
             player_id: PlayerId(0),
             object_id: already_discarded,
             source_id: Some(source),
@@ -42038,12 +42073,17 @@ mod tests {
     fn hand_departures_across_a_round_trip(
         state: &mut GameState,
         card: ObjectId,
-    ) -> [(crate::types::identifiers::ObjectIncarnationRef, GameEvent); 2] {
+    ) -> [(
+        crate::types::identifiers::ObjectIncarnationRef,
+        GameEvent,
+        crate::types::events::DiscardObservation,
+    ); 2] {
         let mut departures = Vec::new();
         for to in [Zone::Graveyard, Zone::Hand, Zone::Graveyard] {
             let before =
                 crate::types::identifiers::ObjectIncarnationRef::from_object(&state.objects[&card]);
             let from_hand = state.objects[&card].zone == Zone::Hand;
+            let observation = from_hand.then(|| discard::capture_discard_observation(state, card));
             let mut moved = Vec::new();
             crate::game::zones::move_to_zone(state, card, to, &mut moved);
             if from_hand {
@@ -42057,7 +42097,7 @@ mod tests {
                         )
                     })
                     .expect("a hand departure emits its ZoneChanged");
-                departures.push((before, event));
+                departures.push((before, event, observation.unwrap()));
             }
         }
         let [first, second]: [_; 2] = departures
@@ -42090,22 +42130,26 @@ mod tests {
     /// the discriminating one.
     #[test]
     fn resumed_discard_stamp_rejects_a_later_incarnation_of_the_paused_card() {
-        let stamped_discards = |state: &mut GameState,
-                                card: ObjectId,
-                                pin: crate::types::identifiers::ObjectIncarnationRef,
-                                departure: GameEvent| {
-            let source = ObjectId(100);
-            park_batch(state, source, PlayerId(0), Vec::new(), None);
-            state.pending_discard_batch.as_mut().unwrap().paused_card = pin;
-            let mut events = vec![departure];
-            drain_pending_discard_batch(state, &mut events).unwrap();
-            events
+        let stamped_discards =
+            |state: &mut GameState,
+             card: ObjectId,
+             pin: crate::types::identifiers::ObjectIncarnationRef,
+             departure: GameEvent,
+             observation: crate::types::events::DiscardObservation| {
+                let source = ObjectId(100);
+                park_batch(state, source, PlayerId(0), Vec::new(), None);
+                state.pending_discard_batch.as_mut().unwrap().paused_card = pin;
+                state.pending_discard_batch.as_mut().unwrap().observation =
+                    Some(Box::new(observation));
+                let mut events = vec![departure];
+                drain_pending_discard_batch(state, &mut events).unwrap();
+                events
                 .iter()
                 .filter(|event| {
                     matches!(event, GameEvent::Discarded { object_id, .. } if *object_id == card)
                 })
                 .count()
-        };
+            };
 
         let mut state = GameState::new_two_player(42);
         let card = create_object(
@@ -42115,20 +42159,32 @@ mod tests {
             "Round Tripper".to_string(),
             Zone::Hand,
         );
-        let [(first_pin, first_departure), (later_pin, later_departure)] =
+        let [(first_pin, first_departure, first_observation), (later_pin, later_departure, later_observation)] =
             hand_departures_across_a_round_trip(&mut state, card);
 
         // Negative arm: the pause parked the FIRST occurrence; the resume window
         // carries only the LATER occurrence's departure.
         assert_eq!(
-            stamped_discards(&mut state, card, first_pin, later_departure),
+            stamped_discards(
+                &mut state,
+                card,
+                first_pin,
+                later_departure,
+                first_observation.clone()
+            ),
             0,
             "a later incarnation's hand departure must not settle this pause"
         );
 
         // Positive arm: the same pin, offered its own departure, still stamps.
         assert_eq!(
-            stamped_discards(&mut state, card, first_pin, first_departure.clone()),
+            stamped_discards(
+                &mut state,
+                card,
+                first_pin,
+                first_departure.clone(),
+                first_observation
+            ),
             1,
             "the parked occurrence's own departure must still stamp exactly one \
              Discarded, or the negative arm above proves nothing"
@@ -42138,7 +42194,13 @@ mod tests {
         // the earlier one, so the predicate is an equality on the occurrence
         // rather than an ordering test.
         assert_eq!(
-            stamped_discards(&mut state, card, later_pin, first_departure),
+            stamped_discards(
+                &mut state,
+                card,
+                later_pin,
+                first_departure,
+                later_observation
+            ),
             0,
             "an earlier incarnation's departure must not settle a later pause"
         );
@@ -59837,17 +59899,26 @@ mod tests {
         let other_source = ObjectId(11);
         let events = vec![
             GameEvent::Discarded {
+                // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+                observation: None,
+
                 player_id: PlayerId(0),
                 object_id: ObjectId(1),
                 source_id: Some(source),
             },
             GameEvent::Discarded {
+                // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+                observation: None,
+
                 player_id: PlayerId(1),
                 object_id: ObjectId(2),
                 source_id: Some(other_source),
             },
             resolved_event(EffectKind::Discard, source),
             GameEvent::Discarded {
+                // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+                observation: None,
+
                 player_id: PlayerId(1),
                 object_id: ObjectId(3),
                 source_id: Some(source),

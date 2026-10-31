@@ -736,7 +736,7 @@ fn pay_turn_face_up_cost_object(
             ) {
                 super::effects::discard::DiscardOutcome::Complete => Ok(None),
                 super::effects::discard::DiscardOutcome::NeedsChoice(waiting_for) => {
-                    Ok(Some(*waiting_for))
+                    Ok(Some(waiting_for.waiting_for))
                 }
             }
         }

@@ -4644,7 +4644,7 @@ where
                 ) {
                     crate::game::effects::discard::DiscardOutcome::Complete => {}
                     crate::game::effects::discard::DiscardOutcome::NeedsChoice(waiting_for) => {
-                        state.waiting_for = *waiting_for;
+                        state.waiting_for = waiting_for.waiting_for;
                     }
                 }
             } else {
@@ -5980,7 +5980,7 @@ fn discard_selected_card_for_mana_cost(
     match crate::game::effects::discard::discard_as_cost(state, chosen_id, player, events) {
         crate::game::effects::discard::DiscardOutcome::Complete => Ok(()),
         crate::game::effects::discard::DiscardOutcome::NeedsChoice(waiting_for) => {
-            state.waiting_for = *waiting_for;
+            state.waiting_for = waiting_for.waiting_for;
             Ok(())
         }
     }

@@ -2948,24 +2948,65 @@ pub(super) fn match_player_action(
     }
 }
 
+fn discarded_subject_matches(
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_context: &TriggerSourceContext,
+    state: &GameState,
+) -> bool {
+    let GameEvent::Discarded {
+        player_id,
+        object_id,
+        observation,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    if observation
+        .as_deref()
+        .is_some_and(|value| !value.completed_for(*object_id, *player_id))
+    {
+        return false;
+    }
+    let Some(filter) = trigger.valid_card.as_ref() else {
+        return true;
+    };
+    let ctx = super::filter::FilterContext::from_trigger_source(source_context);
+    match observation.as_deref() {
+        Some(value) if value.characteristics_defined() => {
+            super::filter::matches_target_filter_on_event_snapshot(
+                state,
+                &value.subject,
+                filter,
+                &ctx,
+            )
+        }
+        value => {
+            super::filter::matches_undefined_discard_filter(
+                state,
+                *object_id,
+                value.map(|value| &value.subject),
+                filter,
+                &ctx,
+            ) == Some(true)
+        }
+    }
+}
+
 pub(super) fn match_discarded(
     event: &GameEvent,
     trigger: &TriggerDefinition,
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::Discarded {
-        player_id,
-        object_id,
-        ..
-    } = event
-    {
+    if let GameEvent::Discarded { player_id, .. } = event {
         // CR 603.2: The trigger event includes which player discarded; scope
         // "you"/"opponent" discard triggers through valid_target.
         if !valid_player_matches(trigger, state, *player_id, source_context) {
             return false;
         }
-        if !valid_card_matches(trigger, state, *object_id, source_context) {
+        if !discarded_subject_matches(event, trigger, source_context, state) {
             return false;
         }
         true
@@ -3605,16 +3646,11 @@ pub(super) fn match_cycled_or_discarded(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::Discarded {
-        player_id,
-        object_id,
-        ..
-    } = event
-    {
+    if let GameEvent::Discarded { player_id, .. } = event {
         if !valid_player_matches(trigger, state, *player_id, source_context) {
             return false;
         }
-        valid_card_matches(trigger, state, *object_id, source_context)
+        discarded_subject_matches(event, trigger, source_context, state)
     } else {
         false
     }
@@ -6686,6 +6722,9 @@ mod tests {
 
         assert!(!match_discarded(
             &GameEvent::Discarded {
+                // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+                observation: None,
+
                 player_id: PlayerId(1),
                 object_id: discarded,
                 source_id: None,
@@ -6696,6 +6735,9 @@ mod tests {
         ));
         assert!(match_discarded(
             &GameEvent::Discarded {
+                // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+                observation: None,
+
                 player_id: PlayerId(0),
                 object_id: discarded,
                 source_id: None,
@@ -6703,6 +6745,53 @@ mod tests {
             &trigger,
             &test_trigger_source_context(&state, source),
             &state,
+        ));
+    }
+
+    #[test]
+    fn malformed_populated_discard_receipts_fail_closed_before_generic_matching() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Discard observer".into(),
+            Zone::Battlefield,
+        );
+        let card = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Original Hand subject".into(),
+            Zone::Hand,
+        );
+        let mut observation =
+            crate::game::effects::discard::capture_discard_observation(&state, card);
+        crate::game::zones::move_to_zone(&mut state, card, Zone::Graveyard, &mut Vec::new());
+        observation.delivered_to = Some(Zone::Graveyard);
+        let context = test_trigger_source_context(&state, source);
+        let trigger = make_trigger(TriggerMode::DiscardedAll);
+        let mut event = GameEvent::Discarded {
+            player_id: PlayerId(0),
+            object_id: card,
+            source_id: None,
+            observation: Some(Box::new(observation)),
+        };
+        assert!(match_discarded(&event, &trigger, &context, &state));
+        assert!(match_cycled_or_discarded(
+            &event, &trigger, &context, &state
+        ));
+        let GameEvent::Discarded {
+            observation: Some(observation),
+            ..
+        } = &mut event
+        else {
+            unreachable!()
+        };
+        observation.delivered_to = None;
+        assert!(!match_discarded(&event, &trigger, &context, &state));
+        assert!(!match_cycled_or_discarded(
+            &event, &trigger, &context, &state
         ));
     }
 
@@ -6721,21 +6810,21 @@ mod tests {
             CardId(2),
             PlayerId(0),
             "Discarded Land".to_string(),
-            Zone::Graveyard,
+            Zone::Hand,
         );
         let p1_land = create_object(
             &mut state,
             CardId(3),
             PlayerId(1),
             "Opponent Discarded Land".to_string(),
-            Zone::Graveyard,
+            Zone::Hand,
         );
         let p0_nonland = create_object(
             &mut state,
             CardId(4),
             PlayerId(0),
             "Discarded Creature".to_string(),
-            Zone::Graveyard,
+            Zone::Hand,
         );
         for id in [p0_land, p1_land] {
             state
@@ -6754,12 +6843,25 @@ mod tests {
             .core_types
             .push(CoreType::Creature);
 
+        let mut receipts = Vec::new();
+        for id in [p0_land, p1_land, p0_nonland] {
+            let mut observation =
+                crate::game::effects::discard::capture_discard_observation(&state, id);
+            crate::game::zones::move_to_zone(&mut state, id, Zone::Graveyard, &mut Vec::new());
+            observation.delivered_to = Some(Zone::Graveyard);
+            receipts.push(observation);
+        }
+        let p0_land_observation = receipts[0].clone();
+        let p1_land_observation = receipts[1].clone();
+        let p0_nonland_observation = receipts[2].clone();
         let mut trigger =
             make_trigger(TriggerMode::DiscardedAll).valid_target(TargetFilter::Controller);
         trigger.valid_card = Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)));
 
         assert!(match_discarded(
             &GameEvent::Discarded {
+                observation: Some(Box::new(p0_land_observation.clone())),
+
                 player_id: PlayerId(0),
                 object_id: p0_land,
                 source_id: None,
@@ -6770,6 +6872,8 @@ mod tests {
         ));
         assert!(!match_discarded(
             &GameEvent::Discarded {
+                observation: Some(Box::new(p1_land_observation.clone())),
+
                 player_id: PlayerId(1),
                 object_id: p1_land,
                 source_id: None,
@@ -6780,6 +6884,8 @@ mod tests {
         ));
         assert!(!match_discarded(
             &GameEvent::Discarded {
+                observation: Some(Box::new(p0_nonland_observation.clone())),
+
                 player_id: PlayerId(0),
                 object_id: p0_nonland,
                 source_id: None,
@@ -6792,6 +6898,8 @@ mod tests {
         let broad = make_trigger(TriggerMode::DiscardedAll).valid_target(TargetFilter::Controller);
         assert!(match_discarded(
             &GameEvent::Discarded {
+                observation: Some(Box::new(p0_nonland_observation.clone())),
+
                 player_id: PlayerId(0),
                 object_id: p0_nonland,
                 source_id: None,
@@ -6856,6 +6964,9 @@ mod tests {
         ));
         assert!(!match_cycled_or_discarded(
             &GameEvent::Discarded {
+                // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+                observation: None,
+
                 player_id: PlayerId(1),
                 object_id: card,
                 source_id: None,
@@ -6866,6 +6977,9 @@ mod tests {
         ));
         assert!(match_cycled_or_discarded(
             &GameEvent::Discarded {
+                // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+                observation: None,
+
                 player_id: PlayerId(0),
                 object_id: card,
                 source_id: None,

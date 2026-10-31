@@ -11,7 +11,7 @@ use crate::types::ability::{
     Effect, EffectError, EffectKind, ParentTargetMissingReason, ResolvedAbility, TargetFilter,
     TargetRef,
 };
-use crate::types::events::GameEvent;
+use crate::types::events::{DiscardObservation, GameEvent};
 use crate::types::game_state::{
     GameState, PendingDiscardProvenance, ReplacementSubtreeBoundary, WaitingFor,
 };
@@ -26,7 +26,24 @@ pub(crate) enum DiscardOutcome {
     Complete,
     /// The replacement pipeline or delivery raised this exact new prompt.
     /// Carry it past the caller's old discard/payment prompt without rebuilding it.
-    NeedsChoice(Box<WaitingFor>),
+    NeedsChoice(Box<DiscardPause>),
+}
+
+pub(crate) struct DiscardPause {
+    pub waiting_for: WaitingFor,
+    pub observation: DiscardObservation,
+}
+
+pub(crate) fn capture_discard_observation(
+    state: &GameState,
+    object_id: ObjectId,
+) -> DiscardObservation {
+    DiscardObservation::new(
+        state
+            .capture_event_object_snapshot(object_id)
+            .filter(|subject| subject.zone == Zone::Hand)
+            .expect("discard selection captures the original Hand subject"),
+    )
 }
 
 /// CR 400.7 + CR 701.9a + CR 616.1f: only the same unperformed discard owns this completion.
@@ -61,7 +78,7 @@ pub(crate) fn retain_pending_discard(state: &mut GameState, provenance: PendingD
             } => *object_id == provenance.object_id,
             _ => false,
         };
-        if same_discard && pending.discard_provenance.is_none() {
+        if same_discard {
             pending.discard_provenance = Some(Box::new(provenance));
         }
     }
@@ -78,8 +95,17 @@ pub(crate) fn record_completed_discard(
         object_id,
         player_id,
         source_id,
-        original_hand: _,
+        original_hand,
+        observation,
     } = provenance;
+    let Some(observation) = observation.filter(|observation| {
+        observation.completed_for(object_id, player_id)
+            && Some(observation.subject.identity) == original_hand
+    }) else {
+        panic!("current discard publication lacks observation authority");
+    };
+    if !events.iter().any(|event| matches!(event, GameEvent::ZoneChanged { object_id: moved, from: Some(Zone::Hand), to, record, .. }
+        if *moved == object_id && Some(*to) == observation.delivered_to && record.trigger_source_context().is_some_and(|context| Some(context.identity.reference) == original_hand))) { return; }
     crate::game::restrictions::record_discard(state, player_id);
     if state.objects.get(&object_id).map(|object| object.zone) == Some(Zone::Graveyard) {
         crate::game::restrictions::record_card_discarded(state, object_id);
@@ -88,6 +114,7 @@ pub(crate) fn record_completed_discard(
         player_id,
         object_id,
         source_id,
+        observation: Some(observation),
     });
 }
 
@@ -115,13 +142,14 @@ fn retire_discard_frame(
 /// (madness) that already applied — this mirrors `discard_applier`'s lowering.
 pub(crate) fn complete_discard_to_graveyard(
     state: &mut GameState,
-    original_hand: ObjectIncarnationRef,
+    mut observation: DiscardObservation,
     player_id: PlayerId,
     source_id: Option<ObjectId>,
     discard_frame: Option<crate::types::identifiers::DiscardFrameId>,
     applied: HashSet<AppliedReplacementKey>,
     events: &mut Vec<GameEvent>,
 ) -> DiscardOutcome {
+    let original_hand = observation.subject.identity;
     let object_id = original_hand.object_id;
     // CR 400.7 + CR 701.9a: only the original occurrence in its owner's hand can depart.
     let was_in_hand = original_hand.is_current(state)
@@ -135,7 +163,8 @@ pub(crate) fn complete_discard_to_graveyard(
         }
         return DiscardOutcome::Complete;
     }
-    let provenance = PendingDiscardProvenance {
+    let mut provenance = PendingDiscardProvenance {
+        observation: Some(Box::new(observation.clone())),
         original_hand: Some(original_hand),
         object_id,
         player_id,
@@ -165,7 +194,7 @@ pub(crate) fn complete_discard_to_graveyard(
         performed_by: None,
         applied,
     };
-    match replacement::replace_event(state, proposed, events) {
+    match replacement::replace_discard_event(state, proposed, &mut observation, events) {
         ReplacementResult::Execute(event) => {
             let matching_delivery = matches!(&event,
                 ProposedEvent::ZoneChange { object_id: subject, from: Zone::Hand, .. }
@@ -175,18 +204,20 @@ pub(crate) fn complete_discard_to_graveyard(
                 .get(&object_id)
                 .is_some_and(|object| object.zone == Zone::Hand);
             let delivery_start = events.len();
-            let delivery = change_zone::deliver_replaced_zone_change(
+            let delivery = crate::game::zone_pipeline::deliver_discard(
                 state,
-                event,
-                source_id,
-                None,
-                None,
-                false,
-                crate::types::game_state::PostReplacementDrainOwner::DeliveryTail,
-                // Discard delivers to the graveyard — no library placement.
-                None,
+                crate::game::zone_pipeline::ApprovedZoneChange::approve_post_replacement(event)
+                    .expect("discard delivery is an approved ZoneChange"),
+                crate::game::zone_pipeline::DeliveryCtx {
+                    source_id,
+                    exile_links: Default::default(),
+                    drain: crate::types::game_state::PostReplacementDrainOwner::DeliveryTail,
+                    library_placement: None,
+                },
+                &mut observation,
                 events,
             );
+            provenance.observation = Some(Box::new(observation.clone()));
             if discard_frame.is_none()
                 && was_in_hand
                 && matching_delivery
@@ -195,7 +226,7 @@ pub(crate) fn complete_discard_to_graveyard(
                     .get(&object_id)
                     .is_some_and(|object| object.zone != Zone::Hand)
             {
-                record_completed_discard(state, provenance, events);
+                record_completed_discard(state, provenance.clone(), events);
             }
             if let change_zone::ZoneDeliveryResult::NeedsChoice(_) = delivery {
                 if discard_frame.is_none() {
@@ -204,7 +235,10 @@ pub(crate) fn complete_discard_to_graveyard(
                 if discard_frame.is_none() {
                     retain_pending_discard(state, provenance);
                 }
-                return DiscardOutcome::NeedsChoice(Box::new(state.waiting_for.clone()));
+                return DiscardOutcome::NeedsChoice(Box::new(DiscardPause {
+                    waiting_for: state.waiting_for.clone(),
+                    observation,
+                }));
             }
         }
         ReplacementResult::Prevented => {
@@ -220,15 +254,17 @@ pub(crate) fn complete_discard_to_graveyard(
             return DiscardOutcome::Complete;
         }
         ReplacementResult::NeedsChoice(player) => {
+            provenance.observation = Some(Box::new(observation.clone()));
             // CR 614.1: The replacement-effect pipeline retains `discard_frame` on the paused
             // ZoneChange. Generic replacement resume returns to terminal zone
             // delivery, which appends the exact result and emits bookkeeping.
             if discard_frame.is_none() && was_in_hand {
                 retain_pending_discard(state, provenance);
             }
-            return DiscardOutcome::NeedsChoice(Box::new(
-                replacement::replacement_choice_waiting_for(player, state),
-            ));
+            return DiscardOutcome::NeedsChoice(Box::new(DiscardPause {
+                waiting_for: replacement::replacement_choice_waiting_for(player, state),
+                observation,
+            }));
         }
     }
     DiscardOutcome::Complete
@@ -282,6 +318,7 @@ fn park_discard_batch(
     source_id: ObjectId,
     effect_kind: EffectKind,
     paused_card: ObjectIncarnationRef,
+    observation: DiscardObservation,
     delivery_subtree: ReplacementSubtreeBoundary,
     discard_frame: Option<crate::types::identifiers::DiscardFrameId>,
     events: &mut Vec<GameEvent>,
@@ -290,6 +327,7 @@ fn park_discard_batch(
 ) {
     let preceding_events = events[events_before_self..].to_vec();
     state.pending_discard_batch = Some(Box::new(crate::types::game_state::PendingDiscardBatch {
+        observation: Some(Box::new(observation)),
         player,
         cursor,
         completion,
@@ -542,6 +580,14 @@ pub fn resolve(
             }
             let player_id = obj.owner;
             let paused_card = ObjectIncarnationRef::from_object(obj);
+            let mut observation = capture_discard_observation(state, obj_id);
+            if let Some(frame_id) = discard_frame {
+                state
+                    .resolution_stack
+                    .active_discard_or_direct_continuation_parent_mut(frame_id)
+                    .expect("active discard owns its selected receipt")
+                    .observation = Some(Box::new(observation.clone()));
+            }
 
             // CR 701.9a + CR 609.3: Tamiyo, Collector of Tales class — an
             // opponent's spell or ability can't force the protected player to
@@ -565,7 +611,7 @@ pub fn resolve(
             };
 
             let delivery_subtree = ReplacementSubtreeBoundary::at(&state.resolution_stack);
-            match replacement::replace_event(state, proposed, events) {
+            match replacement::replace_discard_event(state, proposed, &mut observation, events) {
                 ReplacementResult::Execute(event) => {
                     match event {
                         ProposedEvent::Discard {
@@ -578,7 +624,7 @@ pub fn resolve(
                             if let DiscardOutcome::NeedsChoice(waiting_for) =
                                 complete_discard_to_graveyard(
                                     state,
-                                    paused_card,
+                                    observation,
                                     pid,
                                     Some(ability.source_id),
                                     discard_frame,
@@ -586,7 +632,8 @@ pub fn resolve(
                                     events,
                                 )
                             {
-                                state.waiting_for = *waiting_for;
+                                state.waiting_for = waiting_for.waiting_for;
+                                let observation = waiting_for.observation;
                                 park_discard_batch(
                                     state,
                                     player_id,
@@ -600,7 +647,7 @@ pub fn resolve(
                                     ability.source_id,
                                     EffectKind::from(&ability.effect),
                                     paused_card,
-                                    delivery_subtree,
+                                    observation, delivery_subtree,
                                     discard_frame,
                                     events,
                                     events_before_self,
@@ -624,24 +671,19 @@ pub fn resolve(
                                     .objects
                                     .get(&oid)
                                     .is_some_and(|object| object.zone == Zone::Hand);
-                            let provenance = PendingDiscardProvenance {
+                            let mut provenance = PendingDiscardProvenance {
+                                observation: Some(Box::new(observation.clone())),
                                 original_hand: Some(paused_card),
                                 object_id: oid,
                                 player_id,
                                 source_id: Some(ability.source_id),
                             };
                             let delivery_start = events.len();
-                            let delivery = change_zone::deliver_replaced_zone_change(
-                                state,
-                                zone_event,
-                                None,
-                                None,
-                                None,
-                                false,
-                                crate::types::game_state::PostReplacementDrainOwner::DeliveryTail,
-                                None,
-                                events,
-                            );
+                            let delivery = crate::game::zone_pipeline::deliver_discard(state,
+                crate::game::zone_pipeline::ApprovedZoneChange::approve_post_replacement(zone_event).expect("discard delivery is an approved ZoneChange"),
+                crate::game::zone_pipeline::DeliveryCtx { source_id: None, exile_links: Default::default(), drain: crate::types::game_state::PostReplacementDrainOwner::DeliveryTail, library_placement: None },
+                &mut observation, events);
+                            provenance.observation = Some(Box::new(observation.clone()));
                             if discard_frame.is_none()
                                 && was_in_hand
                                 && state
@@ -649,7 +691,7 @@ pub fn resolve(
                                     .get(&oid)
                                     .is_some_and(|object| object.zone != Zone::Hand)
                             {
-                                record_completed_discard(state, provenance, events);
+                                record_completed_discard(state, provenance.clone(), events);
                             }
                             if let change_zone::ZoneDeliveryResult::NeedsChoice(_) = delivery {
                                 if discard_frame.is_none() {
@@ -666,7 +708,7 @@ pub fn resolve(
                                             .map(ObjectIncarnationRef::from_object).collect(),
                                     },
                                     ability.source_id, EffectKind::from(&ability.effect),
-                                    paused_card, delivery_subtree, discard_frame,
+                                    paused_card, observation, delivery_subtree, discard_frame,
                                     events, events_before_self,
                                     crate::types::game_state::PendingDiscardBatchCompletion::Standard,
                                 );
@@ -697,6 +739,7 @@ pub fn resolve(
                         ability.source_id,
                         EffectKind::from(&ability.effect),
                         paused_card,
+                        observation,
                         delivery_subtree,
                         discard_frame,
                         events,
@@ -801,6 +844,7 @@ pub fn resolve(
                 remaining_eligible,
                 remaining_count,
                 paused_card,
+                observation,
                 delivery_subtree,
                 ..
             } = discard_at_random(
@@ -825,6 +869,7 @@ pub fn resolve(
                     ability.source_id,
                     EffectKind::from(&ability.effect),
                     paused_card,
+                    *observation,
                     delivery_subtree,
                     discard_frame,
                     events,
@@ -851,7 +896,8 @@ pub fn resolve(
                         events,
                     )
                 {
-                    state.waiting_for = *waiting_for;
+                    state.waiting_for = waiting_for.waiting_for;
+                    let observation = waiting_for.observation;
                     // CR 614.1 + CR 701.9a: park the un-iterated tail instead of
                     // abandoning it. `hand_cards[i + 1..]` and not `[i..]`: the
                     // paused card is settled by the replacement itself, exactly
@@ -868,6 +914,7 @@ pub fn resolve(
                         EffectKind::from(&ability.effect),
                         // CR 400.7: the pause parks the pre-move occurrence.
                         paused_card,
+                        observation,
                         delivery_subtree,
                         discard_frame,
                         events,
@@ -1041,6 +1088,7 @@ pub(crate) enum RandomDiscardOutcome {
         /// in hand. The drain settles the pause against this exact occurrence
         /// leaving the hand, so a later same-id occurrence cannot claim it.
         paused_card: ObjectIncarnationRef,
+        observation: Box<DiscardObservation>,
         /// Pre-move cost referent data for the paused pick. Effect callers
         /// ignore it; cost callers preserve it until delivery completes.
         paused_pick: Box<crate::types::game_state::RandomDiscardCostPick>,
@@ -1140,7 +1188,8 @@ pub(crate) fn discard_at_random(
             ),
         };
         if let DiscardOutcome::NeedsChoice(waiting_for) = outcome {
-            state.waiting_for = *waiting_for;
+            state.waiting_for = waiting_for.waiting_for;
+            let observation = waiting_for.observation;
             return RandomDiscardOutcome::NeedsReplacementChoice {
                 completed_picks: picks,
                 remaining_eligible: remaining,
@@ -1150,6 +1199,7 @@ pub(crate) fn discard_at_random(
                 // CR 400.7: pinned before the redirect moves it, so the resume
                 // settles against this occurrence and not a later same-id one.
                 paused_card: selected.occurrence,
+                observation: Box::new(observation),
                 paused_pick: Box::new(selected),
                 delivery_subtree,
             };
@@ -1234,6 +1284,14 @@ fn route_discard(
         return DiscardOutcome::Complete;
     }
     let original_hand = ObjectIncarnationRef::from_object(&state.objects[&object_id]);
+    let mut observation = capture_discard_observation(state, object_id);
+    if let Some(frame_id) = discard_frame {
+        state
+            .resolution_stack
+            .active_discard_or_direct_continuation_parent_mut(frame_id)
+            .expect("active discard owns its selected receipt")
+            .observation = Some(Box::new(observation.clone()));
+    }
     let proposed = ProposedEvent::Discard {
         player_id: player,
         object_id,
@@ -1242,7 +1300,7 @@ fn route_discard(
         discard_frame,
         applied: HashSet::new(),
     };
-    match replacement::replace_event(state, proposed, events) {
+    match replacement::replace_discard_event(state, proposed, &mut observation, events) {
         ReplacementResult::Execute(event) => match event {
             ProposedEvent::Discard {
                 player_id: pid,
@@ -1253,7 +1311,7 @@ fn route_discard(
             } => {
                 if let DiscardOutcome::NeedsChoice(choice_player) = complete_discard_to_graveyard(
                     state,
-                    original_hand,
+                    observation,
                     pid,
                     source_id,
                     discard_frame,
@@ -1280,24 +1338,30 @@ fn route_discard(
                         .objects
                         .get(&oid)
                         .is_some_and(|object| object.zone == Zone::Hand);
-                let provenance = PendingDiscardProvenance {
+                let mut provenance = PendingDiscardProvenance {
+                    observation: Some(Box::new(observation.clone())),
                     original_hand: Some(original_hand),
                     object_id: oid,
                     player_id: player,
                     source_id,
                 };
                 let delivery_start = events.len();
-                let delivery = change_zone::deliver_replaced_zone_change(
+                let delivery = crate::game::zone_pipeline::deliver_discard(
                     state,
-                    zone_event,
-                    None,
-                    None,
-                    None,
-                    false,
-                    crate::types::game_state::PostReplacementDrainOwner::DeliveryTail,
-                    None,
+                    crate::game::zone_pipeline::ApprovedZoneChange::approve_post_replacement(
+                        zone_event,
+                    )
+                    .expect("discard delivery is an approved ZoneChange"),
+                    crate::game::zone_pipeline::DeliveryCtx {
+                        source_id: None,
+                        exile_links: Default::default(),
+                        drain: crate::types::game_state::PostReplacementDrainOwner::DeliveryTail,
+                        library_placement: None,
+                    },
+                    &mut observation,
                     events,
                 );
+                provenance.observation = Some(Box::new(observation.clone()));
                 if discard_frame.is_none()
                     && was_in_hand
                     && state
@@ -1305,7 +1369,7 @@ fn route_discard(
                         .get(&oid)
                         .is_some_and(|object| object.zone != Zone::Hand)
                 {
-                    record_completed_discard(state, provenance, events);
+                    record_completed_discard(state, provenance.clone(), events);
                 }
                 if let change_zone::ZoneDeliveryResult::NeedsChoice(_) = delivery {
                     if discard_frame.is_none() {
@@ -1314,7 +1378,10 @@ fn route_discard(
                     if discard_frame.is_none() && was_in_hand {
                         retain_pending_discard(state, provenance);
                     }
-                    return DiscardOutcome::NeedsChoice(Box::new(state.waiting_for.clone()));
+                    return DiscardOutcome::NeedsChoice(Box::new(DiscardPause {
+                        waiting_for: state.waiting_for.clone(),
+                        observation,
+                    }));
                 }
             }
             _ => {}
@@ -1324,9 +1391,10 @@ fn route_discard(
             // This is extremely rare during cost payment. The card stays in hand.
         }
         ReplacementResult::NeedsChoice(choice_player) => {
-            return DiscardOutcome::NeedsChoice(Box::new(
-                replacement::replacement_choice_waiting_for(choice_player, state),
-            ));
+            return DiscardOutcome::NeedsChoice(Box::new(DiscardPause {
+                waiting_for: replacement::replacement_choice_waiting_for(choice_player, state),
+                observation,
+            }));
         }
     }
     DiscardOutcome::Complete
@@ -1863,7 +1931,8 @@ mod tests {
         ReplacementCondition, ReplacementDefinition, ReplacementMode, ResolvedAbility,
         SubAbilityLink, TargetFilter, TypedFilter,
     };
-    use crate::types::actions::GameAction;
+    use crate::types::actions::{DebugAction, GameAction};
+    use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
     use crate::types::game_state::{PendingContinuation, WaitingFor};
     use crate::types::identifiers::{CardId, ObjectId};
@@ -2009,10 +2078,97 @@ mod tests {
         assert_eq!(state.objects[&card].zone, Zone::Battlefield);
         // CR 701.9a + CR 603.2c: a synchronous empty child does not cancel or duplicate the discard.
         assert_eq!(state.cards_discarded_this_turn_by_player[&PlayerId(0)], 1);
-        assert_eq!(result.events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id: None } if *object_id == card)).count(), 1);
+        assert_eq!(result.events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id: None, .. } if *object_id == card)).count(), 1);
         assert!(matches!(result.waiting_for, WaitingFor::Priority { .. }));
         assert!(state.pending_discard_batch.is_none());
         assert!(state.resolution_stack.is_empty());
+    }
+
+    fn assert_discard_observer_receipt(
+        state: &GameState,
+        events: &[GameEvent],
+        observer: ObjectId,
+        deferred: bool,
+    ) {
+        let actual = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    GameEvent::Discarded {
+                        observation: Some(_),
+                        ..
+                    }
+                )
+            })
+            .expect("completed discard retains its observation");
+        let GameEvent::Discarded {
+            player_id,
+            object_id,
+            source_id: _,
+            observation: Some(observation),
+        } = actual
+        else {
+            unreachable!()
+        };
+        assert!(observation.completed_for(*object_id, *player_id));
+        assert_eq!(observation.subject.zone, Zone::Hand);
+        assert_eq!(observation.delivered_to, Some(Zone::Battlefield));
+        assert!(observation.pending_reveal.is_none() && observation.revealed_by.is_none());
+        assert!(events.iter().any(|event| matches!(event, GameEvent::ZoneChanged { from: Some(Zone::Hand), record, .. } if record.trigger_source_context().is_some_and(|context| context.identity.reference == observation.subject.identity))));
+        if deferred {
+            let context = state
+                .deferred_triggers
+                .iter()
+                .find(|context| context.pending.source_id == observer)
+                .expect("actual deferred observer context");
+            assert_eq!(context.pending.controller, PlayerId(1));
+            assert!(context
+                .pending
+                .trigger_event
+                .iter()
+                .chain(context.trigger_events.iter())
+                .any(|event| event == actual));
+        } else {
+            let entry = state
+                .stack
+                .iter()
+                .find(|entry| entry.source_id == observer)
+                .expect("actual final observer entry");
+            assert!(
+                matches!(&entry.kind, crate::types::game_state::StackEntryKind::TriggeredAbility { trigger_event: Some(event), .. } if event == actual)
+            );
+            assert!(state.is_loop_comparable());
+        }
+    }
+
+    fn assert_delayed_discard_observer_context(state: &GameState, observer: ObjectId) {
+        let expected = crate::game::triggers::trigger_source_context_for_latch(
+            state,
+            &state.objects[&observer],
+        );
+        let installed = state
+            .delayed_triggers
+            .iter()
+            .filter(|trigger| {
+                trigger.source_id == observer
+                    && trigger.controller == PlayerId(1)
+                    && trigger.one_shot
+                    && matches!(
+                        trigger.condition,
+                        crate::types::ability::DelayedTriggerCondition::WhenNextEvent { .. }
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            installed[0].ability.trigger_source.as_ref(),
+            Some(&expected)
+        );
+        assert_eq!(
+            expected.identity.reference,
+            ObjectIncarnationRef::from_object(&state.objects[&observer])
+        );
     }
 
     #[test]
@@ -2022,6 +2178,8 @@ mod tests {
         for optional in [false, true] {
             for delayed in [false, true] {
                 for sacrifice in [false, true] {
+                    let branch =
+                        format!("optional={optional} delayed={delayed} sacrifice={sacrifice}");
                     let mut state = GameState::new_two_player(42);
                     state.phase = crate::types::phase::Phase::PreCombatMain;
                     state.debug_mode = true;
@@ -2082,6 +2240,32 @@ mod tests {
                     );
                     if delayed {
                         trigger.execute = None;
+                        let source_context =
+                            crate::game::triggers::trigger_source_context_for_latch(
+                                &state,
+                                &state.objects[&observer],
+                            );
+                        let mut delayed_ability = ResolvedAbility::new(
+                            Effect::Draw {
+                                count: QuantityExpr::Fixed { value: 1 },
+                                target: TargetFilter::Controller,
+                            },
+                            vec![],
+                            observer,
+                            PlayerId(1),
+                        );
+                        delayed_ability.set_trigger_source_recursive(source_context.clone());
+                        assert_eq!(
+                            delayed_ability.trigger_source.as_ref(),
+                            Some(&source_context),
+                            "{branch}"
+                        );
+                        assert_eq!(source_context.lki.controller, PlayerId(1), "{branch}");
+                        assert_eq!(
+                            source_context.identity.reference,
+                            ObjectIncarnationRef::from_object(&state.objects[&observer]),
+                            "{branch}"
+                        );
                         crate::game::triggers::install_delayed_trigger(
                             &mut state,
                             crate::types::game_state::DelayedTrigger::new(
@@ -2090,15 +2274,7 @@ mod tests {
                                     or_trigger: None,
                                     lifetime: Default::default(),
                                 },
-                                Box::new(ResolvedAbility::new(
-                                    Effect::Draw {
-                                        count: QuantityExpr::Fixed { value: 1 },
-                                        target: TargetFilter::Controller,
-                                    },
-                                    vec![],
-                                    observer,
-                                    PlayerId(1),
-                                )),
+                                Box::new(delayed_ability),
                                 PlayerId(1),
                                 observer,
                                 true,
@@ -2117,15 +2293,24 @@ mod tests {
                         assert_eq!(
                             state.objects[&observer].trigger_definitions.len(),
                             1,
-                            "ordinary Grimoire observer survives production layer preparation"
+                            "{branch}: {}",
+                            format_args!(
+                                "ordinary Grimoire observer survives production layer preparation"
+                            )
                         );
-                        assert!(state.objects[&observer]
-                            .trigger_definitions
-                            .first()
-                            .expect("printed observer remains installed")
-                            .definition
-                            .execute
-                            .is_some());
+                        assert!(
+                            state.objects[&observer]
+                                .trigger_definitions
+                                .first()
+                                .expect("printed observer remains installed")
+                                .definition
+                                .execute
+                                .is_some(),
+                            "{branch}"
+                        );
+                    }
+                    if delayed {
+                        assert_delayed_discard_observer_context(&state, observer);
                     }
                     let mut events = crate::game::engine::apply(
                         &mut state,
@@ -2135,17 +2320,23 @@ mod tests {
                     .unwrap()
                     .events;
                     if optional {
-                        assert!(matches!(
-                            state.waiting_for,
-                            WaitingFor::ReplacementChoice {
-                                player: PlayerId(0),
-                                ..
-                            }
-                        ));
-                        assert_eq!(state.objects[&card].zone, Zone::Hand);
-                        assert!(!events
-                            .iter()
-                            .any(|event| matches!(event, GameEvent::Discarded { .. })));
+                        assert!(
+                            matches!(
+                                state.waiting_for,
+                                WaitingFor::ReplacementChoice {
+                                    player: PlayerId(0),
+                                    ..
+                                }
+                            ),
+                            "{branch}"
+                        );
+                        assert_eq!(state.objects[&card].zone, Zone::Hand, "{branch}");
+                        assert!(
+                            !events
+                                .iter()
+                                .any(|event| matches!(event, GameEvent::Discarded { .. })),
+                            "{branch}"
+                        );
                         events.extend(
                             apply_as_current(
                                 &mut state,
@@ -2159,24 +2350,33 @@ mod tests {
                         player, ref cards, ..
                     } = state.waiting_for
                     else {
-                        panic!("actual delivery prompt lost: {:?}", state.waiting_for)
+                        panic!(
+                            "{branch}: actual delivery prompt lost: {:?}",
+                            state.waiting_for
+                        )
                     };
-                    assert_eq!(player, PlayerId(0));
-                    assert!(cards.contains(&fodder));
-                    assert!(!cards.contains(&card));
+                    assert_eq!(player, PlayerId(0), "{branch}");
+                    assert!(cards.contains(&fodder), "{branch}");
+                    assert!(!cards.contains(&card), "{branch}");
                     // CR 701.9a + CR 603.2c: the original hand departure publishes once before its child choice.
-                    assert_eq!(state.objects[&card].zone, Zone::Battlefield);
-                    assert_eq!(state.cards_discarded_this_turn_by_player[&PlayerId(0)], 1);
-                    assert_eq!(events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id: None } if *object_id == card)).count(), 1);
-                    assert!(state.stack.is_empty());
+                    assert_eq!(state.objects[&card].zone, Zone::Battlefield, "{branch}");
+                    assert_eq!(
+                        state.cards_discarded_this_turn_by_player[&PlayerId(0)],
+                        1,
+                        "{branch}"
+                    );
+                    assert_eq!(events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id: None, .. } if *object_id == card)).count(), 1, "{branch}");
+                    assert!(state.stack.is_empty(), "{branch}");
                     assert_eq!(
                         state
                             .deferred_triggers
                             .iter()
                             .filter(|context| context.pending.source_id == observer)
                             .count(),
-                        1
+                        1,
+                        "{branch}"
                     );
+                    assert_discard_observer_receipt(&state, &events, observer, true);
                     let response = apply_as_current(
                         &mut state,
                         GameAction::SelectCards {
@@ -2190,18 +2390,26 @@ mod tests {
                             Zone::Graveyard
                         } else {
                             Zone::Battlefield
-                        }
+                        },
+                        "{branch}"
                     );
-                    assert!(matches!(response.waiting_for, WaitingFor::Priority { .. }));
-                    assert!(!response
-                        .events
-                        .iter()
-                        .any(|event| matches!(event, GameEvent::Discarded { .. })));
-                    assert!(state.pending_discard_batch.is_none());
-                    assert!(state.resolution_stack.is_empty());
-                    assert_eq!(state.stack.len(), 1);
-                    assert_eq!(state.stack[0].source_id, observer);
-                    assert_eq!(state.stack[0].controller, PlayerId(1));
+                    assert!(
+                        matches!(response.waiting_for, WaitingFor::Priority { .. }),
+                        "{branch}"
+                    );
+                    assert!(
+                        !response
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, GameEvent::Discarded { .. })),
+                        "{branch}"
+                    );
+                    assert!(state.pending_discard_batch.is_none(), "{branch}");
+                    assert!(state.resolution_stack.is_empty(), "{branch}");
+                    assert_eq!(state.stack.len(), 1, "{branch}");
+                    assert_eq!(state.stack[0].source_id, observer, "{branch}");
+                    assert_eq!(state.stack[0].controller, PlayerId(1), "{branch}");
+                    assert_discard_observer_receipt(&state, &events, observer, false);
                 }
             }
         }
@@ -2235,6 +2443,417 @@ mod tests {
             },
         )));
         replacement
+    }
+
+    fn shuffle_back_discard_replacement() -> ReplacementDefinition {
+        let mut replacement = discard_to_battlefield_with_two_counters_replacement();
+        replacement.event = ReplacementEvent::Moved;
+        replacement.condition = None;
+        replacement.active_zones = vec![Zone::Hand];
+        replacement.destination_zone = Some(Zone::Graveyard);
+        let root = replacement.execute.as_deref_mut().unwrap();
+        if let Effect::ChangeZone {
+            destination,
+            enter_with_counters,
+            ..
+        } = root.effect.as_mut()
+        {
+            *destination = Zone::Library;
+            enter_with_counters.clear();
+        }
+        let mut reveal = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Reveal {
+                target: TargetFilter::SelfRef,
+            },
+        );
+        reveal.sub_ability = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Shuffle {
+                target: TargetFilter::Owner,
+            },
+        )));
+        root.sub_ability = Some(Box::new(reveal));
+        replacement
+    }
+
+    #[test]
+    fn selected_discard_reveal_requires_the_exact_mandatory_leading_instruction() {
+        for shape in 0..8 {
+            let mut state = GameState::new_two_player(42);
+            state.debug_mode = true;
+            state.phase = crate::types::phase::Phase::PreCombatMain;
+            let life_before = state.players[0].life;
+            let card = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Selected shuffle-back subject".into(),
+                Zone::Hand,
+            );
+            let other = create_object(
+                &mut state,
+                CardId(2),
+                PlayerId(1),
+                "Other reveal subject".into(),
+                Zone::Hand,
+            );
+            let original = ObjectIncarnationRef::from_object(&state.objects[&card]);
+            let mut definition = shuffle_back_discard_replacement();
+            let root = definition.execute.as_deref_mut().unwrap();
+            match shape {
+                0 => {} // The positive production branch.
+                1 => {
+                    root.sub_ability = root.sub_ability.as_deref_mut().unwrap().sub_ability.take();
+                }
+                2 => {
+                    root.sub_ability.as_deref_mut().unwrap().optional = true;
+                }
+                3 => {
+                    *root.sub_ability.as_deref_mut().unwrap().effect = Effect::Reveal {
+                        target: TargetFilter::SpecificObject { id: other },
+                    };
+                }
+                4 => {
+                    let mut work = AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp);
+                    work.sub_ability = root.sub_ability.take();
+                    root.sub_ability = Some(Box::new(work));
+                }
+                5 => {
+                    definition.mode = ReplacementMode::Optional { decline: None };
+                }
+                6 | 7 => {
+                    definition.mode = ReplacementMode::MayCost {
+                        cost: crate::types::ability::AbilityCost::PayLife {
+                            amount: QuantityExpr::Fixed {
+                                value: if shape == 6 { 1 } else { 99 },
+                            },
+                        },
+                        decline: None,
+                    };
+                }
+                _ => unreachable!(),
+            }
+            state
+                .objects
+                .get_mut(&card)
+                .unwrap()
+                .replacement_definitions
+                .push(definition);
+            let mut events = apply_as_current(
+                &mut state,
+                GameAction::Debug(DebugAction::Discard { object_id: card }),
+            )
+            .unwrap()
+            .events;
+            if shape >= 5 {
+                assert!(matches!(
+                    state.waiting_for,
+                    WaitingFor::ReplacementChoice {
+                        player: PlayerId(0),
+                        ..
+                    }
+                ));
+                assert_eq!(state.objects[&card].zone, Zone::Hand);
+                assert!(events.iter().all(|event| !matches!(
+                    event,
+                    GameEvent::CardsRevealed { .. } | GameEvent::Discarded { .. }
+                )));
+                events.extend(
+                    apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 })
+                        .unwrap()
+                        .events,
+                );
+            }
+            let event = events
+                .iter()
+                .find(|event| matches!(event, GameEvent::Discarded { .. }))
+                .expect("all shapes positively complete the original discard");
+            let GameEvent::Discarded {
+                observation: Some(observation),
+                ..
+            } = event
+            else {
+                panic!("current observation required")
+            };
+            assert_eq!(observation.subject.identity, original, "shape={shape}");
+            assert_eq!(
+                observation.delivered_to,
+                Some(if shape == 7 {
+                    Zone::Graveyard
+                } else {
+                    Zone::Library
+                }),
+                "shape={shape}"
+            );
+            assert_eq!(
+                observation.revealed_by.is_some(),
+                matches!(shape, 0 | 5 | 6),
+                "shape={shape}"
+            );
+            assert!(observation.pending_reveal.is_none());
+            let moved = events.iter().position(|event| matches!(event, GameEvent::ZoneChanged { from: Some(Zone::Hand), object_id, .. } if *object_id == card)).unwrap();
+            let reveals = events.iter().enumerate().filter(|(_, event)| matches!(event, GameEvent::CardsRevealed { card_ids, .. } if card_ids.contains(&card))).map(|(index, _)| index).collect::<Vec<_>>();
+            if matches!(shape, 0 | 5 | 6) {
+                assert_eq!(reveals.len(), 1);
+                assert!(reveals[0] < moved);
+            }
+            if shape == 4 {
+                assert_eq!(reveals.len(), 1);
+                assert!(
+                    reveals[0] > moved,
+                    "intervening ordinary work never licenses a pre-move receipt"
+                );
+            }
+            if shape == 3 {
+                assert!(reveals.is_empty());
+                assert!(events.iter().any(|event| matches!(event, GameEvent::CardsRevealed { card_ids, .. } if card_ids == &[other])), "other-subject instruction really executes");
+            }
+            if shape == 2 {
+                assert!(reveals.is_empty());
+                assert!(
+                    matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+                    "future optional reveal remains an actual later choice"
+                );
+                let answer = apply_as_current(
+                    &mut state,
+                    GameAction::DecideOptionalEffect { accept: false },
+                )
+                .unwrap();
+                assert!(answer.events.iter().all(|event| !matches!(
+                    event,
+                    GameEvent::CardsRevealed { .. } | GameEvent::Discarded { .. }
+                )));
+            }
+            if shape == 1 {
+                assert!(reveals.is_empty());
+            }
+            assert_eq!(
+                state.objects[&card].zone,
+                if shape == 7 {
+                    Zone::Graveyard
+                } else {
+                    Zone::Library
+                }
+            );
+            assert_eq!(
+                state.players[0].life,
+                if shape == 6 {
+                    life_before - 1
+                } else {
+                    life_before
+                },
+                "shape={shape}: only successfully paid selected branch charges life"
+            );
+            if shape == 7 {
+                assert!(
+                    reveals.is_empty(),
+                    "failed MayCost cannot bind the accept body's reveal"
+                );
+            }
+            assert_eq!(state.cards_discarded_this_turn_by_player[&PlayerId(0)], 1);
+            assert!(state.pending_replacement.is_none());
+            assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+        }
+        // A nonselected optional accept body's reveal is not performed on decline.
+        let mut state = GameState::new_two_player(42);
+        state.debug_mode = true;
+        state.phase = crate::types::phase::Phase::PreCombatMain;
+        let card = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Declined shuffle-back subject".into(),
+            Zone::Hand,
+        );
+        let mut definition = shuffle_back_discard_replacement();
+        definition.mode = ReplacementMode::Optional { decline: None };
+        state
+            .objects
+            .get_mut(&card)
+            .unwrap()
+            .replacement_definitions
+            .push(definition);
+        let parked = apply_as_current(
+            &mut state,
+            GameAction::Debug(DebugAction::Discard { object_id: card }),
+        )
+        .unwrap();
+        assert!(matches!(
+            parked.waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        let answer =
+            apply_as_current(&mut state, GameAction::ChooseReplacement { index: 1 }).unwrap();
+        assert_eq!(state.objects[&card].zone, Zone::Graveyard);
+        assert!(answer
+            .events
+            .iter()
+            .all(|event| !matches!(event, GameEvent::CardsRevealed { .. })));
+        assert!(answer.events.iter().any(|event| matches!(event, GameEvent::Discarded { observation: Some(observation), .. } if observation.delivered_to == Some(Zone::Graveyard) && observation.revealed_by.is_none())));
+    }
+
+    #[test]
+    fn independently_permitted_discard_reveal_does_not_publish_an_impossible_hand_move() {
+        let mut state = GameState::new_two_player(42);
+        state.debug_mode = true;
+        state.phase = crate::types::phase::Phase::PreCombatMain;
+        let card = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Instant with an impossible modified delivery".into(),
+            Zone::Hand,
+        );
+        let original = ObjectIncarnationRef::from_object(&state.objects[&card]);
+        let object = state.objects.get_mut(&card).unwrap();
+        object.card_types.core_types.push(CoreType::Instant);
+        object.base_card_types = object.card_types.clone();
+        object
+            .replacement_definitions
+            .push(shuffle_back_discard_replacement());
+        let mut later = discard_to_battlefield_with_two_counters_replacement();
+        later.event = ReplacementEvent::Moved;
+        later.condition = None;
+        later.active_zones = vec![Zone::Hand];
+        later.destination_zone = Some(Zone::Library);
+        if let Effect::ChangeZone {
+            enter_with_counters,
+            ..
+        } = later.execute.as_deref_mut().unwrap().effect.as_mut()
+        {
+            enter_with_counters.clear();
+        }
+        object.replacement_definitions.push(later);
+        let result = apply_as_current(
+            &mut state,
+            GameAction::Debug(DebugAction::Discard { object_id: card }),
+        )
+        .unwrap();
+        assert_eq!(result.events.iter().filter(|event| matches!(event, GameEvent::ReplacementApplied { source_id, .. } if *source_id == card)).count(), 2, "both selected modifications actually apply");
+        assert_eq!(result.events.iter().filter(|event| matches!(event, GameEvent::CardsRevealed { card_ids, .. } if card_ids == &[card])).count(), 1, "the independently permitted mandatory reveal executes");
+        assert!(original.is_current(&state));
+        assert_eq!(state.objects[&card].zone, Zone::Hand);
+        assert!(result.events.iter().all(|event| !matches!(event, GameEvent::ZoneChanged { from: Some(Zone::Hand), object_id, .. } if *object_id == card)));
+        assert!(result
+            .events
+            .iter()
+            .all(|event| !matches!(event, GameEvent::Discarded { .. })));
+        assert_eq!(
+            state.cards_discarded_this_turn_by_player.get(&PlayerId(0)),
+            None
+        );
+        assert!(matches!(result.waiting_for, WaitingFor::Priority { .. }));
+    }
+
+    #[test]
+    fn selected_discard_reveal_survives_a_later_same_event_repark_and_restore() {
+        use crate::types::game_state::PersistedGameState;
+        let mut state = GameState::new_two_player(42);
+        state.debug_mode = true;
+        state.phase = crate::types::phase::Phase::PreCombatMain;
+        let card = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Reparked shuffle-back subject".into(),
+            Zone::Hand,
+        );
+        let original = ObjectIncarnationRef::from_object(&state.objects[&card]);
+        let object = state.objects.get_mut(&card).unwrap();
+        object
+            .replacement_definitions
+            .push(shuffle_back_discard_replacement());
+        let mut later = ReplacementDefinition::new(ReplacementEvent::Moved)
+            .valid_card(TargetFilter::SelfRef)
+            .destination_zone(Zone::Library)
+            .mode(ReplacementMode::Optional { decline: None });
+        later.active_zones = vec![Zone::Hand];
+        object.replacement_definitions.push(later);
+        let first = apply_as_current(
+            &mut state,
+            GameAction::Debug(DebugAction::Discard { object_id: card }),
+        )
+        .unwrap();
+        assert!(matches!(
+            first.waiting_for,
+            WaitingFor::ReplacementChoice {
+                player: PlayerId(0),
+                ..
+            }
+        ));
+        assert_eq!(state.objects[&card].zone, Zone::Hand);
+        assert!(first.events.iter().all(|event| !matches!(
+            event,
+            GameEvent::CardsRevealed { .. } | GameEvent::Discarded { .. }
+        )));
+        let pending = state.pending_replacement.as_ref().unwrap();
+        assert_eq!(
+            pending.candidates[0].index, 1,
+            "the canonical replacement already applied before the later prompt"
+        );
+        let observation = pending
+            .discard_provenance
+            .as_deref()
+            .unwrap()
+            .observation
+            .as_deref()
+            .unwrap()
+            .clone();
+        assert_eq!(observation.subject.identity, original);
+        let bound = observation
+            .pending_reveal
+            .as_ref()
+            .expect("successfully applied mandatory reveal remains pending");
+        assert_eq!(bound.replacement, AppliedReplacementKey::object(card, 0));
+        assert_eq!(bound.source, Some(original));
+        assert!(pending.proposed.applied_set().contains(&bound.replacement));
+        assert!(observation.revealed_by.is_none() && observation.delivered_to.is_none());
+        assert!(!state.is_loop_comparable());
+        for ingress in 0..3 {
+            let mut restored: GameState = if ingress == 0 {
+                serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap()
+            } else {
+                let saved = if ingress == 1 {
+                    PersistedGameState::Raw(Box::new(state.clone()))
+                } else {
+                    PersistedGameState::capture(state.clone())
+                };
+                serde_json::from_value::<PersistedGameState>(serde_json::to_value(saved).unwrap())
+                    .unwrap()
+                    .into_game_state()
+                    .unwrap()
+            };
+            assert_eq!(
+                restored
+                    .pending_replacement
+                    .as_ref()
+                    .unwrap()
+                    .discard_provenance
+                    .as_deref()
+                    .unwrap()
+                    .observation
+                    .as_deref(),
+                Some(&observation)
+            );
+            let result =
+                apply_as_current(&mut restored, GameAction::ChooseReplacement { index: 1 })
+                    .unwrap();
+            assert_eq!(restored.objects[&card].zone, Zone::Library);
+            assert_eq!(result.events.iter().filter(|event| matches!(event, GameEvent::CardsRevealed { card_ids, .. } if card_ids == &[card])).count(), 1);
+            let moved = result.events.iter().position(|event| matches!(event, GameEvent::ZoneChanged { from: Some(Zone::Hand), record, .. } if record.trigger_source_context().is_some_and(|context| context.identity.reference == original))).unwrap();
+            let revealed = result.events.iter().position(|event| matches!(event, GameEvent::CardsRevealed { card_ids, .. } if card_ids == &[card])).unwrap();
+            assert!(revealed < moved);
+            assert!(result.events.iter().any(|event| matches!(event, GameEvent::Discarded { observation: Some(completed), .. } if completed.revealed_by == Some(bound.replacement) && completed.pending_reveal.is_none() && completed.delivered_to == Some(Zone::Library))));
+            assert_eq!(
+                restored.cards_discarded_this_turn_by_player[&PlayerId(0)],
+                1
+            );
+            assert!(restored.pending_replacement.is_none());
+            assert!(restored.resolution_stack.is_empty());
+            assert!(restored.is_loop_comparable());
+            assert!(matches!(result.waiting_for, WaitingFor::Priority { .. }));
+        }
     }
 
     /// Rest in Peace / Leyline of the Void class: "If a card would be put into a
@@ -2682,6 +3301,7 @@ mod tests {
         ] {
             for delayed in [false, true] {
                 for prevent_counter in [false, true] {
+                    let branch = format!("event={event:?} optional={optional} targeted={targeted} delayed={delayed} prevent={prevent_counter}");
                     let mut state = GameState::new_two_player(42);
                     state.phase = crate::types::phase::Phase::PreCombatMain;
                     state.debug_mode = true;
@@ -2729,6 +3349,32 @@ mod tests {
                     );
                     if delayed {
                         observer.execute = None;
+                        let source_context =
+                            crate::game::triggers::trigger_source_context_for_latch(
+                                &state,
+                                &state.objects[&grimoire],
+                            );
+                        let mut delayed_ability = ResolvedAbility::new(
+                            Effect::Draw {
+                                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                                target: TargetFilter::Controller,
+                            },
+                            vec![],
+                            grimoire,
+                            PlayerId(1),
+                        );
+                        delayed_ability.set_trigger_source_recursive(source_context.clone());
+                        assert_eq!(
+                            delayed_ability.trigger_source.as_ref(),
+                            Some(&source_context),
+                            "{branch}"
+                        );
+                        assert_eq!(source_context.lki.controller, PlayerId(1), "{branch}");
+                        assert_eq!(
+                            source_context.identity.reference,
+                            ObjectIncarnationRef::from_object(&state.objects[&grimoire]),
+                            "{branch}"
+                        );
                         crate::game::triggers::install_delayed_trigger(
                             &mut state,
                             crate::types::game_state::DelayedTrigger::new(
@@ -2737,17 +3383,7 @@ mod tests {
                                     or_trigger: None,
                                     lifetime: Default::default(),
                                 },
-                                Box::new(ResolvedAbility::new(
-                                    Effect::Draw {
-                                        count: crate::types::ability::QuantityExpr::Fixed {
-                                            value: 1,
-                                        },
-                                        target: TargetFilter::Controller,
-                                    },
-                                    vec![],
-                                    grimoire,
-                                    PlayerId(1),
-                                )),
+                                Box::new(delayed_ability),
                                 PlayerId(1),
                                 grimoire,
                                 true,
@@ -2766,15 +3402,19 @@ mod tests {
                         assert_eq!(
                             state.objects[&grimoire].trigger_definitions.len(),
                             1,
-                            "ordinary observer survives production layer preparation"
+                            "{branch}: {}",
+                            format_args!("ordinary observer survives production layer preparation")
                         );
-                        assert!(state.objects[&grimoire]
-                            .trigger_definitions
-                            .first()
-                            .expect("printed observer remains installed")
-                            .definition
-                            .execute
-                            .is_some());
+                        assert!(
+                            state.objects[&grimoire]
+                                .trigger_definitions
+                                .first()
+                                .expect("printed observer remains installed")
+                                .definition
+                                .execute
+                                .is_some(),
+                            "{branch}"
+                        );
                     }
                     let before = state
                         .cards_discarded_this_turn_by_player
@@ -2782,6 +3422,9 @@ mod tests {
                         .copied()
                         .unwrap_or(0);
                     // The targeted resolver is supplementary; public Debug and Windfall cover support.
+                    if delayed {
+                        assert_delayed_discard_observer_context(&state, grimoire);
+                    }
                     let mut events = if targeted {
                         let ability = ResolvedAbility::new(
                             Effect::DiscardCard {
@@ -2804,14 +3447,17 @@ mod tests {
                         .events
                     };
                     if optional {
-                        assert!(matches!(
-                            state.waiting_for,
-                            WaitingFor::ReplacementChoice { .. }
-                        ));
-                        assert_eq!(state.objects[&card].zone, Zone::Hand);
-                        assert!(!events
-                            .iter()
-                            .any(|event| matches!(event, GameEvent::Discarded { .. })));
+                        assert!(
+                            matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+                            "{branch}"
+                        );
+                        assert_eq!(state.objects[&card].zone, Zone::Hand, "{branch}");
+                        assert!(
+                            !events
+                                .iter()
+                                .any(|event| matches!(event, GameEvent::Discarded { .. })),
+                            "{branch}"
+                        );
                         events.extend(
                             apply_as_current(
                                 &mut state,
@@ -2822,28 +3468,34 @@ mod tests {
                         );
                     }
                     // CR 701.9a + CR 701.9c: counters may pause after the actual discard already happened.
-                    assert_eq!(state.objects[&card].zone, Zone::Battlefield);
-                    assert!(matches!(
-                        state.waiting_for,
-                        WaitingFor::ReplacementChoice { .. }
-                    ));
+                    assert_eq!(state.objects[&card].zone, Zone::Battlefield, "{branch}");
+                    assert!(
+                        matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+                        "{branch}"
+                    );
                     let pending = state
                         .pending_replacement
                         .as_ref()
                         .expect("counter prompt is live");
-                    assert!(matches!(pending.proposed, ProposedEvent::AddCounter { .. }));
+                    assert!(
+                        matches!(pending.proposed, ProposedEvent::AddCounter { .. }),
+                        "{branch}"
+                    );
                     assert_eq!(
-                        pending.discard_provenance, None,
-                        "completed discard cannot belong to AddCounter"
+                        pending.discard_provenance,
+                        None,
+                        "{branch}: {}",
+                        format_args!("completed discard cannot belong to AddCounter")
                     );
                     assert_eq!(
                         state.cards_discarded_this_turn_by_player[&PlayerId(0)],
-                        before + 1
+                        before + 1,
+                        "{branch}"
                     );
-                    assert_eq!(events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id } if *object_id == card && *source_id == targeted.then_some(source))).count(), 1);
+                    assert_eq!(events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id, .. } if *object_id == card && *source_id == targeted.then_some(source))).count(), 1, "{branch}");
                     assert!(
                         state.stack.is_empty(),
-                        "observers wait for the counter answer"
+                        "{branch}: observers wait for the counter answer"
                     );
                     assert_eq!(
                         state
@@ -2851,8 +3503,10 @@ mod tests {
                             .iter()
                             .filter(|context| context.pending.source_id == grimoire)
                             .count(),
-                        1
+                        1,
+                        "{branch}"
                     );
+                    assert_discard_observer_receipt(&state, &events, grimoire, true);
                     let response = apply_as_current(
                         &mut state,
                         GameAction::ChooseReplacement {
@@ -2860,26 +3514,39 @@ mod tests {
                         },
                     )
                     .unwrap();
-                    assert!(matches!(response.waiting_for, WaitingFor::Priority { .. }));
+                    assert!(
+                        matches!(response.waiting_for, WaitingFor::Priority { .. }),
+                        "{branch}"
+                    );
                     assert_eq!(
                         state.objects[&card]
                             .counters
                             .get(&CounterType::Plus1Plus1)
                             .copied()
                             .unwrap_or(0),
-                        if prevent_counter { 0 } else { 2 }
+                        if prevent_counter { 0 } else { 2 },
+                        "{branch}"
                     );
                     assert_eq!(
                         state.cards_discarded_this_turn_by_player[&PlayerId(0)],
-                        before + 1
+                        before + 1,
+                        "{branch}"
                     );
-                    assert!(!response
-                        .events
-                        .iter()
-                        .any(|event| matches!(event, GameEvent::Discarded { .. })));
-                    assert_eq!(state.stack.len(), 1, "one eventual discard observer");
-                    assert_eq!(state.stack[0].source_id, grimoire);
-                    assert_eq!(state.stack[0].controller, PlayerId(1));
+                    assert!(
+                        !response
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, GameEvent::Discarded { .. })),
+                        "{branch}"
+                    );
+                    assert_eq!(
+                        state.stack.len(),
+                        1,
+                        "{branch}: one eventual discard observer"
+                    );
+                    assert_eq!(state.stack[0].source_id, grimoire, "{branch}");
+                    assert_eq!(state.stack[0].controller, PlayerId(1), "{branch}");
+                    assert_discard_observer_receipt(&state, &events, grimoire, false);
                 }
             }
         }
@@ -2986,6 +3653,9 @@ mod tests {
             .iter()
             .all(|event| !matches!(event, GameEvent::Discarded { .. })));
         let provenance = PendingDiscardProvenance {
+            observation: Some(Box::new(
+                crate::game::effects::discard::capture_discard_observation(&state, card),
+            )),
             original_hand: Some(ObjectIncarnationRef::from_object(&state.objects[&card])),
             object_id: card,
             player_id: PlayerId(0),
@@ -3050,7 +3720,7 @@ mod tests {
         // CR 616.1f + CR 701.9c: all pre-move choices retain one eventual discard.
         assert_eq!(state.objects[&card].zone, Zone::Exile);
         assert_eq!(state.cards_discarded_this_turn_by_player[&PlayerId(0)], 1);
-        assert_eq!(completed.events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id: None } if *object_id == card)).count(), 1);
+        assert_eq!(completed.events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id: None, .. } if *object_id == card)).count(), 1);
         assert!(matches!(completed.waiting_for, WaitingFor::Priority { .. }));
         assert!(state.pending_replacement.is_none());
     }
@@ -3079,11 +3749,13 @@ mod tests {
             .unwrap()
             .replacement_definitions
             .push(library_of_leng_discard_replacement());
-        let mut events = Vec::new();
-        assert!(matches!(
-            discard_caused_by_effect_with_source(&mut state, card, PlayerId(0), None, &mut events),
-            DiscardOutcome::NeedsChoice(_)
-        ));
+        state.debug_mode = true;
+        let started = apply_as_current(
+            &mut state,
+            GameAction::Debug(crate::types::actions::DebugAction::Discard { object_id: card }),
+        )
+        .expect("public Debug discard parks Library choice");
+        let events = started.events;
         assert!(state
             .pending_replacement
             .as_ref()
@@ -3211,7 +3883,32 @@ mod tests {
         assert!(
             matches!(state.pending_replacement.as_ref().unwrap().proposed, ProposedEvent::Discard { discard_frame: Some(id), .. } if id == frame)
         );
+        assert!(state
+            .resolution_stack
+            .active_discard()
+            .unwrap()
+            .observation
+            .is_some());
+        assert!(!state.is_loop_comparable());
+        let mut sampled = state.clone();
+        sampled.record_loop_detect_sample();
+        assert!(sampled.loop_detect_ring.is_empty());
         state.waiting_for = replacement::replacement_choice_waiting_for(PlayerId(0), &state);
+        let current: GameState = serde_json::from_value(serde_json::to_value(&state).unwrap())
+            .expect("current exact frame receipt restores");
+        assert_eq!(current.resolution_stack, state.resolution_stack);
+        let mut missing = state.clone();
+        missing
+            .resolution_stack
+            .active_discard_mut()
+            .unwrap()
+            .observation = None;
+        assert!(
+            serde_json::from_value::<GameState>(serde_json::to_value(missing).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("observation authority")
+        );
         let response =
             apply_as_current(&mut state, GameAction::ChooseReplacement { index: 1 }).unwrap();
         // CR 701.9a + CR 603.2c: the exact frame remains the only publisher.
@@ -3226,6 +3923,19 @@ mod tests {
         assert_eq!(result.results.len(), 1);
         assert_eq!(result.results[0].object_id, card);
         assert!(matches!(response.waiting_for, WaitingFor::Priority { .. }));
+        assert!(
+            !state.is_loop_comparable(),
+            "the exact frame still owns its receipt"
+        );
+        state
+            .resolution_stack
+            .take_active_discard()
+            .unwrap()
+            .unwrap();
+        assert!(
+            state.is_loop_comparable(),
+            "retiring the owner restores comparability"
+        );
     }
 
     #[test]
@@ -3271,7 +3981,7 @@ mod tests {
         assert!(matches!(
             outcome,
             DiscardOutcome::NeedsChoice(waiting_for)
-                if matches!(*waiting_for, WaitingFor::ReplacementChoice { player: PlayerId(0), .. })
+                if matches!(waiting_for.waiting_for, WaitingFor::ReplacementChoice { player: PlayerId(0), .. })
         ));
         assert!(state.players[0].hand.contains(&card));
         assert!(!state.players[0].graveyard.contains(&card));

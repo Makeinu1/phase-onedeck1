@@ -36465,6 +36465,9 @@ mod sacrifice_cost_context_identity_tests {
             ));
         }
         runner.state_mut().current_trigger_event = Some(GameEvent::Discarded {
+            // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+            observation: None,
+
             player_id: P0,
             object_id: fodder,
             source_id: Some(source),

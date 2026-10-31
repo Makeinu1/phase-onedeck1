@@ -4470,6 +4470,9 @@ mod tests {
         assert_eq!(extract_amount_from_event(&milled), Some(1));
         assert_eq!(
             extract_amount_from_event(&GameEvent::Discarded {
+                // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+                observation: None,
+
                 player_id: PlayerId(1),
                 object_id: ObjectId(7),
                 source_id: None,

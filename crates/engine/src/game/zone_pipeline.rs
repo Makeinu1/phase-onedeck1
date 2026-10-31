@@ -3660,6 +3660,31 @@ fn entry_receiver(
 /// `Moved` replacement may have redirected the event to a non-library zone; the
 /// placement then has no effect (the index/shuffle gates both key on
 /// `to == Zone::Library`).
+pub(crate) fn deliver_discard(
+    state: &mut GameState,
+    approved: ApprovedZoneChange,
+    ctx: DeliveryCtx,
+    observation: &mut crate::types::events::DiscardObservation,
+    events: &mut Vec<GameEvent>,
+) -> ZoneDeliveryResult {
+    let track = matches!(
+        ctx.exile_links.tracking,
+        ZoneDeliveryExileTracking::TrackBySource
+    );
+    deliver_replaced_zone_change_impl(
+        state,
+        approved.event,
+        ctx.source_id,
+        ctx.exile_links.duration.as_ref(),
+        ctx.exile_links.controller,
+        track,
+        ctx.drain,
+        ctx.library_placement,
+        Some(observation),
+        events,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn deliver_replaced_zone_change(
     state: &mut GameState,
@@ -3670,6 +3695,33 @@ pub(crate) fn deliver_replaced_zone_change(
     track_exiled_by_source: bool,
     drain: PostReplacementDrainOwner,
     library_placement: Option<LibraryPosition>,
+    events: &mut Vec<GameEvent>,
+) -> ZoneDeliveryResult {
+    deliver_replaced_zone_change_impl(
+        state,
+        event,
+        source_id,
+        duration,
+        exile_controller,
+        track_exiled_by_source,
+        drain,
+        library_placement,
+        None,
+        events,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deliver_replaced_zone_change_impl(
+    state: &mut GameState,
+    event: ProposedEvent,
+    source_id: Option<ObjectId>,
+    duration: Option<&Duration>,
+    exile_controller: Option<PlayerId>,
+    track_exiled_by_source: bool,
+    drain: PostReplacementDrainOwner,
+    library_placement: Option<LibraryPosition>,
+    observation: Option<&mut crate::types::events::DiscardObservation>,
     events: &mut Vec<GameEvent>,
 ) -> ZoneDeliveryResult {
     if let ProposedEvent::ZoneChange {
@@ -3853,6 +3905,65 @@ pub(crate) fn deliver_replaced_zone_change(
         // `move_to_zone` early-return WITHOUT moving the object (CR 614.1d), and a
         // blocked manifest/morph entry must not strand the card face down in its
         // origin zone.
+        let mut frame_observation =
+            if observation.is_none() && from == Zone::Hand && discard_frame.is_some() {
+                let retained = discard_frame
+                    .and_then(|id| {
+                        state
+                            .resolution_stack
+                            .active_discard_or_direct_continuation_parent_mut(id)
+                    })
+                    .and_then(|frame| frame.observation.as_deref().cloned());
+                retained.or_else(|| {
+                    state
+                        .capture_event_object_snapshot(object_id)
+                        .filter(|subject| subject.zone == Zone::Hand)
+                        .map(crate::types::events::DiscardObservation::new)
+                })
+            } else {
+                None
+            };
+        let mut observation = observation.or(frame_observation.as_mut());
+        let discard_delivery_start = events.len();
+        if let Some(observation) = observation.as_deref_mut() {
+            let pin = observation.subject.identity;
+            assert!(
+                from == Zone::Hand
+                    && pin.object_id == object_id
+                    && pin.is_current(state)
+                    && state
+                        .objects
+                        .get(&object_id)
+                        .is_some_and(|object| object.zone == Zone::Hand
+                            && object.owner == observation.subject.owner),
+                "approved discard must retain its original Hand authority"
+            );
+            observation.subject = state
+                .capture_event_object_snapshot(object_id)
+                .expect("approved original Hand subject exists");
+            // The selected mandatory leaf is independent of an impossible zone instruction
+            // being ignored by the raw mover (CR 614.6). Only a real original departure
+            // below can authorize Discarded/count publication.
+            if let Some(bound) = observation.pending_reveal.take() {
+                assert!(
+                    applied.contains(&bound.replacement),
+                    "discard reveal must belong to this applied replacement"
+                );
+                let instruction = crate::types::ability::ResolvedAbility::new(
+                    crate::types::ability::Effect::Reveal {
+                        target: crate::types::ability::TargetFilter::SelfRef,
+                    },
+                    vec![],
+                    object_id,
+                    bound.controller,
+                );
+                let reveal_start = events.len();
+                crate::game::effects::reveal::resolve(state, &instruction, events)
+                    .expect("validated SelfRef reveal has no error or choice path");
+                assert!(events[reveal_start..].iter().any(|event| matches!(event, GameEvent::CardsRevealed { card_ids, .. } if card_ids == &[object_id])), "actual reveal names the original discard subject");
+                observation.revealed_by = Some(bound.replacement);
+            }
+        }
         let face_down_preflight = to == Zone::Battlefield && face_down_profile.is_some();
         let prior_face_down = if face_down_preflight {
             state.objects.get(&object_id).map(|obj| obj.face_down)
@@ -3928,6 +4039,29 @@ pub(crate) fn deliver_replaced_zone_change(
                 }
             }
         }
+        if let Some(observation) = observation.as_deref_mut() {
+            if observation.delivered_to.is_none() {
+                observation.delivered_to =
+                    events[discard_delivery_start..]
+                        .iter()
+                        .find_map(|event| match event {
+                            GameEvent::ZoneChanged {
+                                object_id: moved,
+                                from: Some(Zone::Hand),
+                                to,
+                                record,
+                                ..
+                            } if *moved == object_id
+                                && record.trigger_source_context().is_some_and(|context| {
+                                    context.identity.reference == observation.subject.identity
+                                }) =>
+                            {
+                                Some(*to)
+                            }
+                            _ => None,
+                        });
+            }
+        }
         if face_down_in_exile.is_face_down() && to == Zone::Exile {
             zones::mark_face_down_in_exile(state, events, object_id);
             crate::game::exile_links::link_search_look(state, object_id, source_id);
@@ -3993,6 +4127,15 @@ pub(crate) fn deliver_replaced_zone_change(
                         player_id: lki.owner,
                         object_id,
                         source_id,
+                        observation: Some(Box::new(
+                            observation
+                                .as_deref()
+                                .filter(|observation| {
+                                    observation.completed_for(object_id, lki.owner)
+                                })
+                                .expect("frame discard publishes an actual completed observation")
+                                .clone(),
+                        )),
                     });
                 }
             }

@@ -20599,6 +20599,9 @@ pub mod tests {
         });
 
         let opp = GameEvent::Discarded {
+            // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+            observation: None,
+
             player_id: PlayerId(0),
             object_id: source,
             source_id: Some(opp_cause),
@@ -20609,6 +20612,9 @@ pub mod tests {
         );
 
         let own = GameEvent::Discarded {
+            // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+            observation: None,
+
             player_id: PlayerId(0),
             object_id: source,
             source_id: Some(own_cause),
@@ -20619,6 +20625,9 @@ pub mod tests {
         );
 
         let no_cause = GameEvent::Discarded {
+            // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+            observation: None,
+
             player_id: PlayerId(0),
             object_id: source,
             source_id: None,
@@ -20655,6 +20664,9 @@ pub mod tests {
         };
 
         let madness_discard = GameEvent::Discarded {
+            // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+            observation: None,
+
             player_id: PlayerId(0),
             object_id: madness_card,
             source_id: None,
@@ -20671,6 +20683,9 @@ pub mod tests {
         );
 
         let normal_discard = GameEvent::Discarded {
+            // Legacy event: this fixture reads only player, source, amount or generic-card facts.
+            observation: None,
+
             player_id: PlayerId(0),
             object_id: normal_card,
             source_id: None,
@@ -38586,7 +38601,7 @@ pub mod tests {
             CardId(10),
             PlayerId(0),
             "Discarded Creature".to_string(),
-            Zone::Graveyard,
+            Zone::Hand,
         );
         state
             .objects
@@ -38600,7 +38615,7 @@ pub mod tests {
             CardId(11),
             PlayerId(0),
             "Discarded Instant".to_string(),
-            Zone::Graveyard,
+            Zone::Hand,
         );
         state
             .objects
@@ -38624,15 +38639,37 @@ pub mod tests {
             .core_types
             .push(CoreType::Instant);
 
+        let mut discarded_creature_observation =
+            crate::game::effects::discard::capture_discard_observation(&state, discarded_creature);
+        crate::game::zones::move_to_zone(
+            &mut state,
+            discarded_creature,
+            Zone::Graveyard,
+            &mut Vec::new(),
+        );
+        discarded_creature_observation.delivered_to = Some(Zone::Graveyard);
+        let mut discarded_instant_observation =
+            crate::game::effects::discard::capture_discard_observation(&state, discarded_instant);
+        crate::game::zones::move_to_zone(
+            &mut state,
+            discarded_instant,
+            Zone::Graveyard,
+            &mut Vec::new(),
+        );
+        discarded_instant_observation.delivered_to = Some(Zone::Graveyard);
         process_triggers(
             &mut state,
             &[
                 GameEvent::Discarded {
+                    observation: Some(Box::new(discarded_creature_observation.clone())),
+
                     player_id: PlayerId(0),
                     object_id: discarded_creature,
                     source_id: None,
                 },
                 GameEvent::Discarded {
+                    observation: Some(Box::new(discarded_instant_observation.clone())),
+
                     player_id: PlayerId(0),
                     object_id: discarded_instant,
                     source_id: None,

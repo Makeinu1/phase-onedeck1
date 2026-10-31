@@ -10074,6 +10074,121 @@ fn optional_decline_is_noop(
     tap_already && counters_already && redirect_noop
 }
 
+/// CR 701.9c + CR 614.6: lower only the canonical mandatory shuffle-back reveal.
+fn selected_discard_reveal(
+    state: &GameState,
+    proposed: &ProposedEvent,
+    rid: ReplacementId,
+    ability: Option<&AbilityDefinition>,
+    controller: Option<PlayerId>,
+    observation: Option<&crate::types::events::DiscardObservation>,
+) -> Option<crate::types::events::BoundDiscardReveal> {
+    fn unconditional(node: &AbilityDefinition) -> bool {
+        node.condition.is_none()
+            && node.cost.is_none()
+            && node.duration.is_none()
+            && !node.optional
+            && !node.optional_targeting
+            && !node.forward_result
+            && node.optional_player.is_none()
+            && node.optional_for.is_none()
+            && node.else_ability.is_none()
+            && node.player_scope.is_none()
+            && node.starting_with.is_none()
+            && node.modal.is_none()
+            && node.mode_abilities.is_empty()
+            && node.repeat_for.is_none()
+            && node.repeat_until.is_none()
+            && node.unless_pay.is_none()
+            && node.target_chooser.is_none()
+            && node.multi_target.is_none()
+            && node.distribute.is_none()
+            && node.granting_object.is_none()
+            && node.unlowered_guard.is_none()
+            && node.target_reads == Default::default()
+            && node.target_selection_mode == Default::default()
+            && node.declares_chosen_group.is_none()
+            && node.reads_chosen_group.is_none()
+            && node.declares_return_result.is_none()
+            && node.reads_return_result.is_none()
+    }
+    let observation = observation?;
+    if observation.delivered_to.is_some()
+        || observation.pending_reveal.is_some()
+        || observation.revealed_by.is_some()
+    {
+        return None;
+    }
+    let subject = observation.subject.identity;
+    if proposed.affected_object_id() != Some(subject.object_id)
+        || !subject.is_current(state)
+        || observation.subject.zone != Zone::Hand
+    {
+        return None;
+    }
+    if !matches!(
+        proposed,
+        ProposedEvent::Discard { .. }
+            | ProposedEvent::ZoneChange {
+                from: Zone::Hand,
+                ..
+            }
+    ) {
+        return None;
+    }
+    let root = ability?;
+    if !unconditional(root)
+        || !matches!(
+            *root.effect,
+            Effect::ChangeZone {
+                destination: Zone::Library,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        )
+    {
+        return None;
+    }
+    let reveal = EventModifiers::first_non_modifier_ability(Some(root))?;
+    if !std::ptr::eq(root.sub_ability.as_deref()?, reveal)
+        || !unconditional(reveal)
+        || !matches!(
+            *reveal.effect,
+            Effect::Reveal {
+                target: TargetFilter::SelfRef
+            }
+        )
+    {
+        return None;
+    }
+    let shuffle = reveal.sub_ability.as_deref()?;
+    if !unconditional(shuffle)
+        || !matches!(
+            *shuffle.effect,
+            Effect::Shuffle {
+                target: TargetFilter::Owner
+            }
+        )
+    {
+        return None;
+    }
+    let source = if rid.source == ObjectId(0) {
+        None
+    } else {
+        if rid.source != subject.object_id {
+            return None;
+        }
+        Some(ObjectIncarnationRef::from_object(
+            state.objects.get(&rid.source)?,
+        ))
+    };
+    Some(crate::types::events::BoundDiscardReveal {
+        replacement: AppliedReplacementKey::for_event(proposed, rid),
+        source,
+        controller: controller?,
+    })
+}
+
 // clippy::result_large_err: see `apply_shield_counter_replacement` — the Err
 // arm carries an inherent `ProposedEvent` from the shared replacement pipeline.
 #[allow(clippy::result_large_err)]
@@ -10083,6 +10198,7 @@ fn apply_single_replacement(
     rid: ReplacementId,
     branch: ReplacementBranch,
     registry: &IndexMap<ReplacementEvent, ReplacementHandlerEntry>,
+    observation: Option<&mut crate::types::events::DiscardObservation>,
     events: &mut Vec<GameEvent>,
 ) -> Result<ProposedEvent, ApplyResult> {
     // CR 703.4q + CR 614.1a: Path A carve-out for step-end empty-mana events.
@@ -10171,6 +10287,18 @@ fn apply_single_replacement(
     // and a `PlayerId` is exactly what they need, not the definition itself.
     let ability_controller =
         repl_def_ref.map(|def| replacement_ability_controller(state, rid, def));
+
+    let selected_reveal = selected_discard_reveal(
+        state,
+        &proposed,
+        rid,
+        repl_def_ref.and_then(|definition| match branch {
+            ReplacementBranch::Execute => definition.execute.as_deref(),
+            ReplacementBranch::Decline => replacement_mode_decline(&definition.mode),
+        }),
+        ability_controller,
+        observation.as_deref(),
+    );
 
     // Extract replacement metadata before mutably borrowing state for the applier.
     // CR 614.1c: ProposedEvent modifiers (enter_tapped, ETB counters, zone redirect)
@@ -10847,6 +10975,26 @@ fn apply_single_replacement(
                 // the ZoneChange completes. Only the first such stash in a chained
                 // pipeline wins; this matches how Optional replacements queue their
                 // accept-branch post-effect.
+                let mandatory_post_effect =
+                    match (mandatory_post_effect, selected_reveal, observation) {
+                        (
+                            Some(PostReplacementContinuation::Template(mut post)),
+                            Some(bound),
+                            Some(observation),
+                        ) => {
+                            debug_assert!(matches!(
+                                *post.effect,
+                                Effect::Reveal {
+                                    target: TargetFilter::SelfRef
+                                }
+                            ));
+                            observation.pending_reveal = Some(bound);
+                            post.sub_ability
+                                .take()
+                                .map(PostReplacementContinuation::Template)
+                        }
+                        (post, _, _) => post,
+                    };
                 if let Some(post) = mandatory_post_effect {
                     // CR 615.5 + CR 609.7: only the Prevented arm populates
                     // `post_replacement_event_source`; clear here so a prior
@@ -11003,7 +11151,7 @@ fn apply_replacement_to_token_batches(
             survivors.push(view);
             continue;
         }
-        match apply_single_replacement(state, view, rid, branch, registry, events) {
+        match apply_single_replacement(state, view, rid, branch, registry, None, events) {
             Ok(applied) => survivors.push(applied),
             Err(ApplyResult::Prevented) => {}
             Err(ApplyResult::Modified(_)) => {
@@ -11048,13 +11196,14 @@ fn apply_single_replacement_and_dirty(
     rid: ReplacementId,
     branch: ReplacementBranch,
     registry: &IndexMap<ReplacementEvent, ReplacementHandlerEntry>,
+    observation: Option<&mut crate::types::events::DiscardObservation>,
     events: &mut Vec<GameEvent>,
 ) -> Result<ProposedEvent, ApplyResult> {
     let before = proposed.clone();
     let mut result = if proposed.has_appended_token_batches() {
         apply_replacement_to_token_batches(state, proposed, rid, branch, registry, events)
     } else {
-        apply_single_replacement(state, proposed, rid, branch, registry, events)
+        apply_single_replacement(state, proposed, rid, branch, registry, observation, events)
     };
     // CR 614.5 normally records a replacement once per event. CR 903.9b is the
     // express exception: after ANOTHER replacement actually modifies the event
@@ -12868,6 +13017,7 @@ pub(crate) fn remember_replacement_choice(
 fn replay_pending_replacement(
     state: &mut GameState,
     player: PlayerId,
+    observation: Option<&mut crate::types::events::DiscardObservation>,
     events: &mut Vec<GameEvent>,
 ) -> ReplacementResult {
     // CR 616.1: choosing an optional effect's turn is separate from its may
@@ -12948,7 +13098,7 @@ fn replay_pending_replacement(
         }
         return ReplacementResult::NeedsChoice(player);
     };
-    let result = continue_replacement_impl(state, index, events);
+    let result = continue_replacement_impl(state, index, observation, events);
     if !matches!(result, ReplacementResult::Execute(_)) {
         state.replacement_auto_choice_tail = None;
     }
@@ -12960,6 +13110,7 @@ fn pipeline_loop(
     mut proposed: ProposedEvent,
     mut depth: u16,
     registry: &IndexMap<ReplacementEvent, ReplacementHandlerEntry>,
+    mut observation: Option<&mut crate::types::events::DiscardObservation>,
     events: &mut Vec<GameEvent>,
 ) -> ReplacementResult {
     // The pipeline's recording point (CR 614.1a). This is the pipeline BODY every one
@@ -13078,7 +13229,12 @@ fn pipeline_loop(
                     delivery_boundary: None,
                     unrepresentable_life_change: state.ingress_life_policy(),
                 });
-                return replay_pending_replacement(state, affected, events);
+                return replay_pending_replacement(
+                    state,
+                    affected,
+                    observation.as_deref_mut(),
+                    events,
+                );
             }
 
             if let Some((player, entry_candidates)) = entry_controller_choice(state, &proposed, rid)
@@ -13111,6 +13267,7 @@ fn pipeline_loop(
                 rid,
                 ReplacementBranch::Execute,
                 registry,
+                observation.as_deref_mut(),
                 events,
             ) {
                 Ok(new_event) => proposed = new_event,
@@ -13150,7 +13307,7 @@ fn pipeline_loop(
                 delivery_boundary: None,
                 unrepresentable_life_change: state.ingress_life_policy(),
             });
-            return replay_pending_replacement(state, affected, events);
+            return replay_pending_replacement(state, affected, observation.as_deref_mut(), events);
         } else {
             // CR 616.1: the choice is degenerate here — every candidate ordering
             // yields an observationally identical outcome — so the prompt is
@@ -13177,6 +13334,7 @@ fn pipeline_loop(
                 rid,
                 ReplacementBranch::Execute,
                 registry,
+                observation.as_deref_mut(),
                 events,
             ) {
                 Ok(new_event) => proposed = new_event,
@@ -13197,6 +13355,46 @@ pub fn replace_event(
     proposed: ProposedEvent,
     events: &mut Vec<GameEvent>,
 ) -> ReplacementResult {
+    let mut observation = match &proposed {
+        ProposedEvent::Discard { object_id, .. } => state
+            .capture_event_object_snapshot(*object_id)
+            .filter(|subject| subject.zone == Zone::Hand)
+            .map(crate::types::events::DiscardObservation::new),
+        _ => None,
+    };
+    replace_event_impl(state, proposed, observation.as_mut(), events)
+}
+
+pub(crate) fn replace_discard_event(
+    state: &mut GameState,
+    proposed: ProposedEvent,
+    observation: &mut crate::types::events::DiscardObservation,
+    events: &mut Vec<GameEvent>,
+) -> ReplacementResult {
+    replace_event_impl(state, proposed, Some(observation), events)
+}
+
+fn replace_event_impl(
+    state: &mut GameState,
+    proposed: ProposedEvent,
+    mut observation: Option<&mut crate::types::events::DiscardObservation>,
+    events: &mut Vec<GameEvent>,
+) -> ReplacementResult {
+    if let (
+        Some(observation),
+        ProposedEvent::Discard {
+            discard_frame: Some(frame_id),
+            ..
+        },
+    ) = (observation.as_deref(), &proposed)
+    {
+        if let Some(frame) = state
+            .resolution_stack
+            .active_discard_or_direct_continuation_parent_mut(*frame_id)
+        {
+            frame.observation = Some(Box::new(observation.clone()));
+        }
+    }
     let discard_provenance = match &proposed {
         ProposedEvent::Discard {
             object_id,
@@ -13205,6 +13403,7 @@ pub fn replace_event(
             discard_frame: None,
             ..
         } => Some(crate::types::game_state::PendingDiscardProvenance {
+            observation: observation.as_deref().cloned().map(Box::new),
             original_hand: state
                 .objects
                 .get(object_id)
@@ -13225,9 +13424,17 @@ pub fn replace_event(
     // `continue_replacement` to resume.
     let staged = stage_transformed_entry_projection(state, &proposed);
     prepare_replacement_index_for_pipeline(state);
-    let result = pipeline_loop(state, proposed, 0, registry, events);
+    let result = pipeline_loop(
+        state,
+        proposed,
+        0,
+        registry,
+        observation.as_deref_mut(),
+        events,
+    );
     if matches!(result, ReplacementResult::NeedsChoice(_)) {
-        if let Some(provenance) = discard_provenance {
+        if let Some(mut provenance) = discard_provenance {
+            provenance.observation = observation.as_deref().cloned().map(Box::new);
             crate::game::effects::discard::retain_pending_discard(state, provenance);
         }
     }
@@ -13285,7 +13492,7 @@ pub(crate) fn replace_combat_damage_batch(
     let mut survivors = Vec::with_capacity(proposed.len());
     for event in proposed {
         prepare_replacement_index_for_pipeline(state);
-        let result = pipeline_loop(state, event, 0, registry, events);
+        let result = pipeline_loop(state, event, 0, registry, None, events);
         clear_replacement_index_pipeline(state);
         // CR 615.5: A `Prevention::Next(N)` shield's rider is stashed per-event
         // by the applier (the all-damage and one-shot prevention batch paths
@@ -13335,6 +13542,7 @@ fn continue_search_found_after_decline(
     state: &mut GameState,
     mut pending: PendingReplacement,
     declined: ReplacementId,
+    observation: Option<&mut crate::types::events::DiscardObservation>,
     events: &mut Vec<GameEvent>,
 ) -> ReplacementResult {
     pending.proposed.mark_applied(declined);
@@ -13360,6 +13568,7 @@ fn continue_search_found_after_decline(
             pending.proposed,
             pending.depth,
             replacement_registry(),
+            observation,
             events,
         ),
         [candidate] if !candidate.is_optional => {
@@ -13371,6 +13580,7 @@ fn continue_search_found_after_decline(
                 proposed,
                 pending.depth + 1,
                 replacement_registry(),
+                observation,
                 events,
             )
         }
@@ -13393,6 +13603,7 @@ fn continue_search_found_after_decline(
 fn continue_replacement_impl(
     state: &mut GameState,
     chosen_index: usize,
+    mut observation: Option<&mut crate::types::events::DiscardObservation>,
     events: &mut Vec<GameEvent>,
 ) -> ReplacementResult {
     let mut pending = match state.pending_replacement.take() {
@@ -13440,9 +13651,22 @@ fn continue_replacement_impl(
             if chosen_index == 0 {
                 let proposed =
                     apply_bound_search_found_candidate(state, pending.proposed, &bound, events);
-                return pipeline_loop(state, proposed, pending.depth + 1, registry, events);
+                return pipeline_loop(
+                    state,
+                    proposed,
+                    pending.depth + 1,
+                    registry,
+                    observation.as_deref_mut(),
+                    events,
+                );
             }
-            return continue_search_found_after_decline(state, pending, rid, events);
+            return continue_search_found_after_decline(
+                state,
+                pending,
+                rid,
+                observation.as_deref_mut(),
+                events,
+            );
         }
         let Some(payer) = pending
             .choice_player
@@ -13452,7 +13676,14 @@ fn continue_replacement_impl(
             // applied as declined and continue the ordinary replacement loop.
             let mut proposed = pending.proposed;
             proposed.mark_applied(rid);
-            return pipeline_loop(state, proposed, pending.depth + 1, registry, events);
+            return pipeline_loop(
+                state,
+                proposed,
+                pending.depth + 1,
+                registry,
+                observation.as_deref_mut(),
+                events,
+            );
         };
         // CR 614.12a: a `true` flag means this is the post-choice resume of an
         // accept whose `MayCost` payment paused for an interactive sub-choice
@@ -13625,7 +13856,19 @@ fn continue_replacement_impl(
             }
         };
 
-        let (branch, post_effect) = if chosen_index == 0 && paid_may_cost {
+        let selected_reveal = selected_discard_reveal(
+            state,
+            &proposed,
+            rid,
+            if chosen_index == 0 && paid_may_cost {
+                accept_effect.as_deref()
+            } else {
+                decline_effect.as_deref()
+            },
+            branch_controller,
+            observation.as_deref(),
+        );
+        let (branch, mut post_effect) = if chosen_index == 0 && paid_may_cost {
             // CR 614.1c: Accept path — walk past modifier-only effects (already
             // applied to ProposedEvent by event_modifiers_for_ability) to find the
             // first non-modifier as the real post-replacement work. Covers composed
@@ -13665,6 +13908,27 @@ fn continue_replacement_impl(
             };
             (ReplacementBranch::Decline, post)
         };
+
+        let applied_before_install = selected_reveal.is_some();
+        if let Some(bound) = selected_reveal {
+            match apply_single_replacement_and_dirty(
+                state,
+                proposed,
+                rid,
+                branch,
+                registry,
+                observation.as_deref_mut(),
+                events,
+            ) {
+                Ok(new_event) => proposed = new_event,
+                Err(ApplyResult::Prevented) => return ReplacementResult::Prevented,
+                Err(ApplyResult::Modified(_)) => unreachable!(),
+            }
+            if let Some(observation) = observation.as_deref_mut() {
+                observation.pending_reveal = Some(bound);
+            }
+            post_effect = post_effect.and_then(|mut post| post.sub_ability.take());
+        }
 
         // CR 614.12a: Optional accept/decline branches always derive a Template
         // continuation — the post-effect is built from the ReplacementDefinition's
@@ -13771,16 +14035,34 @@ fn continue_replacement_impl(
             // additional action on a replaced draw's card is not performed;
             // Blood Scrivener's life loss is not such an action), so both are
             // the accept-side follow-up recorded on PR #9235.
+            (ReplacementBranch::Execute, None) if applied_before_install => {}
             (ReplacementBranch::Execute, None) => state.abandon_active_post_replacement_drains(),
         }
 
-        match apply_single_replacement_and_dirty(state, proposed, rid, branch, registry, events) {
-            Ok(new_event) => proposed = new_event,
-            Err(ApplyResult::Prevented) => return ReplacementResult::Prevented,
-            Err(ApplyResult::Modified(_)) => unreachable!(),
+        if !applied_before_install {
+            match apply_single_replacement_and_dirty(
+                state,
+                proposed,
+                rid,
+                branch,
+                registry,
+                observation.as_deref_mut(),
+                events,
+            ) {
+                Ok(new_event) => proposed = new_event,
+                Err(ApplyResult::Prevented) => return ReplacementResult::Prevented,
+                Err(ApplyResult::Modified(_)) => unreachable!(),
+            }
         }
 
-        return pipeline_loop(state, proposed, pending.depth + 1, registry, events);
+        return pipeline_loop(
+            state,
+            proposed,
+            pending.depth + 1,
+            registry,
+            observation.as_deref_mut(),
+            events,
+        );
     }
 
     if chosen_index >= pending.candidates.len() {
@@ -13802,7 +14084,14 @@ fn continue_replacement_impl(
                 proposed.mark_applied(candidate.replacement_id);
             }
             dirty_replacement_index(state);
-            return pipeline_loop(state, proposed, pending.depth + 1, registry, events);
+            return pipeline_loop(
+                state,
+                proposed,
+                pending.depth + 1,
+                registry,
+                observation.as_deref_mut(),
+                events,
+            );
         }
         return ReplacementResult::Execute(pending.proposed);
     }
@@ -13837,7 +14126,14 @@ fn continue_replacement_impl(
             return ReplacementResult::NeedsChoice(affected);
         }
         let proposed = apply_bound_search_found_candidate(state, pending.proposed, &bound, events);
-        return pipeline_loop(state, proposed, pending.depth + 1, registry, events);
+        return pipeline_loop(
+            state,
+            proposed,
+            pending.depth + 1,
+            registry,
+            observation.as_deref_mut(),
+            events,
+        );
     }
 
     // CR 616.1: Selecting an optional candidate from a material ordering prompt
@@ -13849,13 +14145,20 @@ fn continue_replacement_impl(
         let Some(affected) = replacement_choice_player(state, &pending.proposed, rid) else {
             let mut proposed = pending.proposed;
             proposed.mark_applied(rid);
-            return pipeline_loop(state, proposed, pending.depth + 1, registry, events);
+            return pipeline_loop(
+                state,
+                proposed,
+                pending.depth + 1,
+                registry,
+                observation.as_deref_mut(),
+                events,
+            );
         };
         pending.candidates = vec![rid];
         pending.is_optional = true;
         pending.choice_player = Some(affected);
         state.pending_replacement = Some(pending);
-        return replay_pending_replacement(state, affected, events);
+        return replay_pending_replacement(state, affected, observation.as_deref_mut(), events);
     }
 
     let mut proposed = pending.proposed.clone();
@@ -13896,6 +14199,7 @@ fn continue_replacement_impl(
         rid,
         ReplacementBranch::Execute,
         registry,
+        observation.as_deref_mut(),
         events,
     ) {
         Ok(new_event) => proposed = new_event,
@@ -13903,12 +14207,43 @@ fn continue_replacement_impl(
         Err(ApplyResult::Modified(_)) => unreachable!(),
     }
 
-    pipeline_loop(state, proposed, pending.depth + 1, registry, events)
+    pipeline_loop(
+        state,
+        proposed,
+        pending.depth + 1,
+        registry,
+        observation,
+        events,
+    )
 }
 
 pub fn continue_replacement(
     state: &mut GameState,
     chosen_index: usize,
+    events: &mut Vec<GameEvent>,
+) -> ReplacementResult {
+    let mut observation = state
+        .pending_replacement
+        .as_ref()
+        .and_then(|pending| pending.discard_provenance.as_deref())
+        .and_then(|provenance| provenance.observation.as_deref())
+        .cloned();
+    continue_replacement_with_observation(state, chosen_index, observation.as_mut(), events)
+}
+
+pub(crate) fn continue_discard_replacement(
+    state: &mut GameState,
+    chosen_index: usize,
+    observation: &mut crate::types::events::DiscardObservation,
+    events: &mut Vec<GameEvent>,
+) -> ReplacementResult {
+    continue_replacement_with_observation(state, chosen_index, Some(observation), events)
+}
+
+fn continue_replacement_with_observation(
+    state: &mut GameState,
+    chosen_index: usize,
+    mut observation: Option<&mut crate::types::events::DiscardObservation>,
     events: &mut Vec<GameEvent>,
 ) -> ReplacementResult {
     // CR 614.12: a resumed pause reuses its own resident `TransformedEntry`
@@ -13953,10 +14288,11 @@ pub fn continue_replacement(
     let predecessor_discard = state
         .pending_replacement
         .as_ref()
-        .and_then(|pending| pending.discard_provenance.as_deref().copied());
-    let result = continue_replacement_impl(state, chosen_index, events);
+        .and_then(|pending| pending.discard_provenance.as_deref().cloned());
+    let result = continue_replacement_impl(state, chosen_index, observation.as_deref_mut(), events);
     if matches!(result, ReplacementResult::NeedsChoice(_)) {
-        if let Some(provenance) = predecessor_discard {
+        if let Some(mut provenance) = predecessor_discard {
+            provenance.observation = observation.as_deref().cloned().map(Box::new);
             crate::game::effects::discard::retain_pending_discard(state, provenance);
         }
     }
@@ -15775,6 +16111,9 @@ mod tests {
             ));
             state.waiting_for = replacement_choice_waiting_for(PlayerId(0), &state);
             let provenance = PendingDiscardProvenance {
+                observation: Some(Box::new(
+                    crate::game::effects::discard::capture_discard_observation(&state, outer),
+                )),
                 original_hand: Some(ObjectIncarnationRef::from_object(&state.objects[&outer])),
                 object_id: outer,
                 player_id: PlayerId(0),
@@ -15839,6 +16178,13 @@ mod tests {
                 );
                 assert!(outer_record.may_cost_paid);
             }
+            assert!(
+                !state.is_loop_comparable(),
+                "boxed={boxed}: live receipt owner cannot certify a loop"
+            );
+            let mut no_sample = state.clone();
+            no_sample.record_loop_detect_sample();
+            assert!(no_sample.loop_detect_ring.is_empty());
             // Both real MayCost storage paths retain the populated original pin through save/load.
             for ingress in 0..3 {
                 use crate::types::game_state::PersistedGameState;
@@ -15886,7 +16232,7 @@ mod tests {
             assert_eq!(state.objects[&fuel].zone, Zone::Exile);
             assert_eq!(state.objects[&outer].zone, Zone::Battlefield);
             assert_eq!(state.cards_discarded_this_turn_by_player[&PlayerId(0)], 1);
-            assert_eq!(response.events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id: Some(event_source) } if *object_id == outer && *event_source == source)).count(), 1);
+            assert_eq!(response.events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id: Some(event_source), .. } if *object_id == outer && *event_source == source)).count(), 1);
             assert!(matches!(response.waiting_for, WaitingFor::Priority { .. }));
             assert!(state.pending_replacement.is_none());
             assert!(state.pending_cost_move_resume.is_none());
@@ -21586,6 +21932,7 @@ mod tests {
             },
             ReplacementBranch::Execute,
             &registry,
+            None,
             &mut events,
         )
         .expect("Spelunking untap replacement should modify the event");
@@ -21626,6 +21973,7 @@ mod tests {
             },
             ReplacementBranch::Execute,
             &registry,
+            None,
             &mut events,
         )
         .expect("tap replacement should apply");
@@ -21643,6 +21991,7 @@ mod tests {
             },
             ReplacementBranch::Execute,
             &registry,
+            None,
             &mut events,
         )
         .expect("untap replacement should apply");
@@ -21660,6 +22009,7 @@ mod tests {
             },
             ReplacementBranch::Execute,
             &registry,
+            None,
             &mut events,
         )
         .expect("later tap replacement should overwrite prior untap");
@@ -26683,6 +27033,7 @@ mod tests {
             ReplacementId { source, index: 0 },
             ReplacementBranch::Decline,
             &registry,
+            None,
             &mut events,
         );
         assert_eq!(

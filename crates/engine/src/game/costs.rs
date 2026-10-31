@@ -1351,7 +1351,7 @@ fn pay_ability_cost_inner(
         } => match super::effects::discard::discard_as_cost(state, source_id, player, events) {
             super::effects::discard::DiscardOutcome::Complete => {}
             super::effects::discard::DiscardOutcome::NeedsChoice(choice_player) => {
-                state.waiting_for = *choice_player;
+                state.waiting_for = choice_player.waiting_for;
                 return Ok(PaymentOutcome::Paused {
                     remaining_cost: None,
                 });
@@ -1449,7 +1449,7 @@ fn pay_ability_cost_inner(
                         choice_player,
                     ) = super::effects::discard::discard_as_cost(state, card_id, player, events)
                     {
-                        state.waiting_for = *choice_player;
+                        state.waiting_for = choice_player.waiting_for;
                         return Ok(PaymentOutcome::Paused {
                             remaining_cost: None,
                         });

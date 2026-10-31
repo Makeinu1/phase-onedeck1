@@ -9525,7 +9525,7 @@ fn resume_due_discard_batch(
         GameEvent::ZoneChanged { from: Some(Zone::Hand), record, .. }
             if record.trigger_source_context().is_some_and(|context| context.identity.reference == batch.paused_card)));
     let discarded = window().any(|event| matches!(event,
-        GameEvent::Discarded { player_id, object_id, source_id }
+        GameEvent::Discarded { player_id, object_id, source_id, .. }
             if *player_id == batch.player && *object_id == batch.paused_card.object_id && *source_id == Some(batch.source_id)));
     if !departed || !discarded {
         return Err(EngineError::InvalidAction(
@@ -30743,6 +30743,11 @@ mod discard_delivery_resume_tests {
         assert!(outer.return_result_occurrence.is_none());
         state.park_ability_continuation(outer);
         state.pending_discard_batch = Some(Box::new(PendingDiscardBatch {
+            observation: preceding.iter().find_map(|event| match event {
+                GameEvent::Discarded { observation, .. } => observation.clone(),
+                _ => None,
+            }),
+
             player: PlayerId(0),
             cursor: DiscardBatchCursor::All {
                 remaining: vec![second],
@@ -30800,6 +30805,6 @@ mod discard_delivery_resume_tests {
         assert_eq!(state.cards_discarded_this_turn_by_player[&PlayerId(0)], 2);
         assert!(state.pending_discard_batch.is_none());
         assert!(state.resolution_stack.is_empty());
-        assert_eq!(result.events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id: Some(bound) } if *object_id == second && *bound == source)).count(), 1);
+        assert_eq!(result.events.iter().filter(|event| matches!(event, GameEvent::Discarded { player_id: PlayerId(0), object_id, source_id: Some(bound), .. } if *object_id == second && *bound == source)).count(), 1);
     }
 }

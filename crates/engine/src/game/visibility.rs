@@ -1664,6 +1664,18 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
     if !replacement_choice_authorized {
         filtered.pending_replacement = None;
     }
+    if let Some(provenance) = filtered
+        .pending_replacement
+        .as_mut()
+        .and_then(|pending| pending.discard_provenance.as_deref_mut())
+    {
+        provenance.observation = None;
+    }
+    filtered.for_each_trigger_event_carrier_mut(&mut |event| {
+        if let GameEvent::Discarded { observation, .. } = event {
+            *observation = None;
+        }
+    });
 
     filtered.active_library_searches.retain(|_, search| {
         viewer.is_some_and(|viewer| search.learned_audience().contains(&viewer))
@@ -1770,6 +1782,20 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
         .stack
         .iter_mut()
         .chain(filtered.resolving_stack_entry.iter_mut())
+        .chain(
+            filtered
+                .departed_activated_abilities
+                .iter_mut()
+                .map(|(_, entry)| entry),
+        )
+        .chain(
+            filtered
+                .departed_stack_spells
+                .iter_mut()
+                .flat_map(|(_, history)| {
+                    history.iter_mut().map(|(_, departed)| &mut departed.entry)
+                }),
+        )
     {
         if let StackEntryKind::TriggeredAbility {
             trigger_event: Some(event),
@@ -1936,6 +1962,14 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
                 .departed_activated_abilities
                 .iter_mut()
                 .map(|(_, entry)| entry),
+        )
+        .chain(
+            filtered
+                .departed_stack_spells
+                .iter_mut()
+                .flat_map(|(_, history)| {
+                    history.iter_mut().map(|(_, departed)| &mut departed.entry)
+                }),
         )
     {
         if let Some(ability) = entry.ability_mut() {
@@ -3384,6 +3418,17 @@ pub fn filter_events_for_viewer(
             event_visible_to_viewer(event, state, viewer, hidden_search_viewers)
         })
         .map(|(event, _)| match event {
+            GameEvent::Discarded {
+                player_id,
+                object_id,
+                source_id,
+                ..
+            } => GameEvent::Discarded {
+                player_id: *player_id,
+                object_id: *object_id,
+                source_id: *source_id,
+                observation: None,
+            },
             // `CardId` is assigned from the pre-shuffle object sequence when a
             // deck loads. An opponent can use it to recover hidden deck order,
             // including the identity of a face-down spell; only the public
@@ -3885,6 +3930,7 @@ fn redact_printed_identity(obj: &mut crate::game::game_object::GameObject) {
 /// only those are.
 fn redact_hidden_zone_change_event(event: &mut GameEvent, hidden_ids: &HashSet<ObjectId>) {
     match event {
+        GameEvent::Discarded { observation, .. } => *observation = None,
         GameEvent::ZoneChanged {
             object_id,
             record,
@@ -4069,6 +4115,11 @@ fn redact_ability_payment(
     ability: &mut crate::types::ability::ResolvedAbility,
     hidden_ids: &HashSet<ObjectId>,
 ) {
+    if let Some(GameEvent::Discarded { observation, .. }) =
+        ability.context.creation_lookback_event.as_deref_mut()
+    {
+        *observation = None;
+    }
     if let Some(context) = ability.trigger_source.as_mut() {
         redact_source_context_hidden_members(context, hidden_ids);
     }
@@ -4098,7 +4149,13 @@ fn ability_payment_names_hidden_source(
     ability: &crate::types::ability::ResolvedAbility,
     hidden_ids: &HashSet<ObjectId>,
 ) -> bool {
-    ability
+    matches!(
+        ability.context.creation_lookback_event.as_deref(),
+        Some(GameEvent::Discarded {
+            observation: Some(_),
+            ..
+        })
+    ) || ability
         .trigger_source
         .as_ref()
         .is_some_and(|context| source_context_names_hidden_member(context, hidden_ids))
@@ -4829,6 +4886,9 @@ fn redact_pending_trigger_context_for_observer(
 /// library occurrence's object id with its identity. The authoritative event
 /// keeps it (trigger matching reads it); a viewer copy drops it.
 fn redact_hidden_library_event(event: &mut GameEvent, hidden_library: &HashSet<ObjectId>) {
+    if let GameEvent::Discarded { observation, .. } = event {
+        *observation = None;
+    }
     if let GameEvent::EffectResolved { subject, .. } = event {
         if subject
             .as_ref()
@@ -4847,6 +4907,11 @@ fn redact_hidden_library_ability(
     ability: &mut crate::types::ability::ResolvedAbility,
     hidden_library: &HashSet<ObjectId>,
 ) {
+    if let Some(GameEvent::Discarded { observation, .. }) =
+        ability.context.creation_lookback_event.as_deref_mut()
+    {
+        *observation = None;
+    }
     if ability
         .effect_context_object
         .as_ref()
@@ -12197,6 +12262,211 @@ mod tests {
     /// discard batch". The later per-viewer and wire-string assertions never run
     /// (the first panic ends the test), so it is that one which discriminates.
     #[test]
+    fn discard_observation_is_private_in_every_retained_event_and_chooser_projection() {
+        use crate::types::ability::{
+            AbilityDefinition, AbilityKind, ReplacementDefinition, ReplacementMode,
+        };
+        use crate::types::actions::{DebugAction, GameAction};
+        use crate::types::replacements::ReplacementEvent;
+        fn has_observation(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+                    (key == "observation" && !value.is_null()) || has_observation(value)
+                }),
+                serde_json::Value::Array(values) => values.iter().any(has_observation),
+                _ => false,
+            }
+        }
+        let mut state = GameState::new_two_player(42);
+        state.debug_mode = true;
+        state.phase = crate::types::phase::Phase::PreCombatMain;
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Geth's Grimoire".into(),
+            Zone::Battlefield,
+        );
+        let card = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Hand subject".into(),
+            Zone::Hand,
+        );
+        let trigger = crate::parser::oracle_trigger::parse_trigger_line(
+            "Whenever an opponent discards a card, you may draw a card.",
+            "Geth's Grimoire",
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .install_trigger_base_definitions(std::sync::Arc::new(vec![trigger]))
+            .unwrap();
+        let result = crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::Discard { object_id: card }),
+        )
+        .unwrap();
+        let event = result
+            .events
+            .iter()
+            .find(|event| matches!(event, GameEvent::Discarded { .. }))
+            .expect("public producer completed receipt")
+            .clone();
+        assert!(has_observation(&serde_json::to_value(&event).unwrap()));
+        let actual = state.stack.front().expect("real Grimoire observer").clone();
+        assert!(
+            matches!(&actual.kind, StackEntryKind::TriggeredAbility { trigger_event: Some(retained), .. } if retained == &event)
+        );
+        let mut ability = actual.ability().unwrap().clone();
+        ability.set_creation_lookback_event_recursive(&event);
+        let mut pending = crate::game::triggers::PendingTrigger::ordinary(
+            source,
+            PlayerId(1),
+            None,
+            Box::new(ability.clone()),
+            0,
+        );
+        pending.trigger_event = Some(event.clone());
+        let mut context = crate::game::triggers::PendingTriggerContext::single(pending.clone());
+        context.trigger_events = vec![event.clone()];
+        state.resolving_stack_entry = Some(actual.clone());
+        state
+            .stack_trigger_event_batches
+            .insert(actual.id, vec![event.clone()]);
+        state.current_trigger_event = Some(event.clone());
+        state.current_trigger_events = vec![event.clone()];
+        state.pending_trigger = Some(Box::new(pending));
+        state.pending_trigger_event_batch = vec![event.clone()];
+        state.pending_attack_trigger_events = vec![event.clone()];
+        state.deferred_entry_events = vec![event.clone()];
+        state.deferred_triggers.push(context.clone());
+        state.pending_trigger_order = Some(PendingTriggerOrder {
+            groups: vec![TriggerOrderGroup {
+                controller: PlayerId(1),
+                triggers: vec![context],
+                ordered: false,
+            }],
+            resume_after_ordering: None,
+        });
+        state.consumed_before_priority_trigger_events =
+            vec![crate::game::triggers::ConsumedTriggerEventOccurrence {
+                event: event.clone(),
+                occurrence: 0,
+                scope: Default::default(),
+            }];
+        let mut departed = actual.clone();
+        if let Some(departed_ability) = departed.ability_mut() {
+            departed_ability.set_creation_lookback_event_recursive(&event);
+        }
+        state
+            .departed_activated_abilities
+            .insert(ObjectId(700), departed.clone());
+        state
+            .departed_stack_spells
+            .entry(ObjectId(701))
+            .or_default()
+            .insert(
+                0,
+                crate::types::game_state::DepartedStackSpell {
+                    entry: departed,
+                    object: Box::new(state.objects[&card].clone()),
+                },
+            );
+        state.delayed_triggers.push(DelayedTrigger::new(
+            crate::types::ability::DelayedTriggerCondition::AtNextPhase {
+                phase: crate::types::phase::Phase::End,
+            },
+            Box::new(ability),
+            PlayerId(1),
+            source,
+            true,
+        ));
+        state.waiting_for = WaitingFor::TriggerTargetSelection {
+            player: PlayerId(1),
+            trigger_controller: Some(PlayerId(1)),
+            trigger_event: Some(event.clone()),
+            trigger_events: vec![event.clone()],
+            target_slots: vec![],
+            mode_labels: vec![],
+            target_constraints: vec![],
+            selection: Default::default(),
+            source_id: Some(source),
+            description: None,
+        };
+        let authoritative = serde_json::to_value(&state).unwrap();
+        for viewer in [PlayerId(0), PlayerId(1), PlayerId(u8::MAX)] {
+            let filtered = filter_state_for_viewer(&state, viewer);
+            assert!(
+                !has_observation(&serde_json::to_value(filtered).unwrap()),
+                "viewer={viewer:?}"
+            );
+            let filtered = filter_events_for_viewer(std::slice::from_ref(&event), &state, viewer);
+            assert_eq!(filtered.len(), 1);
+            assert!(!has_observation(&serde_json::to_value(filtered).unwrap()));
+        }
+        assert_eq!(serde_json::to_value(&state).unwrap(), authoritative);
+        // The authorized chooser retains the record, but never its private observation.
+        let mut chooser = GameState::new_two_player(42);
+        chooser.debug_mode = true;
+        chooser.phase = crate::types::phase::Phase::PreCombatMain;
+        let selected = create_object(
+            &mut chooser,
+            CardId(3),
+            PlayerId(0),
+            "Private pending subject".into(),
+            Zone::Hand,
+        );
+        chooser
+            .objects
+            .get_mut(&selected)
+            .unwrap()
+            .replacement_definitions
+            .push(
+                ReplacementDefinition::new(ReplacementEvent::Discard)
+                    .valid_card(TargetFilter::SelfRef)
+                    .mode(ReplacementMode::Optional { decline: None })
+                    .execute(AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp)),
+            );
+        crate::game::engine::apply(
+            &mut chooser,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::Discard {
+                object_id: selected,
+            }),
+        )
+        .unwrap();
+        assert!(chooser
+            .pending_replacement
+            .as_ref()
+            .unwrap()
+            .discard_provenance
+            .as_deref()
+            .unwrap()
+            .observation
+            .is_some());
+        let projected = filter_state_for_viewer(&chooser, PlayerId(0));
+        assert!(projected.pending_replacement.is_some());
+        assert!(projected
+            .pending_replacement
+            .unwrap()
+            .discard_provenance
+            .unwrap()
+            .observation
+            .is_none());
+        assert!(chooser
+            .pending_replacement
+            .unwrap()
+            .discard_provenance
+            .unwrap()
+            .observation
+            .is_some());
+    }
+
+    #[test]
     fn parked_discard_batch_is_absent_from_every_viewer_projection() {
         let mut state = GameState::new_two_player(42);
         let hidden = create_object(
@@ -12208,6 +12478,10 @@ mod tests {
         );
         state.pending_discard_batch =
             Some(Box::new(crate::types::game_state::PendingDiscardBatch {
+                observation: Some(Box::new(
+                    crate::game::effects::discard::capture_discard_observation(&state, hidden),
+                )),
+
                 player: PlayerId(0),
                 cursor: crate::types::game_state::DiscardBatchCursor::All {
                     remaining: vec![hidden],

@@ -3509,7 +3509,7 @@ pub(super) fn handle_resolution_choice(
                             source_id: ObjectId(0),
                             subject: None,
                         });
-                        state.waiting_for = *choice_player;
+                        state.waiting_for = choice_player.waiting_for;
                         return Ok(action_result_outcome(events, state.waiting_for.clone()));
                     }
                     let draw_ability = ResolvedAbility::new(
@@ -6335,9 +6335,10 @@ pub(super) fn handle_resolution_choice(
                         events,
                     )
                 {
-                    state.waiting_for = *choice_player;
+                    state.waiting_for = choice_player.waiting_for;
                     state.pending_discard_batch = Some(Box::new(
                         crate::types::game_state::PendingDiscardBatch {
+                            observation: Some(Box::new(choice_player.observation)),
                             player,
                             cursor: crate::types::game_state::DiscardBatchCursor::Ordered {
                                 remaining: chosen_refs[index + 1..].to_vec(),

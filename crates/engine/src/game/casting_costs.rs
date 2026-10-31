@@ -2564,7 +2564,7 @@ pub(crate) fn handle_discard_for_cost(
                         chosen: chosen.to_vec(),
                         paused_at_index: index,
                     }));
-                state.waiting_for = *waiting_for;
+                state.waiting_for = waiting_for.waiting_for;
                 // CR 603.2 + CR 603.3b: Earlier cards in a count>1 discard cost may
                 // already have emitted graveyard `ZoneChanged` events before this
                 // replacement pause. Park them now — the post-action pipeline will
@@ -3532,7 +3532,7 @@ pub(crate) fn resume_interrupted_cost_payment(
                             chosen: chosen.clone(),
                             paused_at_index: index,
                         }));
-                    state.waiting_for = *waiting_for;
+                    state.waiting_for = waiting_for.waiting_for;
                     // CR 603.2 + CR 603.3b: Same mid-loop replacement pause as
                     // `handle_discard_for_cost` — park already-emitted discard
                     // cost events (including replacement-delivered discards in
@@ -23597,6 +23597,7 @@ mod tests {
         for random in [false, true] {
             for resumed in [false, true] {
                 for non_order in [false, true] {
+                    let branch = format!("random={random} resumed={resumed} non_order={non_order}");
                     let mut scenario = GameScenario::new();
                     scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
                     let originals = [
@@ -23640,6 +23641,21 @@ mod tests {
                     let sibling_pin = crate::types::identifiers::ObjectIncarnationRef::from_object(
                         &runner.state().objects[&sibling],
                     );
+                    let sibling_lki = runner.state().objects[&sibling].snapshot_for_mana_spent();
+                    let sibling_arrival = |events: &[GameEvent]| {
+                        events.iter().find_map(|event| match event {
+                            GameEvent::ZoneChanged {
+                                object_id, record, ..
+                            } if *object_id == sibling
+                                && record.trigger_source_context().is_some_and(|context| {
+                                    context.identity.reference == sibling_pin
+                                }) =>
+                            {
+                                record.entered_incarnation
+                            }
+                            _ => None,
+                        })
+                    };
                     let mut expected_rng = runner.state().rng.clone();
                     let mut pool = originals.to_vec();
                     let picks = if random {
@@ -23731,54 +23747,111 @@ mod tests {
                         ..
                     } = runner.state().waiting_for
                     else {
-                        panic!("earlier sacrifice must require its public selection");
+                        panic!("{branch}: earlier sacrifice must require its public selection");
                     };
-                    assert_eq!(choices, &[sibling]);
-                    runner
+                    assert_eq!(choices, &[sibling], "{branch}");
+                    let mut sacrifice_events = runner
                         .act(GameAction::SelectCards {
                             cards: vec![sibling],
                         })
-                        .unwrap();
-                    assert_eq!(runner.state().objects[&sibling].zone, Zone::Battlefield);
-                    assert!(sibling_pin.is_current(runner.state()));
+                        .unwrap()
+                        .events;
+                    assert_eq!(
+                        runner.state().objects[&sibling].zone,
+                        if random {
+                            Zone::Graveyard
+                        } else {
+                            Zone::Battlefield
+                        },
+                        "{branch}"
+                    );
+                    assert_eq!(sibling_pin.is_current(runner.state()), !random, "{branch}");
                     if !random {
-                        assert!(matches!(
-                            runner.state().waiting_for,
-                            WaitingFor::PayCost {
-                                kind: PayCostKind::Discard,
-                                ..
-                            }
-                        ));
-                        runner
-                            .act(GameAction::SelectCards {
-                                cards: picks.to_vec(),
-                            })
-                            .unwrap();
+                        assert!(
+                            matches!(
+                                runner.state().waiting_for,
+                                WaitingFor::PayCost {
+                                    kind: PayCostKind::Discard,
+                                    ..
+                                }
+                            ),
+                            "{branch}"
+                        );
+                        sacrifice_events.extend(
+                            runner
+                                .act(GameAction::SelectCards {
+                                    cards: picks.to_vec(),
+                                })
+                                .unwrap()
+                                .events,
+                        );
                     }
                     if resumed {
-                        assert!(matches!(
-                            runner.state().waiting_for,
-                            WaitingFor::ReplacementChoice { player: P0, .. }
-                        ));
-                        runner
-                            .act(GameAction::ChooseReplacement { index: 0 })
-                            .unwrap();
-                        assert_eq!(runner.state().objects[&picks[0]].zone, Zone::Exile);
+                        assert!(
+                            matches!(
+                                runner.state().waiting_for,
+                                WaitingFor::ReplacementChoice { player: P0, .. }
+                            ),
+                            "{branch}"
+                        );
+                        sacrifice_events.extend(
+                            runner
+                                .act(GameAction::ChooseReplacement { index: 0 })
+                                .unwrap()
+                                .events,
+                        );
+                        assert_eq!(
+                            runner.state().objects[&picks[0]].zone,
+                            Zone::Exile,
+                            "{branch}"
+                        );
                     }
                     if !non_order {
                         for _ in usize::from(resumed)..2 {
-                            assert!(matches!(
-                                runner.state().waiting_for,
-                                WaitingFor::ReplacementChoice { player: P0, .. }
-                            ));
-                            runner
-                                .act(GameAction::ChooseReplacement { index: 0 })
-                                .unwrap();
+                            assert!(
+                                matches!(
+                                    runner.state().waiting_for,
+                                    WaitingFor::ReplacementChoice { player: P0, .. }
+                                ),
+                                "{branch}"
+                            );
+                            sacrifice_events.extend(
+                                runner
+                                    .act(GameAction::ChooseReplacement { index: 0 })
+                                    .unwrap()
+                                    .events,
+                            );
                         }
-                        assert!(runner.state().pending_discard_for_cost.is_none());
-                        assert_eq!(runner.state().objects[&spell].zone, Zone::Stack);
-                        assert_eq!(runner.state().stack.len(), 1);
-                        assert_eq!(runner.state().objects[&sibling].zone, Zone::Graveyard);
+                        assert!(
+                            runner.state().pending_discard_for_cost.is_none(),
+                            "{branch}"
+                        );
+                        assert_eq!(runner.state().objects[&spell].zone, Zone::Stack, "{branch}");
+                        assert_eq!(runner.state().stack.len(), 1, "{branch}");
+                        assert_eq!(
+                            runner.state().objects[&sibling].zone,
+                            Zone::Graveyard,
+                            "{branch}"
+                        );
+                        assert_eq!(sacrifice_events.iter().filter(|event| matches!(event, GameEvent::PermanentSacrificed { object_id, .. } if *object_id == sibling)).count(), 1, "{branch}");
+                        let arrival = sibling_arrival(&sacrifice_events)
+                            .expect("actual sibling departure supplies its committed incarnation");
+                        let committed = runner.state().stack[0]
+                            .ability()
+                            .unwrap()
+                            .cost_paid_objects
+                            .iter()
+                            .find(|record| record.object_id() == sibling)
+                            .unwrap()
+                            .snapshot()
+                            .unwrap();
+                        assert_eq!(committed.incarnation, arrival, "{branch}");
+                        assert_eq!(committed.lki, sibling_lki, "{branch}");
+                        assert_eq!(
+                            runner.state().objects[&sibling].incarnation,
+                            arrival,
+                            "{branch}"
+                        );
                         continue;
                     }
                     let WaitingFor::EffectZoneChoice {
@@ -23787,11 +23860,14 @@ mod tests {
                         ..
                     } = runner.state().waiting_for
                     else {
-                        panic!("cost lost actual wait: {:?}", runner.state().waiting_for)
+                        panic!(
+                            "{branch}: cost lost actual wait: {:?}",
+                            runner.state().waiting_for
+                        )
                     };
-                    assert!(cards.contains(&fodder));
+                    assert!(cards.contains(&fodder), "{branch}");
                     let expected = picks[usize::from(resumed)];
-                    assert!(!cards.contains(&expected));
+                    assert!(!cards.contains(&expected), "{branch}");
                     let root = runner
                         .state()
                         .pending_discard_for_cost
@@ -23804,9 +23880,9 @@ mod tests {
                             paused_at_index,
                             ..
                         } => {
-                            assert!(!random);
-                            assert_eq!(chosen, &picks);
-                            assert_eq!(*paused_at_index, usize::from(resumed));
+                            assert!(!random, "{branch}");
+                            assert_eq!(chosen, &picks, "{branch}");
+                            assert_eq!(*paused_at_index, usize::from(resumed), "{branch}");
                             pending
                         }
                         PendingDiscardForCostResume::Random {
@@ -23816,30 +23892,48 @@ mod tests {
                             remaining_eligible,
                             ..
                         } => {
-                            assert!(random);
-                            assert_eq!(paused_pick.occurrence.object_id, expected);
-                            assert!(pins.contains(&paused_pick.occurrence));
+                            assert!(random, "{branch}");
+                            assert_eq!(paused_pick.occurrence.object_id, expected, "{branch}");
+                            assert!(pins.contains(&paused_pick.occurrence), "{branch}");
                             assert_eq!(
                                 paused_pick.snapshot.incarnation,
-                                paused_pick.occurrence.incarnation
+                                paused_pick.occurrence.incarnation,
+                                "{branch}"
                             );
-                            assert_eq!(*remaining_count, usize::from(!resumed));
-                            assert!(!remaining_eligible.contains(&expected));
+                            assert_eq!(*remaining_count, usize::from(!resumed), "{branch}");
+                            assert!(!remaining_eligible.contains(&expected), "{branch}");
                             if resumed {
-                                assert!(!remaining_eligible.contains(&picks[0]));
+                                assert!(!remaining_eligible.contains(&picks[0]), "{branch}");
                             }
                             pending
                         }
                     };
                     assert_eq!(
                         pending.deferred_sacrificed_permanents,
-                        vec![DeferredSacrificeSelection {
-                            object_id: sibling,
-                            filter: TargetFilter::SpecificObject { id: sibling },
-                        }]
+                        if random {
+                            vec![]
+                        } else {
+                            vec![DeferredSacrificeSelection {
+                                object_id: sibling,
+                                filter: TargetFilter::SpecificObject { id: sibling },
+                            }]
+                        },
+                        "{branch}"
                     );
-                    assert_eq!(runner.state().objects[&sibling].zone, Zone::Battlefield);
-                    assert!(sibling_pin.is_current(runner.state()));
+                    assert_eq!(
+                        runner.state().objects[&sibling].zone,
+                        if random {
+                            Zone::Graveyard
+                        } else {
+                            Zone::Battlefield
+                        },
+                        "{branch}"
+                    );
+                    assert_eq!(sibling_pin.is_current(runner.state()), !random, "{branch}");
+                    if random {
+                        assert_eq!(sacrifice_events.iter().filter(|event| matches!(event, GameEvent::PermanentSacrificed { object_id, .. } if *object_id == sibling)).count(), 1, "{branch}");
+                        assert!(sacrifice_events.iter().any(|event| matches!(event, GameEvent::ZoneChanged { object_id, record, .. } if *object_id == sibling && record.trigger_source_context().is_some_and(|context| context.identity.reference == sibling_pin))), "{branch}");
+                    }
                     let sibling_record = pending
                         .ability
                         .cost_paid_objects
@@ -23851,25 +23945,41 @@ mod tests {
                             .snapshot()
                             .expect("selected cost snapshot")
                             .incarnation,
-                        sibling_pin.incarnation
+                        if random {
+                            sibling_arrival(&sacrifice_events)
+                                .expect("random route has committed its sibling sacrifice")
+                        } else {
+                            sibling_pin.incarnation
+                        },
+                        "{branch}"
                     );
                     let sibling_snapshot = sibling_record.snapshot().unwrap().clone();
-                    assert_eq!(pending.object_id, spell);
-                    assert_eq!(pending.ability.source_id, spell);
-                    assert!(pending
-                        .ability
-                        .cost_paid_objects
-                        .iter()
-                        .any(|record| record.object_id() == sibling));
+                    assert_eq!(
+                        sibling_snapshot.lki, sibling_lki,
+                        "{branch}: pre-move characteristics survive settlement"
+                    );
+                    assert_eq!(pending.object_id, spell, "{branch}");
+                    assert_eq!(pending.ability.source_id, spell, "{branch}");
+                    assert!(
+                        pending
+                            .ability
+                            .cost_paid_objects
+                            .iter()
+                            .any(|record| record.object_id() == sibling),
+                        "{branch}"
+                    );
                     if !random {
                         for id in picks {
-                            assert!(pending.ability.cost_paid_objects.iter().any(|record| record
-                                .object_id()
-                                == id
-                                && record.snapshot().is_some_and(|snapshot| pins
-                                    .iter()
-                                    .any(|pin| pin.object_id == id
-                                        && pin.incarnation == snapshot.incarnation))));
+                            assert!(
+                                pending.ability.cost_paid_objects.iter().any(|record| record
+                                    .object_id()
+                                    == id
+                                    && record.snapshot().is_some_and(|snapshot| pins
+                                        .iter()
+                                        .any(|pin| pin.object_id == id
+                                            && pin.incarnation == snapshot.incarnation))),
+                                "{branch}"
+                            );
                         }
                     }
                     let rng_at_pause = runner.state().rng.clone();
@@ -23878,16 +23988,23 @@ mod tests {
                             cards: vec![fodder],
                         })
                         .unwrap();
-                    assert_eq!(runner.state().objects[&fodder].zone, Zone::Graveyard);
-                    assert!(!response.events.iter().any(|event| matches!(event, GameEvent::Discarded { object_id, .. } if *object_id == expected)));
+                    sacrifice_events.extend(response.events.clone());
+                    assert_eq!(
+                        runner.state().objects[&fodder].zone,
+                        Zone::Graveyard,
+                        "{branch}"
+                    );
+                    assert!(!response.events.iter().any(|event| matches!(event, GameEvent::Discarded { object_id, .. } if *object_id == expected)), "{branch}");
                     assert_eq!(
                         runner.state().rng.get_word_pos(),
                         rng_at_pause.get_word_pos(),
-                        "answer cannot resample a parked cost pick"
+                        "{branch}: {}",
+                        format_args!("answer cannot resample a parked cost pick")
                     );
                     assert_eq!(
                         runner.state().rng.outcome_draws(),
-                        rng_at_pause.outcome_draws()
+                        rng_at_pause.outcome_draws(),
+                        "{branch}"
                     );
                     let surviving_pending = match runner.state().pending_discard_for_cost.as_deref()
                     {
@@ -23902,19 +24019,36 @@ mod tests {
                             .or_else(|| runner.state().waiting_for.pending_cast_ref()),
                     };
                     let ability = if let Some(pending) = surviving_pending {
-                        assert_eq!(pending.object_id, spell);
+                        assert_eq!(pending.object_id, spell, "{branch}");
                         assert_eq!(
                             pending.deferred_sacrificed_permanents,
-                            vec![DeferredSacrificeSelection {
-                                object_id: sibling,
-                                filter: TargetFilter::SpecificObject { id: sibling },
-                            }]
+                            if random {
+                                vec![]
+                            } else {
+                                vec![DeferredSacrificeSelection {
+                                    object_id: sibling,
+                                    filter: TargetFilter::SpecificObject { id: sibling },
+                                }]
+                            },
+                            "{branch}"
                         );
-                        assert_eq!(runner.state().objects[&sibling].zone, Zone::Battlefield);
-                        assert!(sibling_pin.is_current(runner.state()));
+                        assert_eq!(
+                            runner.state().objects[&sibling].zone,
+                            if random {
+                                Zone::Graveyard
+                            } else {
+                                Zone::Battlefield
+                            },
+                            "{branch}"
+                        );
+                        assert_eq!(sibling_pin.is_current(runner.state()), !random, "{branch}");
                         pending.ability.as_ref()
                     } else {
-                        assert_eq!(runner.state().objects[&sibling].zone, Zone::Graveyard);
+                        assert_eq!(
+                            runner.state().objects[&sibling].zone,
+                            Zone::Graveyard,
+                            "{branch}"
+                        );
                         runner
                             .state()
                             .stack
@@ -23930,19 +24064,43 @@ mod tests {
                             .iter()
                             .find(|record| record.object_id() == sibling)
                             .expect("earlier sibling retains exact snapshot through child answer")
-                            .snapshot(),
-                        Some(&sibling_snapshot)
+                            .snapshot()
+                            .map(|snapshot| &snapshot.lki),
+                        Some(&sibling_snapshot.lki),
+                        "{branch}"
                     );
-                    assert_eq!(ability.source_id, spell);
-                    assert!(ability
+                    let retained = ability
                         .cost_paid_objects
                         .iter()
-                        .any(|record| record.object_id() == sibling));
+                        .find(|record| record.object_id() == sibling)
+                        .unwrap()
+                        .snapshot()
+                        .unwrap();
+                    assert_eq!(
+                        retained.incarnation,
+                        if surviving_pending.is_none() || random {
+                            sibling_arrival(&sacrifice_events)
+                                .expect("committed sibling re-pin must come from its actual move")
+                        } else {
+                            sibling_pin.incarnation
+                        },
+                        "{branch}"
+                    );
+                    assert_eq!(sacrifice_events.iter().filter(|event| matches!(event, GameEvent::PermanentSacrificed { object_id, .. } if *object_id == sibling)).count(), usize::from(random || surviving_pending.is_none()), "{branch}");
+                    assert_eq!(ability.source_id, spell, "{branch}");
+                    assert!(
+                        ability
+                            .cost_paid_objects
+                            .iter()
+                            .any(|record| record.object_id() == sibling),
+                        "{branch}"
+                    );
                     assert_eq!(
                         runner.state().objects[&expected]
                             .counters
                             .get(&CounterType::Plus1Plus1),
-                        None
+                        None,
+                        "{branch}"
                     );
                 }
             }

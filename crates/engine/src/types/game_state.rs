@@ -5547,6 +5547,8 @@ pub enum PendingPlayerScopeSacrificeFollowUp {
 /// original frozen value, rather than determine it again after restore.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PendingDiscardBatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<Box<crate::types::events::DiscardObservation>>,
     /// The discarding seat whose batch paused.
     pub player: PlayerId,
     /// What this seat still owes.
@@ -26573,10 +26575,68 @@ fn normalize_pending_discard_delivery_subtree(state: &mut GameState) -> Result<(
     if state.viewer_projection.is_some() {
         return Ok(());
     }
+    let recover = state.pending_replacement.as_ref().and_then(|pending| {
+        let provenance = pending.discard_provenance.as_deref()?;
+        if provenance.observation.is_some() {
+            return None;
+        }
+        let pin = provenance.original_hand?;
+        let exact = match &pending.proposed {
+            ProposedEvent::Discard {
+                object_id,
+                player_id,
+                source_id,
+                discard_frame: None,
+                ..
+            } => {
+                *object_id == provenance.object_id
+                    && *player_id == provenance.player_id
+                    && *source_id == provenance.source_id
+            }
+            ProposedEvent::ZoneChange {
+                object_id,
+                from: Zone::Hand,
+                cause,
+                discard_frame: None,
+                ..
+            } => *object_id == provenance.object_id && *cause == provenance.source_id,
+            _ => false,
+        };
+        (exact
+            && pin.is_current(state)
+            && state.objects.get(&pin.object_id).is_some_and(|object| {
+                object.zone == Zone::Hand && object.owner == provenance.player_id
+            })
+            && pending.depth == 0
+            && pending.proposed.applied_set().is_empty()
+            && !pending.may_cost_paid
+            && pending.may_cost_remaining.is_none()
+            && pending.delivery_boundary.is_none()
+            && !state.replacement_may_cost_paused
+            && state.pending_cost_move_resume.is_none()
+            && state.pending_deferred_life_cost_resume.is_none()
+            && state.pending_discard_for_cost.is_none()
+            && matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }))
+        .then_some(pin.object_id)
+    });
+    if let Some(object_id) = recover {
+        let observation = state
+            .capture_event_object_snapshot(object_id)
+            .map(crate::types::events::DiscardObservation::new)
+            .map(Box::new);
+        state
+            .pending_replacement
+            .as_mut()
+            .unwrap()
+            .discard_provenance
+            .as_deref_mut()
+            .unwrap()
+            .observation = observation;
+    }
     let Some(batch) = state
         .pending_discard_batch
         .as_ref()
-        .filter(|batch| batch.delivery_subtree.is_none())
+        .filter(|batch| batch.delivery_subtree.is_none() || batch.observation.is_none())
     else {
         return Ok(());
     };
@@ -26607,12 +26667,21 @@ fn normalize_pending_discard_delivery_subtree(state: &mut GameState) -> Result<(
     if !initial {
         return state.validate_pending_discard_batch_authority();
     }
+    let observation = state
+        .capture_event_object_snapshot(batch.paused_card.object_id)
+        .map(crate::types::events::DiscardObservation::new)
+        .map(Box::new);
     let boundary = ReplacementSubtreeBoundary::at(&state.resolution_stack);
-    state
+    let batch = state
         .pending_discard_batch
         .as_mut()
-        .expect("checked legacy batch")
-        .delivery_subtree = Some(boundary);
+        .expect("checked legacy batch");
+    if batch.delivery_subtree.is_none() {
+        batch.delivery_subtree = Some(boundary);
+    }
+    if batch.observation.is_none() {
+        batch.observation = observation;
+    }
     Ok(())
 }
 
@@ -26678,6 +26747,7 @@ impl GameStateDecode {
         normalize_resolution_cast_offer_allocator(&mut state)?;
         normalize_pending_discard_delivery_subtree(&mut state)?;
         state.validate_pending_discard_provenance_authority()?;
+        state.validate_completed_discard_observations()?;
         // The PERSISTED half of the projection gate; `decode` below carries the other.
         // See the pairing comment there for why one site is not enough.
         reject_viewer_projection_as_authority(&state)?;
@@ -26722,6 +26792,7 @@ impl GameStateDecode {
         normalize_resolution_cast_offer_allocator(&mut state)?;
         normalize_pending_discard_delivery_subtree(&mut state)?;
         state.validate_pending_discard_provenance_authority()?;
+        state.validate_completed_discard_observations()?;
         // NO viewer-projection guard here, deliberately. This is the TRANSPORT decode
         // path as much as a restore path: `ServerMessage::GameStarted { state, .. }`
         // (`server-core/src/protocol.rs`) carries a `filter_state_for_viewer` projection
@@ -28166,8 +28237,10 @@ pub struct PendingSacrificeProvenance {
 }
 
 /// The no-frame discard whose hand departure still awaits replacement delivery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingDiscardProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<Box<crate::types::events::DiscardObservation>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_hand: Option<ObjectIncarnationRef>,
     pub object_id: ObjectId,
@@ -28782,6 +28855,56 @@ impl GameState {
             _ => None,
         };
         for pending in self.pending_replacement.as_ref().into_iter().chain(outer) {
+            if let Some((frame_id, object_id, player)) = match &pending.proposed {
+                ProposedEvent::Discard {
+                    discard_frame: Some(frame_id),
+                    object_id,
+                    player_id,
+                    ..
+                } => Some((*frame_id, *object_id, Some(*player_id))),
+                ProposedEvent::ZoneChange {
+                    discard_frame: Some(frame_id),
+                    object_id,
+                    from: Zone::Hand,
+                    ..
+                } => Some((*frame_id, *object_id, None)),
+                _ => None,
+            } {
+                let batch = self
+                    .pending_discard_batch
+                    .as_deref()
+                    .filter(|batch| {
+                        batch.discard_frame == Some(frame_id)
+                            && batch.paused_card.object_id == object_id
+                            && player.is_none_or(|player| player == batch.player)
+                    })
+                    .and_then(|batch| batch.observation.as_deref());
+                let frame = match self.resolution_stack.last() {
+                    Some(ResolutionFrame::Discard(frame)) if frame.id == frame_id => {
+                        Some(frame.as_ref())
+                    }
+                    Some(ResolutionFrame::AbilityContinuation(_)) => {
+                        match self.resolution_stack.active_predecessor() {
+                            Some(ResolutionFrame::Discard(frame)) if frame.id == frame_id => {
+                                Some(frame.as_ref())
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let observation = batch
+                    .or_else(|| frame.and_then(|frame| frame.observation.as_deref()))
+                    .ok_or("pending discard lacks observation authority")?;
+                if !observation.valid_for(object_id, player.unwrap_or(observation.subject.owner))
+                    || observation.delivered_to.is_some()
+                    || observation.pending_reveal.as_ref().is_some_and(|bound| {
+                        !pending.proposed.applied_set().contains(&bound.replacement)
+                    })
+                {
+                    return Err("pending discard lacks observation authority".into());
+                }
+            }
             if let Some(provenance) = pending.discard_provenance.as_deref() {
                 if !provenance.original_hand.is_some_and(|pin| {
                     pin.object_id == provenance.object_id
@@ -28789,9 +28912,287 @@ impl GameState {
                 }) {
                     return Err("pending discard lacks original-hand authority".into());
                 }
+                let observation = provenance
+                    .observation
+                    .as_deref()
+                    .ok_or("pending discard lacks observation authority")?;
+                if !observation.valid_for(provenance.object_id, provenance.player_id)
+                    || Some(observation.subject.identity) != provenance.original_hand
+                    || observation.delivered_to.is_some()
+                    || observation.pending_reveal.as_ref().is_some_and(|bound| {
+                        !pending.proposed.applied_set().contains(&bound.replacement)
+                            || bound.source.is_some_and(|source| {
+                                source.incarnation == crate::types::identifiers::LEGACY_INCARNATION
+                            })
+                    })
+                {
+                    return Err("pending discard lacks observation authority".into());
+                }
+            }
+        }
+        if let Some(batch) = self.pending_discard_batch.as_deref() {
+            let observation = batch
+                .observation
+                .as_deref()
+                .ok_or("pending discard lacks observation authority")?;
+            if !observation.valid_for(batch.paused_card.object_id, batch.player) || observation.subject.identity != batch.paused_card
+                || (observation.delivered_to.is_some() && !batch.preceding_events.iter().any(|event| matches!(event, GameEvent::Discarded { player_id, object_id, source_id, observation: Some(completed) } if *player_id == batch.player && *object_id == batch.paused_card.object_id && *source_id == Some(batch.source_id) && completed.as_ref() == observation))) {
+                return Err("pending discard lacks observation authority".into());
             }
         }
         Ok(())
+    }
+
+    fn validate_completed_discard_observations(&mut self) -> Result<(), String> {
+        fn check(event: &GameEvent) -> Result<(), String> {
+            if let GameEvent::Discarded {
+                object_id,
+                player_id,
+                observation: Some(observation),
+                ..
+            } = event
+            {
+                if !observation.completed_for(*object_id, *player_id) {
+                    return Err("completed discard lacks observation authority".into());
+                }
+            }
+            Ok(())
+        }
+        let mut error = None;
+        let mut validate = |event: &mut GameEvent| {
+            if error.is_none() {
+                error = check(event).err();
+            }
+        };
+        self.for_each_trigger_event_carrier_mut(&mut validate);
+        for event in self
+            .pending_attack_trigger_events
+            .iter_mut()
+            .chain(self.deferred_entry_events.iter_mut())
+            .chain(
+                self.consumed_before_priority_trigger_events
+                    .iter_mut()
+                    .map(|entry| &mut entry.event),
+            )
+        {
+            validate(event);
+        }
+        if let Some(batch) = self.pending_discard_batch.as_mut() {
+            batch.preceding_events.iter_mut().for_each(&mut validate);
+        }
+        for entry in self
+            .departed_activated_abilities
+            .iter_mut()
+            .map(|(_, entry)| entry)
+            .chain(
+                self.departed_stack_spells
+                    .iter_mut()
+                    .flat_map(|(_, history)| {
+                        history.iter_mut().map(|(_, departed)| &mut departed.entry)
+                    }),
+            )
+        {
+            if let StackEntryKind::TriggeredAbility {
+                trigger_event: Some(event),
+                ..
+            } = &mut entry.kind
+            {
+                validate(event);
+            }
+            if let Some(ability) = entry.ability_mut() {
+                ability.for_each_creation_lookback_event_mut(&mut validate);
+            }
+        }
+        for trigger in &mut self.delayed_triggers {
+            trigger
+                .ability
+                .for_each_creation_lookback_event_mut(&mut validate);
+        }
+        for entry in self
+            .stack
+            .iter_mut()
+            .chain(self.resolving_stack_entry.iter_mut())
+        {
+            if let Some(ability) = entry.ability_mut() {
+                ability.for_each_creation_lookback_event_mut(&mut validate);
+            }
+        }
+        if let Some(pending) = self.pending_trigger.as_mut() {
+            pending
+                .ability
+                .for_each_creation_lookback_event_mut(&mut validate);
+        }
+        for context in self.deferred_triggers.iter_mut().chain(
+            self.pending_trigger_order
+                .iter_mut()
+                .flat_map(|order| &mut order.groups)
+                .flat_map(|group| &mut group.triggers),
+        ) {
+            context
+                .pending
+                .ability
+                .for_each_creation_lookback_event_mut(&mut validate);
+        }
+        if let Some(error) = error {
+            return Err(error);
+        }
+        let mut suspended = |ability: &ResolvedAbility, context: SuspendedChainEvent<'_>| {
+            let mut copy = ability.clone();
+            let mut result = Ok(());
+            copy.for_each_creation_lookback_event_mut(&mut |event| {
+                if result.is_ok() {
+                    result = check(event);
+                }
+            });
+            result?;
+            match context {
+                SuspendedChainEvent::Bound(event) => {
+                    if let Some(event) = event {
+                        check(event)?;
+                    }
+                }
+                SuspendedChainEvent::Context(context) => {
+                    if let Some(event) = &context.event {
+                        check(event)?;
+                    }
+                    for event in &context.events {
+                        check(event)?;
+                    }
+                }
+                SuspendedChainEvent::Captured(event, events) => {
+                    if let Some(event) = event {
+                        check(event)?;
+                    }
+                    for event in events {
+                        check(event)?;
+                    }
+                }
+                SuspendedChainEvent::Ambient
+                | SuspendedChainEvent::AmbientEventOnly
+                | SuspendedChainEvent::Announcement => {}
+            }
+            Ok(())
+        };
+        if let Some(resume) = self
+            .pending_trigger_order
+            .as_ref()
+            .and_then(|order| order.resume_after_ordering.as_deref())
+        {
+            visit_waiting_for_chains(resume, &mut suspended)?;
+        }
+        if let Some(resume) = self.pending_cost_move_resume.as_ref() {
+            visit_cost_move_resume_chains(resume, &mut suspended)?;
+        }
+        if let Some(resume) = self.pending_deferred_life_cost_resume.as_ref() {
+            visit_deferred_life_cost_resume_chains(resume, &mut suspended)?;
+        }
+        if let Some(pending) = self.pending_cast.as_deref() {
+            visit_pending_cast_chain(pending, &mut suspended)?;
+        }
+        if let Some(search) = self.pending_scoped_library_search.as_ref() {
+            suspended(&search.ability, SuspendedChainEvent::Ambient)?;
+            if let Some(after_scope) = search.after_scope.as_deref() {
+                suspended(after_scope, SuspendedChainEvent::Ambient)?;
+            }
+        }
+        if let Some(resume) = self.pending_library_search_delivery.as_ref() {
+            visit_library_search_delivery_resume_chains(resume, &mut suspended)?;
+        }
+        if let Some(choice) = self.pending_player_scope_sacrifice_choice.as_ref() {
+            suspended(&choice.ability, SuspendedChainEvent::Ambient)?;
+        }
+        if let Some(payment) = self.pending_player_scope_unless_payment.as_deref() {
+            suspended(&payment.pending_effect, SuspendedChainEvent::Ambient)?;
+        }
+        if let Some(fan_out) = self
+            .pending_discard_batch
+            .as_deref()
+            .and_then(|batch| batch.fan_out.as_deref())
+        {
+            suspended(&fan_out.scoped_template, SuspendedChainEvent::Ambient)?;
+            suspended(&fan_out.outer, SuspendedChainEvent::Ambient)?;
+        }
+        if let Some(transaction) = self.payment_transaction.as_deref() {
+            suspended(
+                &transaction.root,
+                transaction
+                    .resolving_trigger_context
+                    .as_ref()
+                    .map_or(SuspendedChainEvent::Ambient, SuspendedChainEvent::Context),
+            )?;
+            visit_waiting_for_chains(&transaction.base_waiting_for, &mut suspended)?;
+        }
+        if let Some(resume) = self.pending_triggered_mana_resume.as_deref() {
+            visit_mana_trigger_fixed_point_resume_chains(&resume.outer_resume, &mut suspended)?;
+        }
+        for frame in self.resolution_stack.iter() {
+            match frame {
+                ResolutionFrame::OptionalEffect(frame) => suspended(
+                    &frame.ability,
+                    SuspendedChainEvent::Captured(
+                        frame.trigger_event.as_ref(),
+                        &frame.trigger_events,
+                    ),
+                )?,
+                ResolutionFrame::AbilityContinuation(frame) => {
+                    suspended(&frame.pending.chain, SuspendedChainEvent::Ambient)?;
+                    if let Some(tail) = &frame.pending.player_scope_tail {
+                        suspended(&tail.after_scope, SuspendedChainEvent::Ambient)?;
+                    }
+                }
+                ResolutionFrame::RepeatFor(frame) => {
+                    suspended(&frame.ability, SuspendedChainEvent::Ambient)?
+                }
+                ResolutionFrame::RepeatUntil(frame) => {
+                    suspended(&frame.ability, SuspendedChainEvent::Ambient)?
+                }
+                ResolutionFrame::RepeatedOptionalPayment(frame) => {
+                    if let Some(pending) = &frame.pending {
+                        suspended(&pending.payment_unit, SuspendedChainEvent::Ambient)?;
+                        suspended(&pending.reflexive, SuspendedChainEvent::Ambient)?;
+                    }
+                }
+                ResolutionFrame::PerPlayerZoneChoice(frame) => {
+                    suspended(&frame.ability, SuspendedChainEvent::Ambient)?
+                }
+                ResolutionFrame::PerCategoryZoneChoice(frame) => {
+                    suspended(&frame.pending.ability, SuspendedChainEvent::Ambient)?
+                }
+                ResolutionFrame::ChooseOneOf(frame) => {
+                    if let Some(continuation) = &frame.continuation {
+                        suspended(
+                            continuation,
+                            choice_continuation_event(frame.trigger_context.as_ref()),
+                        )?;
+                    }
+                }
+                ResolutionFrame::BatchDelivery(batch) => {
+                    if let Some(completion) = &batch.completion {
+                        visit_batch_completion_chains(completion, &mut suspended)?;
+                    }
+                }
+                ResolutionFrame::ChangeZone(_)
+                | ResolutionFrame::CounterMoves(_)
+                | ResolutionFrame::CounterRemovals(_)
+                | ResolutionFrame::CounterAdditions(_)
+                | ResolutionFrame::CopyToken(_)
+                | ResolutionFrame::DebugCardEntries(_)
+                | ResolutionFrame::EachPlayerCopyChosen(_)
+                | ResolutionFrame::VoteBallot(_)
+                | ResolutionFrame::CoinFlip(_)
+                | ResolutionFrame::DieRoll(_)
+                | ResolutionFrame::Proliferate(_)
+                | ResolutionFrame::MultiDraw(_)
+                | ResolutionFrame::Discard(_)
+                | ResolutionFrame::ConniveReentry(_)
+                | ResolutionFrame::LifeTotalAssignment(_)
+                | ResolutionFrame::SpellResolution(_)
+                | ResolutionFrame::MutateMerge(_)
+                | ResolutionFrame::CipherEncode(_)
+                | ResolutionFrame::PostReplacement(_) => {}
+            }
+        }
+        visit_waiting_for_chains(&self.waiting_for, &mut suspended)
     }
 
     pub(crate) fn validate_pending_discard_batch_authority(&self) -> Result<(), String> {
@@ -33962,19 +34363,57 @@ impl GameState {
     /// snapshot sits behind it, is preserved. Non-resolved origins name
     /// append-only history and remap by union rank below the window.
     fn canonicalize_lki_incarnations_for_loop(&mut self) {
-        fn named_incarnation(event: &mut GameEvent) -> Option<(ObjectId, &mut u64)> {
+        fn named_incarnations(event: &mut GameEvent, visit: &mut impl FnMut(ObjectId, &mut u64)) {
             match event {
                 GameEvent::ZoneChanged {
                     object_id, record, ..
-                } => record
-                    .entered_incarnation
-                    .as_mut()
-                    .map(|incarnation| (*object_id, incarnation)),
+                } => {
+                    if let Some(incarnation) = record.entered_incarnation.as_mut() {
+                        visit(*object_id, incarnation);
+                    }
+                }
                 GameEvent::PermanentTapped {
                     object_id,
                     incarnation: Some(incarnation),
                     ..
-                } => Some((*object_id, incarnation)),
+                } => visit(*object_id, incarnation),
+                GameEvent::Discarded {
+                    object_id,
+                    player_id,
+                    observation,
+                    ..
+                } => {
+                    if let Some(observation) = observation
+                        .as_deref_mut()
+                        .filter(|observation| observation.completed_for(*object_id, *player_id))
+                    {
+                        let subject = &mut observation.subject;
+                        let mut identity = |pin: &mut ObjectIncarnationRef| {
+                            if pin.incarnation != crate::types::identifiers::LEGACY_INCARNATION {
+                                visit(pin.object_id, &mut pin.incarnation);
+                            }
+                        };
+                        identity(&mut subject.identity);
+                        for attachment in &mut subject.attachments {
+                            identity(&mut attachment.identity);
+                        }
+                        subject
+                            .combat
+                            .related_objects
+                            .iter_mut()
+                            .for_each(&mut identity);
+                        subject
+                            .relations
+                            .saddled_sources
+                            .iter_mut()
+                            .for_each(&mut identity);
+                        subject
+                            .relations
+                            .convoked_sources
+                            .iter_mut()
+                            .for_each(&mut identity);
+                    }
+                }
                 // Exhaustive on purpose: a new event that names an incarnation must
                 // decide here whether loop normalization renumbers it.
                 GameEvent::PermanentTapped {
@@ -34017,7 +34456,6 @@ impl GameState {
                 | GameEvent::LandPlayed { .. }
                 | GameEvent::StackPushed { .. }
                 | GameEvent::StackResolved { .. }
-                | GameEvent::Discarded { .. }
                 | GameEvent::Milled { .. }
                 | GameEvent::DamageCleared { .. }
                 | GameEvent::GameOver { .. }
@@ -34118,7 +34556,7 @@ impl GameState {
                 | GameEvent::CascadeMissed { .. }
                 | GameEvent::DebugActionUsed { .. }
                 | GameEvent::DebugPermissionGranted { .. }
-                | GameEvent::DebugPermissionRevoked { .. } => None,
+                | GameEvent::DebugPermissionRevoked { .. } => {}
             }
         }
         let mut present: std::collections::HashMap<ObjectId, Vec<u64>> =
@@ -34136,9 +34574,9 @@ impl GameState {
                 .extend(history.keys().copied());
         }
         self.for_each_trigger_event_carrier_mut(&mut |event| {
-            if let Some((object_id, incarnation)) = named_incarnation(event) {
+            named_incarnations(event, &mut |object_id, incarnation| {
                 present.entry(object_id).or_default().push(*incarnation);
-            }
+            });
         });
         // CR 608.2c + CR 608.2h: only the RESOLVED set's origins join the
         // identity pool (mirrors `retain_carrier_referenced_lki`:
@@ -34201,9 +34639,9 @@ impl GameState {
                 })
                 .collect();
         self.for_each_trigger_event_carrier_mut(&mut |event| {
-            if let Some((object_id, incarnation)) = named_incarnation(event) {
+            named_incarnations(event, &mut |object_id, incarnation| {
                 *incarnation = canonical(object_id, *incarnation);
-            }
+            });
         });
         // CR 608.2c: remap origin-named incarnations. A pooled incarnation
         // (history, carrier, or resolved-set origin) takes its exact rank, so
@@ -34321,6 +34759,23 @@ impl GameState {
         !self.resolution_stack.holds_unsettled_delivery_frame()
             && self.pending_player_scope_sacrifice_choice.is_none()
             && self.pending_discard_batch.is_none()
+            && self.pending_replacement.as_ref().is_none_or(|pending| {
+                pending
+                    .discard_provenance
+                    .as_deref()
+                    .is_none_or(|provenance| provenance.observation.is_none())
+            })
+            && match self.pending_cost_move_resume.as_ref() {
+                Some(PendingCostMoveResume::ReplacementMayCost {
+                    outer_replacement, ..
+                }) => outer_replacement.as_deref().is_none_or(|pending| {
+                    pending
+                        .discard_provenance
+                        .as_deref()
+                        .is_none_or(|provenance| provenance.observation.is_none())
+                }),
+                _ => true,
+            }
             && self.pending_combat_lifelink.is_none()
             && self.deferred_entry_events.is_empty()
             && self.pending_attack_trigger_events.is_empty()
@@ -34335,7 +34790,10 @@ impl GameState {
     /// every parked resolution frame, the pre-roll die instruction, and a paused
     /// triggered mana ability. The one traversal `normalize_for_loop` uses for
     /// both LKI retention and identity canonicalization.
-    fn for_each_trigger_event_carrier_mut(&mut self, f: &mut impl FnMut(&mut GameEvent)) {
+    pub(crate) fn for_each_trigger_event_carrier_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut GameEvent),
+    ) {
         for entry in self
             .stack
             .iter_mut()
@@ -40462,10 +40920,19 @@ mod tests {
     /// The event is the point: `preceding_events` is a LIVE event carrier, so
     /// its records must be rebound on load like every other one.
     fn parked_discard_batch(
-        state: &GameState,
+        state: &mut GameState,
         record: ZoneChangeRecord,
     ) -> Box<PendingDiscardBatch> {
+        let card = crate::game::zones::create_object(
+            state,
+            CardId(9303),
+            PlayerId(0),
+            "Pending Hand subject".into(),
+            Zone::Hand,
+        );
+        let observation = crate::game::effects::discard::capture_discard_observation(state, card);
         Box::new(PendingDiscardBatch {
+            observation: Some(Box::new(observation.clone())),
             player: PlayerId(0),
             cursor: DiscardBatchCursor::All {
                 remaining: vec![ObjectId(9_301), ObjectId(9_302)],
@@ -40473,7 +40940,7 @@ mod tests {
             completion: PendingDiscardBatchCompletion::Standard,
             source_id: ObjectId(9_300),
             effect_kind: crate::types::ability::EffectKind::Discard,
-            paused_card: ObjectIncarnationRef::of(ObjectId(9_303), 0),
+            paused_card: observation.subject.identity,
             delivery_subtree: Some(ReplacementSubtreeBoundary::at(&state.resolution_stack)),
             discard_frame: None,
             fan_out: None,
@@ -40568,7 +41035,7 @@ mod tests {
         state.turn_number = 19;
         let record = persisted_zone_change_record(ObjectId(9_101), 19, 0);
         state.zone_changes_this_turn.push_back(record.clone());
-        state.pending_discard_batch = Some(parked_discard_batch(&state, record));
+        state.pending_discard_batch = Some(parked_discard_batch(&mut state, record));
 
         let bare = {
             let mut bare = state.clone();
@@ -40659,7 +41126,7 @@ mod tests {
         state.turn_number = 19;
         let record = persisted_zone_change_record(ObjectId(9_101), 19, 0);
         state.zone_changes_this_turn.push_back(record.clone());
-        state.pending_discard_batch = Some(parked_discard_batch(&state, record));
+        state.pending_discard_batch = Some(parked_discard_batch(&mut state, record));
         // The prompt a parked batch is waiting on. Without it the save is not
         // mid-pause and this test measures nothing. CR 616.1 is accurate for THIS
         // fixture, which builds a two-candidate ordering prompt; the production
@@ -46081,6 +46548,410 @@ mod tests {
             !loop_states_equal(&early.normalize_for_loop(), &unmatched.normalize_for_loop()),
             "an event naming an incarnation with no retained snapshot is a different position"
         );
+    }
+
+    #[test]
+    fn normalize_for_loop_canonicalizes_retained_discard_observations() {
+        use crate::game::game_object::ObjectIncarnationRefExt;
+        use crate::types::ability::{AttachmentKind, ThisWayCause};
+        use crate::types::events::{
+            DiscardObservation, EventAttachmentSnapshot, EventTrackedSetMembership,
+        };
+        fn receipt(event: &mut GameEvent) -> &mut DiscardObservation {
+            let GameEvent::Discarded {
+                observation: Some(observation),
+                ..
+            } = event
+            else {
+                panic!("real completed receipt required")
+            };
+            observation
+        }
+        fn rename(event: &mut GameEvent, delta: u64) {
+            let mut pin = |pin: &mut ObjectIncarnationRef| {
+                if pin.incarnation != crate::types::identifiers::LEGACY_INCARNATION {
+                    pin.incarnation += delta;
+                }
+            };
+            match event {
+                GameEvent::Discarded {
+                    observation: Some(observation),
+                    ..
+                } => {
+                    pin(&mut observation.subject.identity);
+                    for attachment in &mut observation.subject.attachments {
+                        pin(&mut attachment.identity);
+                    }
+                    observation
+                        .subject
+                        .combat
+                        .related_objects
+                        .iter_mut()
+                        .for_each(&mut pin);
+                    observation
+                        .subject
+                        .relations
+                        .saddled_sources
+                        .iter_mut()
+                        .for_each(&mut pin);
+                    observation
+                        .subject
+                        .relations
+                        .convoked_sources
+                        .iter_mut()
+                        .for_each(&mut pin);
+                }
+                GameEvent::PermanentTapped {
+                    incarnation: Some(incarnation),
+                    ..
+                } => *incarnation += delta,
+                _ => {}
+            }
+        }
+        for delayed in [false, true] {
+            let mut state = GameState::new_two_player(42);
+            let observer = crate::game::zones::create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(1),
+                "Geth's Grimoire".into(),
+                Zone::Battlefield,
+            );
+            let card = crate::game::zones::create_object(
+                &mut state,
+                CardId(2),
+                PlayerId(0),
+                "Original Hand creature".into(),
+                Zone::Hand,
+            );
+            state
+                .objects
+                .get_mut(&card)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+            let original = ObjectIncarnationRef::from_object(&state.objects[&card]);
+            let mut trigger = crate::parser::oracle_trigger::parse_trigger_line(
+                "Whenever an opponent discards a card, you may draw a card.",
+                "Geth's Grimoire",
+            );
+            if delayed {
+                trigger.execute = None;
+                let context = crate::game::triggers::trigger_source_context_for_latch(
+                    &state,
+                    &state.objects[&observer],
+                );
+                let mut ability = ResolvedAbility::new(
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                    vec![],
+                    observer,
+                    PlayerId(1),
+                );
+                ability.set_trigger_source_recursive(context.clone());
+                assert_eq!(ability.trigger_source.as_ref(), Some(&context));
+                crate::game::triggers::install_delayed_trigger(
+                    &mut state,
+                    DelayedTrigger::new(
+                        crate::types::ability::DelayedTriggerCondition::WhenNextEvent {
+                            trigger: Box::new(trigger),
+                            or_trigger: None,
+                            lifetime: Default::default(),
+                        },
+                        Box::new(ability),
+                        PlayerId(1),
+                        observer,
+                        true,
+                    ),
+                    &mut Vec::new(),
+                );
+            } else {
+                state
+                    .objects
+                    .get_mut(&observer)
+                    .unwrap()
+                    .install_trigger_base_definitions(std::sync::Arc::new(vec![trigger]))
+                    .unwrap();
+            }
+            let mut events = Vec::new();
+            assert!(matches!(
+                crate::game::effects::discard::discard_caused_by_effect_with_source(
+                    &mut state,
+                    card,
+                    PlayerId(0),
+                    None,
+                    &mut events
+                ),
+                crate::game::effects::discard::DiscardOutcome::Complete
+            ));
+            let actual = events
+                .iter()
+                .find(|event| matches!(event, GameEvent::Discarded { .. }))
+                .unwrap()
+                .clone();
+            let GameEvent::Discarded {
+                player_id: PlayerId(0),
+                object_id,
+                source_id: None,
+                observation: Some(observation),
+            } = &actual
+            else {
+                panic!("real publisher receipt")
+            };
+            assert_eq!(*object_id, card);
+            assert_eq!(observation.subject.identity, original);
+            assert_eq!(observation.subject.zone, Zone::Hand);
+            assert_eq!(observation.delivered_to, Some(Zone::Graveyard));
+            assert!(observation.pending_reveal.is_none());
+            crate::game::triggers::process_triggers(&mut state, &events);
+            let entry = state
+                .stack
+                .iter()
+                .find(|entry| entry.source_id == observer)
+                .expect("real ordinary/delayed observer retained");
+            assert!(
+                matches!(&entry.kind, StackEntryKind::TriggeredAbility { trigger_event: Some(event), .. } if event == &actual)
+            );
+            assert!(state.is_loop_comparable());
+            // Representation controls extend only a clone of the actual retained event.
+            let mut represented = actual.clone();
+            let subject = &mut receipt(&mut represented).subject;
+            let first = ObjectIncarnationRef::of(observer, 3);
+            let second = ObjectIncarnationRef::of(observer, 7);
+            subject.attachments = vec![
+                EventAttachmentSnapshot {
+                    identity: first,
+                    controller: PlayerId(1),
+                    kind: AttachmentKind::Aura,
+                },
+                EventAttachmentSnapshot {
+                    identity: second,
+                    controller: PlayerId(0),
+                    kind: AttachmentKind::Equipment,
+                },
+            ];
+            subject.combat.related_objects = vec![first, second, first];
+            subject.relations.saddled_sources = vec![
+                second,
+                first,
+                ObjectIncarnationRef::of(
+                    ObjectId(900),
+                    crate::types::identifiers::LEGACY_INCARNATION,
+                ),
+            ];
+            subject.relations.convoked_sources = vec![first, second];
+            subject.relations.tracked_sets = vec![EventTrackedSetMembership {
+                set_id: TrackedSetId(81),
+                caused_by: Some(ThisWayCause::Discarded),
+            }];
+            let mut early = state.clone();
+            early.for_each_trigger_event_carrier_mut(&mut |event| {
+                if matches!(event, GameEvent::Discarded { .. }) {
+                    *event = represented.clone();
+                }
+            });
+            let entry_id = early
+                .stack
+                .iter()
+                .find(|entry| entry.source_id == observer)
+                .unwrap()
+                .id;
+            early
+                .stack_trigger_event_batches
+                .insert(entry_id, vec![represented.clone()]);
+            early.current_trigger_events = vec![
+                GameEvent::PermanentTapped {
+                    object_id: observer,
+                    caused_by: None,
+                    incarnation: Some(3),
+                },
+                GameEvent::PermanentTapped {
+                    object_id: observer,
+                    caused_by: None,
+                    incarnation: Some(7),
+                },
+            ];
+            let lki = early.objects[&observer].snapshot_for_mana_spent();
+            early
+                .lki_by_incarnation
+                .entry(observer)
+                .or_default()
+                .insert(3, lki.clone());
+            early
+                .lki_by_incarnation
+                .entry(observer)
+                .or_default()
+                .insert(7, lki);
+            let mut late = early.clone();
+            late.for_each_trigger_event_carrier_mut(&mut |event| rename(event, 88));
+            late.lki_by_incarnation = std::mem::take(&mut late.lki_by_incarnation)
+                .into_iter()
+                .map(|(id, history)| {
+                    (
+                        id,
+                        history
+                            .into_iter()
+                            .map(|(epoch, snapshot)| (epoch + 88, snapshot))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let authoritative_early = serde_json::to_value(&early).unwrap();
+            let authoritative_late = serde_json::to_value(&late).unwrap();
+            assert_ne!(early, late, "delayed={delayed}: raw epochs differ");
+            assert!(early.is_loop_comparable() && late.is_loop_comparable());
+            let normalized = early.normalize_for_loop();
+            let mut sentinel_guard = normalized.clone();
+            sentinel_guard.for_each_trigger_event_carrier_mut(&mut |event| {
+                if let GameEvent::Discarded {
+                    observation: Some(observation),
+                    ..
+                } = event
+                {
+                    assert_eq!(
+                        observation.subject.relations.saddled_sources[2].incarnation,
+                        crate::types::identifiers::LEGACY_INCARNATION
+                    );
+                }
+            });
+            assert!(
+                loop_states_equal(&normalized, &late.normalize_for_loop()),
+                "delayed={delayed}: shared rank pool covers all nested leaves"
+            );
+            assert!(
+                loop_states_equal(&normalized, &normalized.normalize_for_loop()),
+                "normalization is idempotent"
+            );
+            assert_eq!(serde_json::to_value(&early).unwrap(), authoritative_early);
+            assert_eq!(serde_json::to_value(&late).unwrap(), authoritative_late);
+            for control in 0..10 {
+                let mut changed = early.clone();
+                changed.for_each_trigger_event_carrier_mut(&mut |event| {
+                    if !matches!(event, GameEvent::Discarded { .. }) {
+                        return;
+                    }
+                    let observation = receipt(event);
+                    match control {
+                        0 => observation.subject.name.push('!'),
+                        1 => observation.subject.controller = PlayerId(0),
+                        2 => observation.delivered_to = Some(Zone::Exile),
+                        3 => {
+                            observation.revealed_by =
+                                Some(crate::types::proposed_event::AppliedReplacementKey::object(
+                                    observer, 4,
+                                ))
+                        }
+                        4 => {
+                            observation.subject.relations.tracked_sets[0].set_id = TrackedSetId(82)
+                        }
+                        5 => {
+                            observation.subject.relations.tracked_sets[0].caused_by =
+                                Some(ThisWayCause::Exiled)
+                        }
+                        6 => observation.subject.combat.related_objects[0].object_id = card,
+                        7 => observation.subject.attachments[0].identity.incarnation = 4,
+                        8 => observation.subject.relations.saddled_sources[0].incarnation = 3,
+                        9 => observation.subject.relations.convoked_sources[0].incarnation = 7,
+                        _ => unreachable!(),
+                    }
+                });
+                assert!(
+                    !loop_states_equal(&normalized, &changed.normalize_for_loop()),
+                    "delayed={delayed} meaningful control={control}"
+                );
+            }
+            // A real public producer, rather than a re-labelled moved snapshot, owns the live gate.
+            let mut inflight = state.clone();
+            inflight.debug_mode = true;
+            inflight.phase = crate::types::phase::Phase::PreCombatMain;
+            let selected = crate::game::zones::create_object(
+                &mut inflight,
+                CardId(3),
+                PlayerId(0),
+                "Unperformed Hand subject".into(),
+                Zone::Hand,
+            );
+            inflight
+                .objects
+                .get_mut(&selected)
+                .unwrap()
+                .replacement_definitions
+                .push(
+                    crate::types::ability::ReplacementDefinition::new(
+                        crate::types::replacements::ReplacementEvent::Discard,
+                    )
+                    .valid_card(TargetFilter::SelfRef)
+                    .mode(crate::types::ability::ReplacementMode::Optional { decline: None }),
+                );
+            let parked = crate::game::engine::apply(
+                &mut inflight,
+                PlayerId(0),
+                crate::types::actions::GameAction::Debug(
+                    crate::types::actions::DebugAction::Discard {
+                        object_id: selected,
+                    },
+                ),
+            )
+            .unwrap();
+            assert!(matches!(
+                parked.waiting_for,
+                WaitingFor::ReplacementChoice { .. }
+            ));
+            assert_eq!(inflight.objects[&selected].zone, Zone::Hand);
+            assert!(inflight
+                .pending_replacement
+                .as_ref()
+                .unwrap()
+                .discard_provenance
+                .as_deref()
+                .unwrap()
+                .observation
+                .is_some());
+            assert!(!inflight.is_loop_comparable());
+            inflight.record_loop_detect_sample();
+            assert!(inflight.loop_detect_ring.is_empty());
+            let completed = crate::game::engine::apply(
+                &mut inflight,
+                PlayerId(0),
+                crate::types::actions::GameAction::ChooseReplacement { index: 1 },
+            )
+            .unwrap();
+            assert!(completed.events.iter().any(|event| matches!(event, GameEvent::Discarded { object_id, observation: Some(_), .. } if *object_id == selected)));
+            assert!(inflight.pending_replacement.is_none());
+            assert!(inflight.is_loop_comparable());
+            let mut keyed = early.clone();
+            keyed.for_each_trigger_event_carrier_mut(&mut |event| {
+                if let GameEvent::Discarded {
+                    observation: Some(observation),
+                    ..
+                } = event
+                {
+                    observation.revealed_by = Some(
+                        crate::types::proposed_event::AppliedReplacementKey::object(observer, 4),
+                    );
+                }
+            });
+            let mut another_key = keyed.clone();
+            another_key.for_each_trigger_event_carrier_mut(&mut |event| {
+                if let GameEvent::Discarded {
+                    observation: Some(observation),
+                    ..
+                } = event
+                {
+                    observation.revealed_by = Some(
+                        crate::types::proposed_event::AppliedReplacementKey::object(observer, 5),
+                    );
+                }
+            });
+            assert!(keyed.is_loop_comparable() && another_key.is_loop_comparable());
+            assert!(!loop_states_equal(
+                &keyed.normalize_for_loop(),
+                &another_key.normalize_for_loop()
+            ));
+        }
     }
 
     /// Maintainer round 4, finding 1. CR 104.4b + CR 400.7: LKI retention and
@@ -53646,12 +54517,13 @@ mod tests {
         assert_eq!(legacy.discard_provenance, None);
         for source_id in [None, Some(ObjectId(99))] {
             let provenance = PendingDiscardProvenance {
+                observation: None, // Leaf-wire legacy fixture; no executable delivery is claimed.
                 original_hand: Some(ObjectIncarnationRef::of(ObjectId(71), 3)),
                 object_id: ObjectId(71),
                 player_id: PlayerId(1),
                 source_id,
             };
-            pending.discard_provenance = Some(Box::new(provenance));
+            pending.discard_provenance = Some(Box::new(provenance.clone()));
             let json = serde_json::to_value(&pending).expect("serialize owned discard");
             assert_eq!(
                 json["discard_provenance"],
@@ -55831,6 +56703,7 @@ mod replacement_subtree_boundary_tests {
 
     fn discard_batch_at(state: &GameState) -> Box<super::PendingDiscardBatch> {
         Box::new(super::PendingDiscardBatch {
+            observation: None, // Structural insertion fixture, never a current delivery/admission.
             player: PlayerId(0),
             cursor: super::DiscardBatchCursor::All { remaining: vec![] },
             completion: super::PendingDiscardBatchCompletion::Standard,

@@ -381,7 +381,7 @@ fn handle_replacement_choice_inner(
                     _ => false,
                 })
     });
-    let parked_discard_provenance = pending.discard_provenance.as_deref().copied().or_else(|| {
+    let parked_discard_provenance = pending.discard_provenance.as_deref().cloned().or_else(|| {
         (original_discard_response
             && state
                 .pending_discard_batch
@@ -393,6 +393,7 @@ fn handle_replacement_choice_inner(
                 .as_ref()
                 .expect("proven original batch");
             crate::types::game_state::PendingDiscardProvenance {
+                observation: batch.observation.clone(),
                 original_hand: Some(batch.paused_card),
                 object_id: batch.paused_card.object_id,
                 player_id: batch.player,
@@ -401,7 +402,7 @@ fn handle_replacement_choice_inner(
         })
     });
     // CR 400.7 + CR 701.9a: an answer cannot discard a later occurrence of this storage id.
-    if let Some(provenance) = parked_discard_provenance {
+    if let Some(provenance) = parked_discard_provenance.as_ref() {
         let matching = match &pending.proposed {
             ProposedEvent::Discard {
                 object_id,
@@ -456,7 +457,7 @@ fn handle_replacement_choice_inner(
                     context.identity.reference == paused_card))
         });
         let discarded = events.iter().any(|event| {
-            matches!(event, GameEvent::Discarded { player_id, object_id, source_id: event_source }
+            matches!(event, GameEvent::Discarded { player_id, object_id, source_id: event_source, .. }
                 if *player_id == player && *object_id == paused_card.object_id
                     && *event_source == Some(source_id))
         });
@@ -590,11 +591,130 @@ fn handle_replacement_choice_inner(
     // pre-move incarnation and the exact proposed event. Capture this before
     // `continue_replacement` consumes the pending record.
     let parked_zone_change_delivery = state.pending_zone_change_delivery_from_replacement();
-    if let Some(provenance) = parked_discard_provenance {
+    if let Some(provenance) = parked_discard_provenance.as_ref() {
         // The exact legacy batch pin also survives any inner replacement re-park.
-        effects::discard::retain_pending_discard(state, provenance);
+        effects::discard::retain_pending_discard(state, provenance.clone());
     }
-    let result = super::replacement::continue_replacement(state, index, events);
+    let discard_frame =
+        state
+            .pending_replacement
+            .as_ref()
+            .and_then(|pending| match &pending.proposed {
+                ProposedEvent::Discard { discard_frame, .. }
+                | ProposedEvent::ZoneChange {
+                    from: Zone::Hand,
+                    discard_frame,
+                    ..
+                } => *discard_frame,
+                _ => None,
+            });
+    let frame_observation = discard_frame.and_then(|id| {
+        state
+            .resolution_stack
+            .active_discard_or_direct_continuation_parent_mut(id)
+            .map(|frame| (frame.source_id, frame.observation.as_deref().cloned()))
+    });
+    if discard_frame.is_some() && frame_observation.is_none() {
+        return Err(EngineError::InvalidAction(
+            "pending discard lacks an active or direct-parent observation owner".into(),
+        ));
+    }
+    let mut discard_observation = parked_discard_provenance
+        .as_ref()
+        .and_then(|provenance| provenance.observation.as_deref())
+        .cloned()
+        .or_else(|| {
+            state
+                .pending_discard_batch
+                .as_ref()
+                .filter(|batch| {
+                    original_discard_response
+                        || (discard_frame.is_some()
+                            && batch.discard_frame == discard_frame
+                            && parked_affected_object_id == Some(batch.paused_card.object_id)
+                            && frame_observation
+                                .as_ref()
+                                .is_some_and(|(source, _)| *source == Some(batch.source_id))
+                            && batch.observation.as_deref().is_some_and(|observation| {
+                                observation.subject.identity == batch.paused_card
+                                    && observation.subject.owner == batch.player
+                            }))
+                })
+                .and_then(|batch| batch.observation.as_deref())
+                .cloned()
+        })
+        .or_else(|| frame_observation.and_then(|(_, observation)| observation));
+    if parked_discard_provenance.is_some() || discard_frame.is_some() || original_discard_response {
+        let observation = discard_observation.as_ref().ok_or_else(|| {
+            EngineError::InvalidAction("pending discard lacks observation authority".into())
+        })?;
+        if !observation.valid_for(
+            observation.subject.identity.object_id,
+            observation.subject.owner,
+        ) || observation.delivered_to.is_some()
+            || !observation.subject.identity.is_current(state)
+            || parked_affected_object_id != Some(observation.subject.identity.object_id)
+            || !state
+                .objects
+                .get(&observation.subject.identity.object_id)
+                .is_some_and(|object| {
+                    object.zone == Zone::Hand && object.owner == observation.subject.owner
+                })
+            || observation.pending_reveal.as_ref().is_some_and(|bound| {
+                !state
+                    .pending_replacement
+                    .as_ref()
+                    .unwrap()
+                    .proposed
+                    .applied_set()
+                    .contains(&bound.replacement)
+            })
+        {
+            return Err(EngineError::InvalidAction(
+                "pending discard lacks observation authority".into(),
+            ));
+        }
+    }
+    let result = match discard_observation.as_mut() {
+        Some(observation) => {
+            super::replacement::continue_discard_replacement(state, index, observation, events)
+        }
+        None => super::replacement::continue_replacement(state, index, events),
+    };
+    if let Some(observation) = discard_observation.as_ref() {
+        let batch_owns = state.pending_discard_batch.as_ref().is_some_and(|batch| {
+            parked_discard_batch_owner
+                == Some((
+                    batch.paused_card,
+                    batch.player,
+                    batch.source_id,
+                    batch.discard_frame,
+                ))
+                && batch.paused_card == observation.subject.identity
+        });
+        if batch_owns {
+            state.pending_discard_batch.as_mut().unwrap().observation =
+                Some(Box::new(observation.clone()));
+        }
+        let frame = discard_frame.and_then(|id| {
+            state
+                .resolution_stack
+                .active_discard_or_direct_continuation_parent_mut(id)
+        });
+        if let Some(frame) = frame {
+            frame.observation = Some(Box::new(observation.clone()));
+        } else if discard_frame.is_some()
+            && !batch_owns
+            && matches!(
+                result,
+                super::replacement::ReplacementResult::NeedsChoice(_)
+            )
+        {
+            return Err(EngineError::InvalidAction(
+                "pending discard lacks an active or direct-parent observation owner".into(),
+            ));
+        }
+    }
     // CR 614.12a: an optional `MayCost` accept whose payment surfaced an
     // interactive sub-choice (e.g. Mox Diamond's "discard a land card" with
     // multiple eligible lands) re-parked the pending replacement with
@@ -652,26 +772,27 @@ fn handle_replacement_choice_inner(
                         } => (*object_id, *from, *to, *cause, *discard_frame),
                         _ => unreachable!("arm pattern guarantees ZoneChange"),
                     };
-                    let discard_delivery = if let Some(provenance) = parked_discard_provenance {
-                        if discard_frame.is_some()
-                            || from != Zone::Hand
-                            || provenance.object_id != object_id
-                            || !provenance.original_hand.is_some_and(|pin| {
-                                pin.is_current(state)
-                                    && state.objects.get(&pin.object_id).is_some_and(|object| {
-                                        object.zone == Zone::Hand
-                                            && object.owner == provenance.player_id
-                                    })
-                            })
-                        {
-                            return Err(EngineError::InvalidAction(
-                                "discard delivery lacks current original-hand authority".into(),
-                            ));
-                        }
-                        Some(provenance)
-                    } else {
-                        None
-                    };
+                    let discard_delivery =
+                        if let Some(provenance) = parked_discard_provenance.as_ref() {
+                            if discard_frame.is_some()
+                                || from != Zone::Hand
+                                || provenance.object_id != object_id
+                                || !provenance.original_hand.is_some_and(|pin| {
+                                    pin.is_current(state)
+                                        && state.objects.get(&pin.object_id).is_some_and(|object| {
+                                            object.zone == Zone::Hand
+                                                && object.owner == provenance.player_id
+                                        })
+                                })
+                            {
+                                return Err(EngineError::InvalidAction(
+                                    "discard delivery lacks current original-hand authority".into(),
+                                ));
+                            }
+                            Some(provenance.clone())
+                        } else {
+                            None
+                        };
                     let Ok(approved) =
                         crate::game::zone_pipeline::ApprovedZoneChange::approve_post_replacement(
                             event,
@@ -680,10 +801,8 @@ fn handle_replacement_choice_inner(
                         unreachable!("arm pattern guarantees a ZoneChange payload");
                     };
                     let delivery_start = events.len();
-                    let delivery = crate::game::zone_pipeline::deliver(
-                        state,
-                        approved,
-                        crate::game::zone_pipeline::DeliveryCtx {
+                    let delivery = {
+                        let ctx = crate::game::zone_pipeline::DeliveryCtx {
                             source_id: cause,
                             exile_links: crate::game::zone_pipeline::ExileLinkSpec {
                                 duration: parked_exile_duration,
@@ -697,12 +816,34 @@ fn handle_replacement_choice_inner(
                             // requested index instead of the tail auto-shuffling it
                             // away. `None` for every non-library parked event.
                             library_placement: parked_library_placement.clone(),
-                        },
-                        events,
-                    );
+                        };
+                        match discard_observation.as_mut() {
+                            Some(observation) => crate::game::zone_pipeline::deliver_discard(
+                                state,
+                                approved,
+                                ctx,
+                                observation,
+                                events,
+                            ),
+                            None => {
+                                crate::game::zone_pipeline::deliver(state, approved, ctx, events)
+                            }
+                        }
+                    };
+                    if let Some(observation) = discard_observation.as_ref() {
+                        if let Some(batch) = state
+                            .pending_discard_batch
+                            .as_mut()
+                            .filter(|batch| batch.paused_card == observation.subject.identity)
+                        {
+                            batch.observation = Some(Box::new(observation.clone()));
+                        }
+                    }
                     // CR 701.9a + CR 701.9c: the discard is complete when its card leaves hand,
                     // even if counter replacement work subsequently needs a choice.
-                    if let Some(provenance) = discard_delivery {
+                    if let Some(mut provenance) = discard_delivery {
+                        provenance.observation =
+                            discard_observation.as_ref().cloned().map(Box::new);
                         if state
                             .objects
                             .get(&object_id)
@@ -710,7 +851,7 @@ fn handle_replacement_choice_inner(
                         {
                             effects::discard::record_completed_discard(state, provenance, events);
                         } else {
-                            effects::discard::retain_pending_discard(state, provenance);
+                            effects::discard::retain_pending_discard(state, provenance.clone());
                         }
                     }
                     match delivery {
@@ -1136,8 +1277,9 @@ fn handle_replacement_choice_inner(
                     applied,
                     ..
                 } => {
-                    let (original_hand, player_id, source_id) = if discard_frame.is_none() {
+                    let (observation, player_id, source_id) = if discard_frame.is_none() {
                         let provenance = parked_discard_provenance
+                            .as_ref()
                             .expect("no-frame authority checked before continue");
                         if provenance.object_id != object_id
                             || provenance.player_id != player_id
@@ -1148,27 +1290,28 @@ fn handle_replacement_choice_inner(
                             ));
                         }
                         (
-                            provenance.original_hand.expect("validated original pin"),
+                            discard_observation
+                                .take()
+                                .expect("validated original discard observation"),
                             provenance.player_id,
                             provenance.source_id,
                         )
                     } else {
-                        let pin = state
-                            .objects
-                            .get(&object_id)
-                            .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
-                            .ok_or_else(|| {
+                        (
+                            discard_observation.take().ok_or_else(|| {
                                 EngineError::InvalidAction(
-                                    "discard subject no longer exists".into(),
+                                    "pending discard lacks observation authority".into(),
                                 )
-                            })?;
-                        (pin, player_id, source_id)
+                            })?,
+                            player_id,
+                            source_id,
+                        )
                     };
                     let delivery_start = events.len();
                     if let effects::discard::DiscardOutcome::NeedsChoice(player) =
                         effects::discard::complete_discard_to_graveyard(
                             state,
-                            original_hand,
+                            observation,
                             player_id,
                             source_id,
                             discard_frame,
@@ -1176,7 +1319,12 @@ fn handle_replacement_choice_inner(
                             events,
                         )
                     {
-                        state.waiting_for = *player;
+                        if let Some(batch) = state.pending_discard_batch.as_mut().filter(|batch| {
+                            batch.paused_card == player.observation.subject.identity
+                        }) {
+                            batch.observation = Some(Box::new(player.observation));
+                        }
+                        state.waiting_for = player.waiting_for;
                         retain_paused_discard_batch_events(state, &events[delivery_start..]);
                         super::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
                             state,
