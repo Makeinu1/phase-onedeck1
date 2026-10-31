@@ -3090,6 +3090,16 @@ mod tests {
             .unwrap()
             .discard_provenance
             .is_some());
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ReplacementChoice {
+                player: PlayerId(0),
+                ..
+            }
+        ));
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, GameEvent::Discarded { .. })));
         // Moved has no natural prevention producer. Use the existing regeneration
         // witness to positively exercise the shared dispatcher's Prevented arm.
         state
@@ -3112,9 +3122,30 @@ mod tests {
         }];
         pending.is_optional = false;
         state.waiting_for = replacement::replacement_choice_waiting_for(PlayerId(0), &state);
+        let before = serde_json::to_value(&state).unwrap();
+        let journal = state.resolved_rules_journal.clone();
+        let error =
+            apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 }).unwrap_err();
+        assert!(matches!(
+            &error,
+            crate::game::engine::EngineError::InvalidAction(message)
+                if message.contains("original-hand authority")
+        ));
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+        assert_eq!(state.resolved_rules_journal, journal);
+        assert!(!state.objects[&leng].tapped);
+        // The Destroy witness owns no discard: retire the unrelated carrier
+        // explicitly before exercising its genuine regeneration prevention.
+        assert!(state
+            .pending_replacement
+            .as_mut()
+            .unwrap()
+            .discard_provenance
+            .take()
+            .is_some());
         let response =
             apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 }).unwrap();
-        // CR 614.6: preventing the original departure publishes no discard.
+        // CR 614.6: replaced destruction does not publish an unrelated discard.
         assert!(
             state.objects[&leng].tapped,
             "regeneration prevention was applied"

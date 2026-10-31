@@ -805,8 +805,8 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                         .objects
                         .get_mut(&observer)
                         .unwrap()
-                        .trigger_definitions
-                        .clear();
+                        .install_trigger_base_definitions(std::sync::Arc::new(Vec::new()))
+                        .expect("delayed-only observer has no printed ordinary triggers");
                     engine::game::triggers::install_delayed_trigger(
                         runner.state_mut(),
                         engine::types::game_state::DelayedTrigger::new(
@@ -829,6 +829,32 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                             true,
                         ),
                         &mut Vec::new(),
+                    );
+                    engine::game::layers::mark_layers_full(runner.state_mut());
+                    engine::game::layers::flush_layers(runner.state_mut());
+                    assert!(
+                        runner.state().objects[&observer]
+                            .trigger_definitions
+                            .is_empty(),
+                        "ordinary observer remains absent after production layer preparation"
+                    );
+                    assert_eq!(
+                        runner
+                            .state()
+                            .delayed_triggers
+                            .iter()
+                            .filter(|trigger| {
+                                trigger.source_id == observer
+                                    && trigger.controller == P1
+                                    && trigger.one_shot
+                                    && matches!(
+                                        trigger.condition,
+                                        DelayedTriggerCondition::WhenNextEvent { .. }
+                                    )
+                            })
+                            .count(),
+                        1,
+                        "definition-derived one-shot delayed observer survives the layer flush"
                     );
                 }
                 let initial = runner.cast(spell).resolve();
