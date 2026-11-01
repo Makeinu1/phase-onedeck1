@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use crate::game::engine_replacement::CopyEntryResumption;
 use crate::game::game_object::GameObject;
+use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::game::replacement::{self, ReplacementResult};
 use crate::types::ability::{
     AbilityTag, CounterMoveSelection, CounterTransferMode, DelayedTriggerCondition,
@@ -400,6 +401,7 @@ pub(crate) fn park_pending_counter_completion_at_child_boundary(
                 ResolutionFrame::CounterAdditions(queue),
                 child_stack_start,
             )
+            .map(|_| ())
             .expect("a counter completion must be inserted below its complete child stack"),
     }
 }
@@ -1023,6 +1025,7 @@ fn apply_pending_counter_post_action(
             object_id,
             name,
             enters_attacking,
+            attack_destination,
             source_id,
             controller,
         } => {
@@ -1030,7 +1033,13 @@ fn apply_pending_counter_post_action(
             // replacement-processed counters finish, preserving attacking
             // placement and the normal token ETB events.
             if enters_attacking {
-                crate::game::combat::enter_attacking(state, object_id, source_id, controller);
+                crate::game::combat::enter_attacking_at_destination(
+                    state,
+                    object_id,
+                    source_id,
+                    controller,
+                    &attack_destination,
+                );
             }
             super::token::inject_predefined_token_abilities(state, object_id);
             crate::game::layers::mark_layers_entered(state, object_id);
@@ -1100,6 +1109,7 @@ fn apply_pending_counter_post_action(
             object_id,
             name,
             enters_attacking,
+            attack_destination,
             source_id,
             controller,
             remaining_modifications,
@@ -1109,6 +1119,7 @@ fn apply_pending_counter_post_action(
             object_id,
             name,
             enters_attacking,
+            attack_destination,
             source_id,
             controller,
             remaining_modifications,
@@ -1213,6 +1224,7 @@ fn apply_pending_counter_post_action(
             exile_tracking,
             enters_attacking,
             drain,
+            selected_shuffle_owner,
         } => {
             // CR 614.12a: the delivery tail may surface a Devour as-enters
             // sacrifice `EffectZoneChoice`. On that pause, return `false` so the
@@ -1237,6 +1249,7 @@ fn apply_pending_counter_post_action(
                 // placement is not a shuffle; the tail's auto-shuffle gate is moot
                 // here because this path never delivers to the library.)
                 None,
+                selected_shuffle_owner,
                 events,
             ) {
                 super::change_zone::ZoneDeliveryResult::Done => {
@@ -9161,6 +9174,7 @@ mod tests {
                     source_id,
                     controller: PlayerId(0),
                     enters_attacking: false,
+                    attack_destination: crate::types::ability::EntryAttackDestination::AnyDefender,
                     attach_to: None,
                     sacrifice_at: None,
                     created_ids: Vec::new(),
@@ -9173,6 +9187,7 @@ mod tests {
                     object_id,
                     name: "Saproling".to_string(),
                     enters_attacking: false,
+                    attack_destination: crate::types::ability::EntryAttackDestination::AnyDefender,
                     source_id,
                     controller: PlayerId(0),
                 },
@@ -9192,6 +9207,8 @@ mod tests {
                         object_id,
                         name: "Saproling".to_string(),
                         enters_attacking: false,
+                        attack_destination:
+                            crate::types::ability::EntryAttackDestination::AnyDefender,
                         source_id,
                         controller: PlayerId(0),
                         remaining_modifications: Vec::new(),
@@ -9450,6 +9467,7 @@ mod tests {
                     object_id,
                     name: "Copy Token".to_string(),
                     enters_attacking: false,
+                    attack_destination: crate::types::ability::EntryAttackDestination::AnyDefender,
                     source_id,
                     controller: PlayerId(0),
                 },
@@ -9458,6 +9476,8 @@ mod tests {
                         object_id,
                         name: "Copy Token".to_string(),
                         enters_attacking: false,
+                        attack_destination:
+                            crate::types::ability::EntryAttackDestination::AnyDefender,
                         source_id,
                         controller: PlayerId(0),
                         remaining_modifications: Vec::new(),
