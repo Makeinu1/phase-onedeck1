@@ -2116,6 +2116,7 @@ mod tests {
         events: &[GameEvent],
         observer: ObjectId,
         deferred: bool,
+        expected_revealed_by: Option<AppliedReplacementKey>,
     ) {
         let actual = events
             .iter()
@@ -2141,7 +2142,8 @@ mod tests {
         assert!(observation.completed_for(*object_id, *player_id));
         assert_eq!(observation.subject.zone, Zone::Hand);
         assert_eq!(observation.delivered_to, Some(Zone::Battlefield));
-        assert!(observation.pending_reveal.is_none() && observation.revealed_by.is_none());
+        assert!(observation.pending_reveal.is_none());
+        assert_eq!(observation.revealed_by, expected_revealed_by);
         assert!(events.iter().any(|event| matches!(event, GameEvent::ZoneChanged { from: Some(Zone::Hand), record, .. } if record.trigger_source_context().is_some_and(|context| context.identity.reference == observation.subject.identity))));
         if deferred {
             let context = state
@@ -2403,7 +2405,7 @@ mod tests {
                         1,
                         "{branch}"
                     );
-                    assert_discard_observer_receipt(&state, &events, observer, true);
+                    assert_discard_observer_receipt(&state, &events, observer, true, None);
                     let response = apply_as_current(
                         &mut state,
                         GameAction::SelectCards {
@@ -2436,7 +2438,7 @@ mod tests {
                     assert_eq!(state.stack.len(), 1, "{branch}");
                     assert_eq!(state.stack[0].source_id, observer, "{branch}");
                     assert_eq!(state.stack[0].controller, PlayerId(1), "{branch}");
-                    assert_discard_observer_receipt(&state, &events, observer, false);
+                    assert_discard_observer_receipt(&state, &events, observer, false, None);
                 }
             }
         }
@@ -3808,7 +3810,7 @@ mod tests {
                             AbilityKind::Spell,
                             Effect::GainLife {
                                 amount: QuantityExpr::Fixed { value: 2 },
-                                target: None,
+                                player: TargetFilter::Controller,
                             },
                         );
                         later.optional = true;
@@ -3820,11 +3822,18 @@ mod tests {
                     }
                     let object = state.objects.get_mut(&card).unwrap();
                     object.card_types.core_types.push(CoreType::Artifact);
-                    if selected_pair {
+                    let expected_revealed_by = if selected_pair {
+                        let key = AppliedReplacementKey::object(
+                            card,
+                            object.replacement_definitions.len(),
+                        );
                         object
                             .replacement_definitions
                             .push(shuffle_back_discard_replacement());
-                    }
+                        Some(key)
+                    } else {
+                        None
+                    };
                     object.replacement_definitions.push(redirect);
                     object.replacement_definitions.push(
                         ReplacementDefinition::new(ReplacementEvent::AddCounter)
@@ -4002,7 +4011,13 @@ mod tests {
                         1,
                         "{branch}"
                     );
-                    assert_discard_observer_receipt(&state, &events, grimoire, true);
+                    assert_discard_observer_receipt(
+                        &state,
+                        &events,
+                        grimoire,
+                        true,
+                        expected_revealed_by,
+                    );
                     if selected_pair {
                         use crate::types::game_state::{
                             PendingCounterPostAction, PersistedGameState,
@@ -4240,7 +4255,13 @@ mod tests {
                     );
                     assert_eq!(state.stack[0].source_id, grimoire, "{branch}");
                     assert_eq!(state.stack[0].controller, PlayerId(1), "{branch}");
-                    assert_discard_observer_receipt(&state, &events, grimoire, false);
+                    assert_discard_observer_receipt(
+                        &state,
+                        &events,
+                        grimoire,
+                        false,
+                        expected_revealed_by,
+                    );
                     if selected_pair {
                         assert_eq!(
                             tail_events
