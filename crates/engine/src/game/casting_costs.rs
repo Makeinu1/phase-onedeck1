@@ -24019,23 +24019,6 @@ mod tests {
                         rng_at_pause.outcome_draws(),
                         "{branch}"
                     );
-                    if random {
-                        assert_eq!(
-                            crate::types::identifiers::ObjectIncarnationRef::from_object(
-                                &runner.state().objects[&sibling]
-                            ),
-                            sibling_commit_pin.unwrap(),
-                            "{branch}"
-                        );
-                    } else if runner
-                        .state()
-                        .stack
-                        .iter()
-                        .any(|entry| entry.source_id == spell)
-                    {
-                        sibling_commit_pin =
-                            Some(capture_sibling_commit(runner.state(), &sacrifice_events));
-                    }
                     let surviving_pending = match runner.state().pending_discard_for_cost.as_deref()
                     {
                         Some(
@@ -24048,6 +24031,19 @@ mod tests {
                             .as_deref()
                             .or_else(|| runner.state().waiting_for.pending_cast_ref()),
                     };
+                    if random {
+                        assert_eq!(
+                            crate::types::identifiers::ObjectIncarnationRef::from_object(
+                                &runner.state().objects[&sibling]
+                            ),
+                            sibling_commit_pin.unwrap(),
+                            "{branch}"
+                        );
+                    } else if surviving_pending.is_none() {
+                        assert_eq!(runner.state().objects[&spell].zone, Zone::Stack, "{branch}");
+                        sibling_commit_pin =
+                            Some(capture_sibling_commit(runner.state(), &sacrifice_events));
+                    }
                     let ability = if let Some(pending) = surviving_pending {
                         assert_eq!(pending.object_id, spell, "{branch}");
                         assert_eq!(

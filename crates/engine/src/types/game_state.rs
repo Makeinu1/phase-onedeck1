@@ -14341,6 +14341,113 @@ fn legacy_firing_class_matches(
     legacy_firing_to_canonical(companion).is_ok_and(|companion| *canonical == companion)
 }
 
+/// Check current input before serde can discard legacy companion fields. Unlike
+/// persistence migration, admission never derives a missing canonical carrier.
+fn validate_current_trigger_firing_companions(value: &serde_json::Value) -> Result<(), String> {
+    fn validate(
+        canonical: Option<&serde_json::Value>,
+        carrier: &serde_json::Value,
+        precise_keys: &[&str],
+        carrier_name: &str,
+    ) -> Result<(), String> {
+        let canonical = canonical
+            .filter(|canonical| !canonical.is_null())
+            .ok_or_else(|| format!("{carrier_name} has no firing carrier"))?;
+        if canonical == "UnknownLegacy" {
+            return Err(format!(
+                "{carrier_name} has no canonical trigger firing discriminator"
+            ));
+        }
+        if precise_keys.iter().any(|key| {
+            carrier
+                .get(*key)
+                .is_some_and(|companion| !legacy_firing_class_matches(canonical, companion, false))
+        }) || carrier
+            .get("dispatch_origin")
+            .is_some_and(|companion| !legacy_firing_class_matches(canonical, companion, true))
+        {
+            return Err("pending trigger firing representations disagree".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_continuations(value: &serde_json::Value) -> Result<(), String> {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    validate_continuations(value)?;
+                }
+            }
+            serde_json::Value::Object(object) => {
+                if object.contains_key("chain")
+                    && (object
+                        .get("trigger_context")
+                        .is_some_and(|context| !context.is_null())
+                        || ["firing", "firing_classification", "dispatch_origin"]
+                            .iter()
+                            .any(|key| object.contains_key(*key)))
+                {
+                    validate(
+                        object.get("trigger_firing"),
+                        value,
+                        &["firing", "firing_classification"],
+                        "paused trigger continuation",
+                    )?;
+                }
+                for value in object.values() {
+                    validate_continuations(value)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    if let Some(pending) = value
+        .get("pending_trigger")
+        .filter(|pending| !pending.is_null())
+    {
+        validate(
+            value.get("pending_trigger_firing"),
+            pending,
+            &["firing", "firing_classification"],
+            "pending trigger",
+        )?;
+    }
+    if let Some(contexts) = value
+        .get("deferred_triggers")
+        .and_then(serde_json::Value::as_array)
+    {
+        for context in contexts {
+            validate(
+                context.get("firing"),
+                context,
+                &["firing_classification"],
+                "deferred trigger",
+            )?;
+        }
+    }
+    if let Some(groups) = value
+        .get("pending_trigger_order")
+        .and_then(|order| order.get("groups"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for group in groups {
+            if let Some(contexts) = group.get("triggers").and_then(serde_json::Value::as_array) {
+                for context in contexts {
+                    validate(
+                        context.get("firing"),
+                        context,
+                        &["firing_classification"],
+                        "ordered trigger",
+                    )?;
+                }
+            }
+        }
+    }
+    validate_continuations(value)
+}
+
 /// Upgrade the firing carrier inside every serialized ability-continuation
 /// frame. Resolution-frame envelopes have evolved, but a continuation always
 /// owns both `chain` and `trigger_context`.
@@ -26767,7 +26874,9 @@ impl GameStateDecode {
         reject_legacy_exploit_event_evidence(&value)?;
         reject_legacy_raw_prompt_authority(&value)?;
         reject_legacy_deferred_spell_delivery(&value)?;
-        if !matches!(mode, GameStateDecodeMode::DirectCurrentRaw) {
+        if matches!(mode, GameStateDecodeMode::DirectCurrentRaw) {
+            validate_current_trigger_firing_companions(&value)?;
+        } else {
             migrate_legacy_delayed_trigger_provenance(&mut value)?;
             migrate_legacy_trigger_firing_carriers(
                 &mut value,
@@ -40611,6 +40720,40 @@ mod tests {
                             .as_ref(),
                         Some(&source_context)
                     );
+                    if ingress == 0 {
+                        for unknown in [false, true] {
+                            let mut bad = positive.clone();
+                            let (carrier, key, name) = match placement {
+                                0 => (
+                                    &mut bad["deferred_triggers"][0],
+                                    "firing",
+                                    "deferred trigger",
+                                ),
+                                1 => (
+                                    &mut bad["pending_trigger_order"]["groups"][0]["triggers"][0],
+                                    "firing",
+                                    "ordered trigger",
+                                ),
+                                2 => (&mut bad, "pending_trigger_firing", "pending trigger"),
+                                _ => unreachable!(),
+                            };
+                            if unknown {
+                                carrier[key] = serde_json::json!("UnknownLegacy");
+                            } else {
+                                carrier.as_object_mut().unwrap().remove(key);
+                            }
+                            let error = decode(bad, ingress).unwrap_err();
+                            assert_eq!(
+                                error,
+                                if unknown {
+                                    format!("{name} has no canonical trigger firing discriminator")
+                                } else {
+                                    format!("{name} has no firing carrier")
+                                },
+                                "delayed={delayed} placement={placement} unknown={unknown}"
+                            );
+                        }
+                    }
                     for malformed in 0..if delayed { 5 } else { 1 } {
                         let mut bad = positive.clone();
                         let root = if ingress == 2 {
@@ -40660,10 +40803,15 @@ mod tests {
                         .unwrap()
                         .remove("firing");
                     root["deferred_triggers"][0]["dispatch_origin"] = serde_json::json!("Delayed");
-                    assert_eq!(
-                        decode(legacy, ingress).unwrap().deferred_triggers[0].firing(),
-                        TriggerFiring::LegacyDelayed
-                    );
+                    if ingress == 0 {
+                        let error = decode(legacy, ingress).unwrap_err();
+                        assert_eq!(error, "deferred trigger has no firing carrier");
+                    } else {
+                        assert_eq!(
+                            decode(legacy, ingress).unwrap().deferred_triggers[0].firing(),
+                            TriggerFiring::LegacyDelayed
+                        );
+                    }
                 }
             }
         }
@@ -40673,19 +40821,45 @@ mod tests {
         let precise = serde_json::json!({"ReceiptEligible": origin});
         let good = serde_json::json!({"chain": {}, "trigger_context": {}, "trigger_firing": precise,
             "firing_classification": {"Delayed": origin}, "dispatch_origin": "Delayed"});
+        validate_current_trigger_firing_companions(&good).unwrap();
         let mut positive = good.clone();
         migrate_legacy_continuation_firing(&mut positive, false).unwrap();
         assert_eq!(positive["trigger_firing"], precise);
         for field in ["token", "instance", "source_id"] {
             let mut bad = good.clone();
             bad["firing_classification"]["Delayed"][field] = serde_json::json!(99);
+            assert_eq!(
+                validate_current_trigger_firing_companions(&bad).unwrap_err(),
+                "pending trigger firing representations disagree",
+                "{field}"
+            );
             assert!(
                 migrate_legacy_continuation_firing(&mut bad, false).is_err(),
                 "{field}"
             );
         }
+        for unknown in [false, true] {
+            let mut bad = good.clone();
+            if unknown {
+                bad["trigger_firing"] = serde_json::json!("UnknownLegacy");
+            } else {
+                bad.as_object_mut().unwrap().remove("trigger_firing");
+            }
+            assert_eq!(
+                validate_current_trigger_firing_companions(&bad).unwrap_err(),
+                if unknown {
+                    "paused trigger continuation has no canonical trigger firing discriminator"
+                } else {
+                    "paused trigger continuation has no firing carrier"
+                }
+            );
+        }
         let mut third = good;
         third["firing"] = serde_json::json!("LegacyDelayed");
+        assert_eq!(
+            validate_current_trigger_firing_companions(&third).unwrap_err(),
+            "pending trigger firing representations disagree"
+        );
         assert!(migrate_legacy_continuation_firing(&mut third, false).is_err());
     }
 
@@ -44696,7 +44870,7 @@ mod tests {
         assert!(
             conflict_error
                 .to_string()
-                .contains("deferred trigger dispatch origin disagrees with its firing carrier"),
+                .contains("pending trigger firing representations disagree"),
             "expected strict direct-current conflict rejection, got {conflict_error}"
         );
 
@@ -46875,6 +47049,8 @@ mod tests {
         }
         for delayed in [false, true] {
             let mut state = GameState::new_two_player(42);
+            state.debug_mode = true;
+            state.phase = Phase::PreCombatMain;
             let observer = crate::game::zones::create_object(
                 &mut state,
                 CardId(1),
@@ -46941,17 +47117,15 @@ mod tests {
                     .install_trigger_base_definitions(std::sync::Arc::new(vec![trigger]))
                     .unwrap();
             }
-            let mut events = Vec::new();
-            assert!(matches!(
-                crate::game::effects::discard::discard_caused_by_effect_with_source(
-                    &mut state,
-                    card,
-                    PlayerId(0),
-                    None,
-                    &mut events
+            let events = crate::game::engine::apply(
+                &mut state,
+                PlayerId(0),
+                crate::types::actions::GameAction::Debug(
+                    crate::types::actions::DebugAction::Discard { object_id: card },
                 ),
-                crate::game::effects::discard::DiscardOutcome::Complete
-            ));
+            )
+            .expect("public discard settles ordinary and delayed observers")
+            .events;
             let actual = events
                 .iter()
                 .find(|event| matches!(event, GameEvent::Discarded { .. }))
@@ -46971,7 +47145,6 @@ mod tests {
             assert_eq!(observation.subject.zone, Zone::Hand);
             assert_eq!(observation.delivered_to, Some(Zone::Graveyard));
             assert!(observation.pending_reveal.is_none());
-            crate::game::triggers::process_triggers(&mut state, &events);
             let entry = state
                 .stack
                 .iter()
