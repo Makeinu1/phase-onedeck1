@@ -530,7 +530,7 @@ fn handle_replacement_choice_inner(
     // ZoneChange resume arm below can thread it into the delivery `DeliveryCtx`
     // instead of hardcoding `None` (which would let the tail auto-shuffle the
     // requested position away). `None` for every non-library parked event.
-    let parked_library_placement = state
+    let mut parked_library_placement = state
         .pending_replacement
         .as_ref()
         .and_then(|pending| pending.library_placement.clone());
@@ -676,9 +676,15 @@ fn handle_replacement_choice_inner(
         }
     }
     let result = match discard_observation.as_mut() {
-        Some(observation) => {
-            super::replacement::continue_discard_replacement(state, index, observation, events)
-        }
+        Some(observation) => super::replacement::continue_discard_replacement(
+            state,
+            index,
+            &mut super::replacement::DiscardReplacementContext {
+                observation,
+                library_placement: &mut parked_library_placement,
+            },
+            events,
+        ),
         None => super::replacement::continue_replacement(state, index, events),
     };
     if let Some(observation) = discard_observation.as_ref() {
@@ -1966,13 +1972,9 @@ fn handle_replacement_choice_inner(
             Ok(waiting_for)
         }
         super::replacement::ReplacementResult::NeedsChoice(player) => {
-            // CR 616.1 + CR 701.24a: a SECOND ordering choice on the same
-            // library-placement event re-parked a fresh `PendingReplacement`
-            // inside `pipeline_loop` with `library_placement: None`. Reapply the
-            // placement captured before `continue_replacement` consumed the prior
-            // record so the eventual delivery still honors the requested index
-            // instead of the tail auto-shuffling it away. `None` for every
-            // non-library parked event (no-op).
+            // Retain inherited generic W3 placement if the new park has none.
+            // The discard-aware pipeline already stores its updated selection;
+            // a predecessor None must never overwrite that newly selected value.
             if let Some(pending) = state.pending_replacement.as_mut() {
                 if pending.library_placement.is_none() {
                     pending.library_placement = parked_library_placement.clone();

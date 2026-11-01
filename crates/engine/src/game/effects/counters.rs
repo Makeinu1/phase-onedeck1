@@ -1224,6 +1224,7 @@ fn apply_pending_counter_post_action(
             exile_tracking,
             enters_attacking,
             drain,
+            selected_shuffle_owner,
         } => {
             // CR 614.12a: the delivery tail may surface a Devour as-enters
             // sacrifice `EffectZoneChoice`. On that pause, return `false` so the
@@ -1248,6 +1249,7 @@ fn apply_pending_counter_post_action(
                 // placement is not a shuffle; the tail's auto-shuffle gate is moot
                 // here because this path never delivers to the library.)
                 None,
+                selected_shuffle_owner,
                 events,
             ) {
                 super::change_zone::ZoneDeliveryResult::Done => {

@@ -2014,6 +2014,7 @@ fn append_zone_delivery_tail_after_counter_pause(
     exile_tracking: ZoneDeliveryExileTracking,
     drain: PostReplacementDrainOwner,
     enters_attacking: bool,
+    selected_shuffle_owner: Option<PlayerId>,
     clear_pending_etb_counters: Option<ObjectId>,
 ) -> ZoneDeliveryResult {
     let mut actions = Vec::new();
@@ -2031,6 +2032,7 @@ fn append_zone_delivery_tail_after_counter_pause(
         exile_tracking,
         drain,
         enters_attacking,
+        selected_shuffle_owner,
     });
     crate::game::effects::counters::append_pending_counter_post_actions(state, actions);
     replacement_pause_delivery_result(state)
@@ -2057,6 +2059,7 @@ pub(crate) fn apply_zone_delivery_tail(
     // bear no enters-with counters and never enter the battlefield, so they
     // never reach the counter-replacement pause that re-enters this tail.
     library_placement: Option<&LibraryPosition>,
+    selected_shuffle_owner: Option<PlayerId>,
     events: &mut Vec<GameEvent>,
 ) -> ZoneDeliveryResult {
     // CR 701.24a: To shuffle a library, randomize the cards within it so that
@@ -2066,7 +2069,20 @@ pub(crate) fn apply_zone_delivery_tail(
     // `library_placement` was honored by the move above. (CR 701.24g — shuffle and
     // placement instructed simultaneously, shuffle-with-object-pinned — is a
     // different case that does not arise here.)
-    if to == Zone::Library && library_placement.is_none() {
+    // CR 701.24c + CR 701.24e: the selected owner-Shuffle remains owed
+    // after redirection or an impossible move, including a zero/one-card library.
+    if let Some(owner) = selected_shuffle_owner {
+        let instruction = crate::types::ability::ResolvedAbility::new(
+            crate::types::ability::Effect::Shuffle {
+                target: crate::types::ability::TargetFilter::Controller,
+            },
+            vec![],
+            object_id,
+            owner,
+        );
+        crate::game::effects::shuffle::resolve(state, &instruction, events)
+            .expect("validated selected shuffle owner exists and Shuffle cannot pause");
+    } else if to == Zone::Library && library_placement.is_none() {
         let owner = state.objects.get(&object_id).map(|o| o.owner);
         if let Some(owner) = owner {
             shuffle_library(state, owner, events);
@@ -3795,6 +3811,7 @@ fn deliver_replaced_zone_change_impl(
                     exile_tracking,
                     drain,
                     library_placement.as_ref(),
+                    None,
                     events,
                 ),
                 BatchMoveResult::NeedsChoice => replacement_pause_delivery_result(state),
@@ -3925,6 +3942,7 @@ fn deliver_replaced_zone_change_impl(
             };
         let mut observation = observation.or(frame_observation.as_mut());
         let discard_delivery_start = events.len();
+        let mut selected_shuffle_owner = None;
         if let Some(observation) = observation.as_deref_mut() {
             let pin = observation.subject.identity;
             assert!(
@@ -3946,7 +3964,12 @@ fn deliver_replaced_zone_change_impl(
             // below can authorize Discarded/count publication.
             if let Some(bound) = observation.pending_reveal.take() {
                 assert!(
-                    applied.contains(&bound.replacement),
+                    applied.contains(&bound.replacement)
+                        && bound.shuffle_owner == observation.subject.owner
+                        && state
+                            .players
+                            .iter()
+                            .any(|player| player.id == bound.shuffle_owner),
                     "discard reveal must belong to this applied replacement"
                 );
                 let instruction = crate::types::ability::ResolvedAbility::new(
@@ -3962,6 +3985,7 @@ fn deliver_replaced_zone_change_impl(
                     .expect("validated SelfRef reveal has no error or choice path");
                 assert!(events[reveal_start..].iter().any(|event| matches!(event, GameEvent::CardsRevealed { card_ids, .. } if card_ids == &[object_id])), "actual reveal names the original discard subject");
                 observation.revealed_by = Some(bound.replacement);
+                selected_shuffle_owner = Some(bound.shuffle_owner);
             }
         }
         let face_down_preflight = to == Zone::Battlefield && face_down_profile.is_some();
@@ -4402,6 +4426,7 @@ fn deliver_replaced_zone_change_impl(
                     exile_tracking,
                     drain,
                     enters_attacking,
+                    selected_shuffle_owner,
                     pending_etb_cleanup,
                 );
             }
@@ -4440,6 +4465,7 @@ fn deliver_replaced_zone_change_impl(
                     exile_tracking,
                     drain,
                     enters_attacking,
+                    selected_shuffle_owner,
                     None,
                 );
             }
@@ -4456,6 +4482,7 @@ fn deliver_replaced_zone_change_impl(
             exile_tracking,
             drain,
             library_placement.as_ref(),
+            selected_shuffle_owner,
             events,
         );
         if matches!(result, ZoneDeliveryResult::Done) && enters_attacking && entered_battlefield {
@@ -6088,6 +6115,278 @@ mod w3_library_placement_tests {
     /// placement to `None`, so the final delivery shuffled — the order assertion
     /// below fails (and the `ShuffledLibrary` absence assertion guards against a
     /// seed-identity permutation false-pass).
+    #[test]
+    fn selected_discard_placement_keeps_its_exact_suffix_and_first_hidden_receipt() {
+        use crate::game::game_object::ObjectIncarnationRefExt;
+        use crate::game::scenario::GameScenario;
+        use crate::game::scenario_db::GameScenarioDbExt;
+        use crate::types::actions::{DebugAction, GameAction};
+        use crate::types::identifiers::ObjectIncarnationRef;
+        let db = crate::test_support::shared_card_db();
+        let mut scenario = GameScenario::new_n_player(2, 42);
+        scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+        let card = scenario.add_real_card(PlayerId(0), "Grizzly Bears", Zone::Hand, db);
+        let generic = scenario.add_real_card(PlayerId(1), "Geth's Grimoire", Zone::Battlefield, db);
+        let typed = scenario.add_real_card(PlayerId(1), "Waste Not", Zone::Battlefield, db);
+        scenario.add_real_card(PlayerId(0), "Swamp", Zone::Library, db);
+        scenario.add_real_card(PlayerId(0), "Opt", Zone::Library, db);
+        let mut state = scenario.build().state().clone();
+        state.debug_mode = true;
+        let host = create_object(
+            &mut state,
+            CardId(701),
+            PlayerId(0),
+            "Mandatory selected parent placement".into(),
+            Zone::Battlefield,
+        );
+        let mut definition = db.face_index["library of leng"].replacements[0].clone();
+        definition.mode = ReplacementMode::Mandatory;
+        let mut suffix = optional_zone_redirect(Zone::Library, Zone::Exile)
+            .execute
+            .unwrap();
+        if let Effect::ChangeZone { target, .. } = suffix.effect.as_mut() {
+            *target = TargetFilter::SelfRef;
+        }
+        definition.execute.as_deref_mut().unwrap().sub_ability = Some(suffix);
+        state
+            .objects
+            .get_mut(&host)
+            .unwrap()
+            .replacement_definitions
+            .push(definition);
+        let original = ObjectIncarnationRef::from_object(&state.objects[&card]);
+        let rng = state.rng.clone();
+        let result = crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::Debug(DebugAction::Discard { object_id: card }),
+        )
+        .unwrap();
+        assert_eq!(
+            state.objects[&card].zone,
+            Zone::Exile,
+            "the ordinary suffix is retained and really executes"
+        );
+        let first = result.events.iter().position(|event| matches!(event,
+            GameEvent::ZoneChanged { object_id, from: Some(Zone::Hand), to: Zone::Library, record }
+                if *object_id == card && record.trigger_source_context().is_some_and(|context| context.identity.reference == original)
+        )).unwrap();
+        let later = result.events.iter().position(|event| matches!(event,
+            GameEvent::ZoneChanged { object_id, from: Some(Zone::Library), to: Zone::Exile, .. } if *object_id == card
+        )).unwrap();
+        assert!(first < later);
+        assert_eq!(result.events.iter().filter(|event| matches!(event,
+            GameEvent::ZoneChanged { object_id, from: Some(Zone::Library), to: Zone::Exile, .. } if *object_id == card
+        )).count(), 1);
+        let event = result
+            .events
+            .iter()
+            .find(|event| matches!(event, GameEvent::Discarded { .. }))
+            .unwrap();
+        assert!(
+            matches!(event, GameEvent::Discarded { object_id, player_id: PlayerId(0), source_id: None, observation: Some(observation) }
+            if *object_id == card && observation.subject.identity == original && observation.delivered_to == Some(Zone::Library)
+                && observation.revealed_by.is_none() && observation.pending_reveal.is_none())
+        );
+        assert_eq!(state.cards_discarded_this_turn_by_player[&PlayerId(0)], 1);
+        assert_eq!(
+            state
+                .stack
+                .iter()
+                .filter(|entry| entry.source_id == generic)
+                .count(),
+            1
+        );
+        assert!(
+            !state.stack.iter().any(|entry| entry.source_id == typed),
+            "the later public zone never replaces the first hidden receipt"
+        );
+        let retained = state
+            .stack
+            .iter()
+            .find(|entry| entry.source_id == generic)
+            .unwrap();
+        let crate::types::game_state::StackEntryKind::TriggeredAbility {
+            trigger_event: Some(retained),
+            ..
+        } = &retained.kind
+        else {
+            panic!("generic observer retains the occurrence")
+        };
+        assert_eq!(retained, event);
+        assert_eq!(state.rng.get_word_pos(), rng.get_word_pos());
+        assert!(matches!(result.waiting_for, WaitingFor::Priority { .. }));
+        assert!(state.resolution_stack.is_empty());
+    }
+
+    #[test]
+    fn selected_discard_top_placement_survives_ordering_optional_and_all_restore_ingresses() {
+        use crate::game::game_object::ObjectIncarnationRefExt;
+        use crate::game::scenario::GameScenario;
+        use crate::game::scenario_db::GameScenarioDbExt;
+        use crate::types::actions::{DebugAction, GameAction};
+        use crate::types::game_state::PersistedGameState;
+        use crate::types::identifiers::ObjectIncarnationRef;
+        let db = crate::test_support::shared_card_db();
+        let mut scenario = GameScenario::new_n_player(2, 42);
+        scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+        scenario.add_real_card(PlayerId(0), "Library of Leng", Zone::Battlefield, db);
+        let card = scenario.add_real_card(PlayerId(0), "Grizzly Bears", Zone::Hand, db);
+        for name in ["Swamp", "Opt", "Forest"] {
+            scenario.add_real_card(PlayerId(0), name, Zone::Library, db);
+        }
+        let mut state = scenario.build().state().clone();
+        state.debug_mode = true;
+        for destination in [Zone::Exile, Zone::Graveyard] {
+            let host = create_object(
+                &mut state,
+                CardId(700),
+                PlayerId(0),
+                format!("Later {destination:?} choice"),
+                Zone::Battlefield,
+            );
+            state
+                .objects
+                .get_mut(&host)
+                .unwrap()
+                .replacement_definitions
+                .push(optional_zone_redirect(Zone::Library, destination));
+        }
+        let original = ObjectIncarnationRef::from_object(&state.objects[&card]);
+        let initial = crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::Debug(DebugAction::Discard { object_id: card }),
+        )
+        .unwrap();
+        assert!(matches!(
+            initial.waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        assert!(state
+            .pending_replacement
+            .as_ref()
+            .unwrap()
+            .library_placement
+            .is_none());
+        let selected = crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::ChooseReplacement { index: 0 },
+        )
+        .unwrap();
+        assert!(selected.events.iter().all(|event| !matches!(
+            event,
+            GameEvent::Discarded { .. }
+                | GameEvent::ZoneChanged {
+                    from: Some(Zone::Hand),
+                    ..
+                }
+        )));
+        assert_eq!(state.objects[&card].zone, Zone::Hand);
+        assert!(!state.pending_replacement.as_ref().unwrap().is_optional);
+        assert_eq!(
+            state.pending_replacement.as_ref().unwrap().candidates.len(),
+            2
+        );
+        assert_eq!(
+            state
+                .pending_replacement
+                .as_ref()
+                .unwrap()
+                .library_placement,
+            Some(LibraryPosition::Top)
+        );
+        for ingress in 0..3 {
+            let mut restored = state.clone();
+            let rng = restored.rng.clone();
+            let mut events = Vec::new();
+            for (step, answer) in [0, 1, 1].into_iter().enumerate() {
+                let encoded = match ingress {
+                    0 => serde_json::to_value(&restored).unwrap(),
+                    1 => serde_json::to_value(PersistedGameState::Raw(Box::new(restored.clone())))
+                        .unwrap(),
+                    2 => {
+                        serde_json::to_value(PersistedGameState::capture(restored.clone())).unwrap()
+                    }
+                    _ => unreachable!(),
+                };
+                restored = if ingress == 0 {
+                    serde_json::from_value(encoded).unwrap()
+                } else {
+                    serde_json::from_value::<PersistedGameState>(encoded)
+                        .unwrap()
+                        .into_game_state()
+                        .unwrap()
+                };
+                let pending = restored.pending_replacement.as_ref().unwrap();
+                assert_eq!(
+                    pending.library_placement,
+                    Some(LibraryPosition::Top),
+                    "ingress={ingress} step={step}"
+                );
+                assert_eq!(
+                    pending
+                        .discard_provenance
+                        .as_deref()
+                        .unwrap()
+                        .observation
+                        .as_deref()
+                        .unwrap()
+                        .subject
+                        .identity,
+                    original
+                );
+                assert!(original.is_current(&restored));
+                for projected in [
+                    crate::game::visibility::filter_state_for_viewer(&restored, PlayerId(0)),
+                    crate::game::visibility::filter_state_for_viewer(&restored, PlayerId(1)),
+                    crate::game::visibility::filter_state_for_unseated_viewer(&restored),
+                ] {
+                    assert!(projected
+                        .pending_replacement
+                        .as_ref()
+                        .and_then(|pending| pending.discard_provenance.as_deref())
+                        .is_none_or(|provenance| provenance.observation.is_none()));
+                }
+                events.extend(
+                    crate::game::engine::apply_as_current(
+                        &mut restored,
+                        GameAction::ChooseReplacement { index: answer },
+                    )
+                    .unwrap()
+                    .events,
+                );
+                if step != 2 {
+                    assert!(matches!(
+                        restored.waiting_for,
+                        WaitingFor::ReplacementChoice { .. }
+                    ));
+                    assert_eq!(restored.objects[&card].zone, Zone::Hand);
+                }
+            }
+            assert_eq!(restored.library_of(PlayerId(0)).front(), Some(&card));
+            assert_eq!(restored.rng.get_word_pos(), rng.get_word_pos());
+            assert_eq!(restored.rng.outcome_draws(), rng.outcome_draws());
+            assert_eq!(events.iter().filter(|event| matches!(event, GameEvent::ZoneChanged {
+                object_id, from: Some(Zone::Hand), to: Zone::Library, record,
+            } if *object_id == card && record.trigger_source_context().is_some_and(|context| context.identity.reference == original))).count(), 1);
+            assert!(!events.iter().any(|event| matches!(event, GameEvent::ZoneChanged { object_id, to: Zone::Graveyard, .. } if *object_id == card)));
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                GameEvent::PlayerPerformedAction {
+                    action: crate::types::events::PlayerActionKind::ShuffledLibrary,
+                    ..
+                }
+            )));
+            assert_eq!(events.iter().filter(|event| matches!(event, GameEvent::Discarded { object_id, player_id: PlayerId(0), source_id: None, observation: Some(observation) }
+                if *object_id == card && observation.subject.identity == original && observation.delivered_to == Some(Zone::Library))).count(), 1);
+            assert_eq!(
+                restored.cards_discarded_this_turn_by_player[&PlayerId(0)],
+                1
+            );
+            assert!(matches!(restored.waiting_for, WaitingFor::Priority { .. }));
+            assert!(restored.resolution_stack.is_empty());
+        }
+    }
+
     #[test]
     fn library_placement_survives_two_sequential_parks() {
         use crate::game::engine::apply_as_current;

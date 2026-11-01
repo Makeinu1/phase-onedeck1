@@ -1002,7 +1002,7 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                     );
                     // Current non-order snapshots retain the exact subtree in all decode ingresses.
                     for ingress in 0..3 {
-                        let restored = if ingress == 0 {
+                        let mut restored = if ingress == 0 {
                             serde_json::from_value::<engine::types::game_state::GameState>(
                                 serde_json::to_value(runner.state()).unwrap(),
                             )
@@ -1029,6 +1029,113 @@ fn non_order_discard_batches_finish_each_pick_fanout_and_following_draw() {
                             batch.delivery_subtree,
                             "{branch}"
                         );
+                        if delayed && mode.is_none() && index == 0 {
+                            let original_wire = serde_json::to_value(runner.state()).unwrap();
+                            let restored_wire = serde_json::to_value(&restored).unwrap();
+                            let precise = &original_wire["deferred_triggers"][0]["firing"];
+                            assert!(
+                                precise["ReceiptEligible"]["token"]
+                                    .as_u64()
+                                    .is_some_and(|token| token > 0),
+                                "{branch}"
+                            );
+                            assert!(
+                                precise["ReceiptEligible"]["instance"]
+                                    .as_u64()
+                                    .is_some_and(|instance| instance > 0),
+                                "{branch}"
+                            );
+                            assert_eq!(
+                                precise["ReceiptEligible"]["source_id"],
+                                serde_json::to_value(observer).unwrap(),
+                                "{branch}"
+                            );
+                            assert_eq!(
+                                &restored_wire["deferred_triggers"][0]["firing"], precise,
+                                "{branch} ingress={ingress}"
+                            );
+                            assert_eq!(
+                                restored.deferred_triggers[0].pending.ability.trigger_source,
+                                runner.state().deferred_triggers[0]
+                                    .pending
+                                    .ability
+                                    .trigger_source,
+                                "{branch}"
+                            );
+                            let actual_source = restored.deferred_triggers[0]
+                                .pending
+                                .ability
+                                .trigger_source
+                                .as_ref()
+                                .unwrap();
+                            assert_eq!(
+                                actual_source.identity.reference,
+                                engine::types::identifiers::ObjectIncarnationRef::from_object(
+                                    &runner.state().objects[&observer]
+                                ),
+                                "{branch}"
+                            );
+                            assert_eq!(actual_source.lki.controller, P1, "{branch}");
+                            apply(
+                                &mut restored,
+                                P0,
+                                GameAction::SelectCards {
+                                    cards: vec![*expected],
+                                },
+                            )
+                            .unwrap();
+                            if optional {
+                                assert!(
+                                    matches!(
+                                        restored.waiting_for,
+                                        WaitingFor::ReplacementChoice { player: P0, .. }
+                                    ),
+                                    "{branch}"
+                                );
+                                apply(
+                                    &mut restored,
+                                    P0,
+                                    GameAction::ChooseReplacement { index: 0 },
+                                )
+                                .unwrap();
+                            }
+                            assert!(
+                                matches!(
+                                    restored.waiting_for,
+                                    WaitingFor::EffectZoneChoice { player: P0, .. }
+                                ),
+                                "{branch}"
+                            );
+                            apply(&mut restored, P0, GameAction::SelectCards { cards: vec![] })
+                                .unwrap();
+                            assert!(
+                                matches!(restored.waiting_for, WaitingFor::Priority { .. }),
+                                "{branch} ingress={ingress}"
+                            );
+                            assert!(
+                                restored.pending_discard_batch.is_none()
+                                    && restored.resolution_stack.is_empty()
+                            );
+                            assert_eq!(restored.cards_discarded_this_turn_by_player[&P0], 2);
+                            assert_eq!(restored.cards_discarded_this_turn_by_player[&P1], 1);
+                            assert_eq!(restored.players[0].library.len(), LIBRARY_DEPTH - 2);
+                            assert_eq!(restored.players[1].library.len(), LIBRARY_DEPTH - 2);
+                            assert_eq!(
+                                restored
+                                    .stack
+                                    .iter()
+                                    .filter(|entry| entry.source_id == observer
+                                        && entry.controller == P1)
+                                    .count(),
+                                1
+                            );
+                            let completed_wire = serde_json::to_value(&restored).unwrap();
+                            assert!(completed_wire["stack_trigger_firings"]
+                                .as_object()
+                                .unwrap()
+                                .values()
+                                .any(|value| value == precise));
+                        }
                     }
                     events.extend(
                         apply(
@@ -1412,9 +1519,15 @@ fn discard_delivery_restore_normalizes_only_initial_legacy_authority_and_admissi
                 6 => bad.replacement_may_cost_paused = true,
                 _ => unreachable!(),
             }
-            assert!(decode(encoded(&bad))
-                .unwrap_err()
-                .contains("pending discard batch lacks recoverable delivery subtree authority"));
+            let expected_error = if matches!(malformed, 0 | 2) {
+                "pending discard lacks observation authority"
+            } else {
+                "pending discard batch lacks recoverable delivery subtree authority"
+            };
+            assert!(
+                decode(encoded(&bad)).unwrap_err().contains(expected_error),
+                "malformed={malformed}: expected {expected_error}"
+            );
         }
     }
     for simulation in [false, true] {

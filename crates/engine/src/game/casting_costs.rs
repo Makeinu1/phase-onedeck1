@@ -23642,19 +23642,21 @@ mod tests {
                         &runner.state().objects[&sibling],
                     );
                     let sibling_lki = runner.state().objects[&sibling].snapshot_for_mana_spent();
-                    let sibling_arrival = |events: &[GameEvent]| {
-                        events.iter().find_map(|event| match event {
-                            GameEvent::ZoneChanged {
-                                object_id, record, ..
-                            } if *object_id == sibling
-                                && record.trigger_source_context().is_some_and(|context| {
-                                    context.identity.reference == sibling_pin
-                                }) =>
-                            {
-                                record.entered_incarnation
-                            }
-                            _ => None,
-                        })
+                    let capture_sibling_commit = |state: &GameState, events: &[GameEvent]| {
+                        assert_eq!(events.iter().filter(|event| matches!(event,
+                            GameEvent::ZoneChanged { object_id, record, .. }
+                                if *object_id == sibling && record.from_zone == Some(Zone::Battlefield)
+                                    && record.to_zone == Zone::Graveyard
+                                    && record.trigger_source_context().is_some_and(|context| context.identity.reference == sibling_pin)
+                        )).count(), 1, "{branch}: exact original sibling departure");
+                        assert_eq!(events.iter().filter(|event| matches!(event,
+                            GameEvent::PermanentSacrificed { object_id, .. } if *object_id == sibling
+                        )).count(), 1, "{branch}");
+                        assert!(!sibling_pin.is_current(state), "{branch}");
+                        assert_eq!(state.objects[&sibling].zone, Zone::Graveyard, "{branch}");
+                        crate::types::identifiers::ObjectIncarnationRef::from_object(
+                            &state.objects[&sibling],
+                        )
                     };
                     let mut expected_rng = runner.state().rng.clone();
                     let mut pool = originals.to_vec();
@@ -23766,6 +23768,8 @@ mod tests {
                         "{branch}"
                     );
                     assert_eq!(sibling_pin.is_current(runner.state()), !random, "{branch}");
+                    let mut sibling_commit_pin =
+                        random.then(|| capture_sibling_commit(runner.state(), &sacrifice_events));
                     if !random {
                         assert!(
                             matches!(
@@ -23834,8 +23838,16 @@ mod tests {
                             "{branch}"
                         );
                         assert_eq!(sacrifice_events.iter().filter(|event| matches!(event, GameEvent::PermanentSacrificed { object_id, .. } if *object_id == sibling)).count(), 1, "{branch}");
-                        let arrival = sibling_arrival(&sacrifice_events)
-                            .expect("actual sibling departure supplies its committed incarnation");
+                        let arrival = *sibling_commit_pin.get_or_insert_with(|| {
+                            capture_sibling_commit(runner.state(), &sacrifice_events)
+                        });
+                        assert_eq!(
+                            crate::types::identifiers::ObjectIncarnationRef::from_object(
+                                &runner.state().objects[&sibling]
+                            ),
+                            arrival,
+                            "{branch}"
+                        );
                         let committed = runner.state().stack[0]
                             .ability()
                             .unwrap()
@@ -23845,11 +23857,11 @@ mod tests {
                             .unwrap()
                             .snapshot()
                             .unwrap();
-                        assert_eq!(committed.incarnation, arrival, "{branch}");
+                        assert_eq!(committed.incarnation, arrival.incarnation, "{branch}");
                         assert_eq!(committed.lki, sibling_lki, "{branch}");
                         assert_eq!(
                             runner.state().objects[&sibling].incarnation,
-                            arrival,
+                            arrival.incarnation,
                             "{branch}"
                         );
                         continue;
@@ -23946,8 +23958,9 @@ mod tests {
                             .expect("selected cost snapshot")
                             .incarnation,
                         if random {
-                            sibling_arrival(&sacrifice_events)
-                                .expect("random route has committed its sibling sacrifice")
+                            sibling_commit_pin
+                                .expect("random route captured its actual committed pin")
+                                .incarnation
                         } else {
                             sibling_pin.incarnation
                         },
@@ -24006,6 +24019,23 @@ mod tests {
                         rng_at_pause.outcome_draws(),
                         "{branch}"
                     );
+                    if random {
+                        assert_eq!(
+                            crate::types::identifiers::ObjectIncarnationRef::from_object(
+                                &runner.state().objects[&sibling]
+                            ),
+                            sibling_commit_pin.unwrap(),
+                            "{branch}"
+                        );
+                    } else if runner
+                        .state()
+                        .stack
+                        .iter()
+                        .any(|entry| entry.source_id == spell)
+                    {
+                        sibling_commit_pin =
+                            Some(capture_sibling_commit(runner.state(), &sacrifice_events));
+                    }
                     let surviving_pending = match runner.state().pending_discard_for_cost.as_deref()
                     {
                         Some(
@@ -24079,8 +24109,7 @@ mod tests {
                     assert_eq!(
                         retained.incarnation,
                         if surviving_pending.is_none() || random {
-                            sibling_arrival(&sacrifice_events)
-                                .expect("committed sibling re-pin must come from its actual move")
+                            sibling_commit_pin.expect("committed sibling pin was captured at the public commit boundary").incarnation
                         } else {
                             sibling_pin.incarnation
                         },

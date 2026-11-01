@@ -3612,13 +3612,23 @@ impl ResolutionStack {
         self.frames.iter().any(|frame| match frame {
             ResolutionFrame::ChangeZone(_) | ResolutionFrame::BatchDelivery(_) => true,
             ResolutionFrame::Discard(frame) => frame.observation.is_some(),
+            ResolutionFrame::CounterAdditions(frame) => {
+                frame.completion.as_ref().is_some_and(|completion| {
+                    completion.post_actions.iter().any(|action| {
+                        matches!(action,
+                    crate::types::game_state::PendingCounterPostAction::ContinueZoneDeliveryTail {
+                        selected_shuffle_owner: Some(_), ..
+                    }
+                )
+                    })
+                })
+            }
             ResolutionFrame::AbilityContinuation(_)
             | ResolutionFrame::RepeatFor(_)
             | ResolutionFrame::RepeatUntil(_)
             | ResolutionFrame::RepeatedOptionalPayment(_)
             | ResolutionFrame::CounterMoves(_)
             | ResolutionFrame::CounterRemovals(_)
-            | ResolutionFrame::CounterAdditions(_)
             | ResolutionFrame::CopyToken(_)
             | ResolutionFrame::DebugCardEntries(_)
             | ResolutionFrame::EachPlayerCopyChosen(_)

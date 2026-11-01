@@ -7886,6 +7886,9 @@ pub enum PendingCounterPostAction {
     },
     ContinueZoneDeliveryTail {
         object_id: ObjectId,
+        /// Selected owner-Shuffle owed by this exact discard delivery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_shuffle_owner: Option<PlayerId>,
         from: Zone,
         to: Zone,
         cause: Option<ObjectId>,
@@ -14097,90 +14100,83 @@ pub(crate) fn migrate_legacy_trigger_firing_carriers(
         if !context.contains_key("pending") {
             return Err("persisted pending trigger context has no pending trigger".to_string());
         }
-        let canonical = context
-            .get("firing")
+        let precise = ["firing", "firing_classification"]
+            .into_iter()
+            .filter_map(|key| context.get(key))
+            .map(legacy_firing_to_canonical)
+            .collect::<Result<Vec<_>, _>>()?;
+        let dispatch = context.get("dispatch_origin");
+        let canonical = precise
+            .first()
             .cloned()
+            .or_else(|| dispatch.cloned())
             .map(|value| legacy_firing_to_canonical(&value))
-            .transpose()?;
-        let legacy = context
-            .remove("firing_classification")
-            .or_else(|| context.get("dispatch_origin").cloned());
-        match (canonical, legacy) {
-            (Some(canonical), Some(legacy)) => {
-                let legacy = legacy_firing_to_canonical(&legacy)?;
-                if !legacy_firing_class_matches(&canonical, &legacy) {
-                    return Err("pending trigger firing representations disagree".to_string());
-                }
-                context.insert("firing".to_string(), canonical);
-            }
-            (Some(canonical), None) => {
-                context.insert("firing".to_string(), canonical);
-            }
-            (None, Some(legacy)) => {
-                context.insert("firing".to_string(), legacy_firing_to_canonical(&legacy)?);
-            }
-            // `dispatch_origin: Normal` was omitted by its historical serde
-            // default. An absent classifier therefore proves this was an
-            // ordinary trigger, rather than an ambiguous delayed identity.
-            (None, None) => {
-                context.insert(
-                    "firing".to_string(),
-                    serde_json::Value::String("Ordinary".to_string()),
-                );
-            }
+            .transpose()?
+            .unwrap_or_else(|| serde_json::json!("Ordinary"));
+        if precise
+            .iter()
+            .any(|companion| !legacy_firing_class_matches(&canonical, companion, false))
+            || dispatch
+                .is_some_and(|companion| !legacy_firing_class_matches(&canonical, companion, true))
+        {
+            return Err("pending trigger firing representations disagree".to_string());
         }
+        context.remove("firing_classification");
+        context.insert("firing".to_string(), canonical);
         Ok(())
     };
 
     if let Some(pending) = state.get_mut("pending_trigger") {
         if !pending.is_null() {
-            let legacy = {
-                let pending = pending
-                    .as_object_mut()
-                    .ok_or_else(|| "persisted pending trigger must be an object".to_string())?;
-                pending
-                    .remove("firing")
-                    .or_else(|| pending.remove("firing_classification"))
-                    .or_else(|| pending.remove("dispatch_origin"))
-            };
-            let canonical = state
-                .get("pending_trigger_firing")
+            let pending = pending
+                .as_object()
+                .ok_or_else(|| "persisted pending trigger must be an object".to_string())?;
+            let mut precise = ["firing", "firing_classification"]
+                .into_iter()
+                .filter_map(|key| pending.get(key))
                 .cloned()
+                .collect::<Vec<_>>();
+            let dispatch = pending.get("dispatch_origin").cloned();
+            if let Some(firing) = state.get("pending_trigger_firing") {
+                precise.insert(0, firing.clone());
+            }
+            let precise = precise
+                .iter()
+                .map(legacy_firing_to_canonical)
+                .collect::<Result<Vec<_>, _>>()?;
+            let canonical = precise
+                .first()
+                .cloned()
+                .or_else(|| dispatch.clone())
                 .map(|value| legacy_firing_to_canonical(&value))
                 .transpose()?;
-            match (canonical, legacy) {
-                (Some(canonical), Some(legacy)) => {
-                    let legacy = legacy_firing_to_canonical(&legacy)?;
-                    if !legacy_firing_class_matches(&canonical, &legacy) {
-                        return Err("pending trigger firing representations disagree".to_string());
-                    }
-                    state.insert("pending_trigger_firing".to_string(), canonical);
+            let canonical = match canonical {
+                Some(canonical) => canonical,
+                None if allow_unlabeled_v1_carriers => serde_json::json!("LegacyDelayed"),
+                None => {
+                    return Err(
+                        "active legacy pending trigger has no firing discriminator".to_string()
+                    )
                 }
-                (Some(canonical), None) => {
-                    state.insert("pending_trigger_firing".to_string(), canonical);
-                }
-                (None, Some(legacy)) => {
-                    state.insert(
-                        "pending_trigger_firing".to_string(),
-                        legacy_firing_to_canonical(&legacy)?,
-                    );
-                }
-                // CR 603.7: an unlabelled v1 active trigger may have been
-                // delayed, so preserve it as a non-receipt-eligible legacy
-                // firing rather than inventing ordinary or receipt identity.
-                (None, None) => {
-                    if allow_unlabeled_v1_carriers {
-                        state.insert(
-                            "pending_trigger_firing".to_string(),
-                            serde_json::Value::String("LegacyDelayed".to_string()),
-                        );
-                    } else {
-                        return Err(
-                            "active legacy pending trigger has no firing discriminator".to_string()
-                        );
-                    }
-                }
+            };
+            if precise
+                .iter()
+                .any(|companion| !legacy_firing_class_matches(&canonical, companion, false))
+                || dispatch.as_ref().is_some_and(|companion| {
+                    !legacy_firing_class_matches(&canonical, companion, true)
+                })
+            {
+                return Err("pending trigger firing representations disagree".to_string());
             }
+            let pending = state
+                .get_mut("pending_trigger")
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            for key in ["firing", "firing_classification", "dispatch_origin"] {
+                pending.remove(key);
+            }
+            state.insert("pending_trigger_firing".to_string(), canonical);
         }
     }
     if let Some(contexts) = state
@@ -14329,16 +14325,20 @@ fn legacy_firing_to_canonical(value: &serde_json::Value) -> Result<serde_json::V
     Err("unknown legacy trigger firing discriminator".to_string())
 }
 
-fn legacy_firing_class_matches(canonical: &serde_json::Value, legacy: &serde_json::Value) -> bool {
-    match (canonical, legacy) {
-        (serde_json::Value::String(canonical), serde_json::Value::String(legacy)) => {
-            canonical == legacy
-        }
-        (serde_json::Value::Object(canonical), serde_json::Value::Object(legacy)) => {
-            canonical.contains_key("ReceiptEligible") && legacy.contains_key("ReceiptEligible")
-        }
-        _ => false,
+fn legacy_firing_class_matches(
+    canonical: &serde_json::Value,
+    companion: &serde_json::Value,
+    dispatch_origin: bool,
+) -> bool {
+    // Only the historical dispatch classifier lacks an occurrence identity.
+    // Every precise representation must agree on the complete canonical origin.
+    if dispatch_origin && companion == "Normal" {
+        return canonical == "Ordinary";
     }
+    if dispatch_origin && companion == "Delayed" {
+        return canonical == "LegacyDelayed" || canonical.get("ReceiptEligible").is_some();
+    }
+    legacy_firing_to_canonical(companion).is_ok_and(|companion| *canonical == companion)
 }
 
 /// Upgrade the firing carrier inside every serialized ability-continuation
@@ -14358,48 +14358,45 @@ fn migrate_legacy_continuation_firing(
             if object.contains_key("chain")
                 && (object.contains_key("trigger_context")
                     || object.contains_key("trigger_firing")
+                    || object.contains_key("firing")
                     || object.contains_key("firing_classification")
                     || object.contains_key("dispatch_origin"))
             {
-                let canonical = object
-                    .get("trigger_firing")
+                let precise = ["trigger_firing", "firing", "firing_classification"]
+                    .into_iter()
+                    .filter_map(|key| object.get(key))
+                    .map(legacy_firing_to_canonical)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let dispatch = object.get("dispatch_origin");
+                let canonical = precise
+                    .first()
                     .cloned()
+                    .or_else(|| dispatch.cloned())
                     .map(|value| legacy_firing_to_canonical(&value))
                     .transpose()?;
-                let legacy = object
-                    .remove("firing_classification")
-                    .or_else(|| object.remove("dispatch_origin"));
-                match (canonical, legacy) {
-                    (Some(canonical), Some(legacy)) => {
-                        let legacy = legacy_firing_to_canonical(&legacy)?;
-                        if !legacy_firing_class_matches(&canonical, &legacy) {
-                            return Err(
-                                "continuation trigger firing representations disagree".to_string()
-                            );
-                        }
-                        object.insert("trigger_firing".to_string(), canonical);
-                    }
-                    (Some(canonical), None) => {
-                        object.insert("trigger_firing".to_string(), canonical);
-                    }
-                    (None, None)
-                        if allow_unlabeled_v1_carriers
-                            && object
-                                .get("trigger_context")
-                                .is_some_and(|context| !context.is_null()) =>
+                let canonical = canonical.or_else(|| {
+                    (allow_unlabeled_v1_carriers
+                        && object
+                            .get("trigger_context")
+                            .is_some_and(|context| !context.is_null()))
+                    .then(|| serde_json::json!("LegacyDelayed"))
+                });
+                if let Some(canonical) = canonical {
+                    if precise
+                        .iter()
+                        .any(|companion| !legacy_firing_class_matches(&canonical, companion, false))
+                        || dispatch.is_some_and(|companion| {
+                            !legacy_firing_class_matches(&canonical, companion, true)
+                        })
                     {
-                        object.insert(
-                            "trigger_firing".to_string(),
-                            serde_json::Value::String("LegacyDelayed".to_string()),
+                        return Err(
+                            "continuation trigger firing representations disagree".to_string()
                         );
                     }
-                    (None, None) => {}
-                    (None, Some(legacy)) => {
-                        object.insert(
-                            "trigger_firing".to_string(),
-                            legacy_firing_to_canonical(&legacy)?,
-                        );
+                    for key in ["firing", "firing_classification", "dispatch_origin"] {
+                        object.remove(key);
                     }
+                    object.insert("trigger_firing".to_string(), canonical);
                 }
             }
             for value in object.values_mut() {
@@ -28899,7 +28896,11 @@ impl GameState {
                 if !observation.valid_for(object_id, player.unwrap_or(observation.subject.owner))
                     || observation.delivered_to.is_some()
                     || observation.pending_reveal.as_ref().is_some_and(|bound| {
-                        !pending.proposed.applied_set().contains(&bound.replacement)
+                        !self
+                            .players
+                            .iter()
+                            .any(|player| player.id == bound.shuffle_owner)
+                            || !pending.proposed.applied_set().contains(&bound.replacement)
                     })
                 {
                     return Err("pending discard lacks observation authority".into());
@@ -28920,7 +28921,11 @@ impl GameState {
                     || Some(observation.subject.identity) != provenance.original_hand
                     || observation.delivered_to.is_some()
                     || observation.pending_reveal.as_ref().is_some_and(|bound| {
-                        !pending.proposed.applied_set().contains(&bound.replacement)
+                        !self
+                            .players
+                            .iter()
+                            .any(|player| player.id == bound.shuffle_owner)
+                            || !pending.proposed.applied_set().contains(&bound.replacement)
                             || bound.source.is_some_and(|source| {
                                 source.incarnation == crate::types::identifiers::LEGACY_INCARNATION
                             })
@@ -28935,9 +28940,37 @@ impl GameState {
                 .observation
                 .as_deref()
                 .ok_or("pending discard lacks observation authority")?;
-            if !observation.valid_for(batch.paused_card.object_id, batch.player) || observation.subject.identity != batch.paused_card
+            if observation.pending_reveal.as_ref().is_some_and(|bound| !self.players.iter().any(|player| player.id == bound.shuffle_owner))
+                || !observation.valid_for(batch.paused_card.object_id, batch.player) || observation.subject.identity != batch.paused_card
                 || (observation.delivered_to.is_some() && !batch.preceding_events.iter().any(|event| matches!(event, GameEvent::Discarded { player_id, object_id, source_id, observation: Some(completed) } if *player_id == batch.player && *object_id == batch.paused_card.object_id && *source_id == Some(batch.source_id) && completed.as_ref() == observation))) {
                 return Err("pending discard lacks observation authority".into());
+            }
+        }
+        for frame in self.resolution_stack.iter() {
+            if let ResolutionFrame::CounterAdditions(frame) = frame {
+                if let Some(completion) = frame.completion.as_ref() {
+                    for action in &completion.post_actions {
+                        if let PendingCounterPostAction::ContinueZoneDeliveryTail {
+                            object_id,
+                            from,
+                            selected_shuffle_owner: Some(owner),
+                            ..
+                        } = action
+                        {
+                            if !self.players.iter().any(|player| player.id == *owner)
+                                || *from != Zone::Hand
+                                || self
+                                    .objects
+                                    .get(object_id)
+                                    .is_some_and(|object| object.owner != *owner)
+                            {
+                                return Err(
+                                    "pending discard lacks selected shuffle owner authority".into(),
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -40425,6 +40458,238 @@ mod tests {
     }
 
     #[test]
+    fn trigger_firing_companions_preserve_precise_origins_and_reject_every_contradiction() {
+        fn decode(value: serde_json::Value, ingress: usize) -> Result<GameState, String> {
+            if ingress == 0 {
+                serde_json::from_value(value).map_err(|error| error.to_string())
+            } else {
+                serde_json::from_value::<PersistedGameState>(value)
+                    .map_err(|error| error.to_string())?
+                    .into_game_state()
+                    .map_err(|error| error.to_string())
+            }
+        }
+        for delayed in [false, true] {
+            let mut state = normal_trigger_firing_fixture();
+            let source = state.pending_trigger.as_ref().unwrap().source_id;
+            let source_context = crate::game::triggers::trigger_source_context_for_latch(
+                &state,
+                &state.objects[&source],
+            );
+            let mut pending = state.pending_trigger.as_deref().unwrap().clone();
+            pending
+                .ability
+                .set_trigger_source_recursive(source_context.clone());
+            let firing = if delayed {
+                crate::game::triggers::install_delayed_trigger(
+                    &mut state,
+                    DelayedTrigger::new(
+                        crate::types::ability::DelayedTriggerCondition::AtNextPhase {
+                            phase: Phase::Upkeep,
+                        },
+                        pending.ability.clone(),
+                        PlayerId(0),
+                        source,
+                        true,
+                    ),
+                    &mut Vec::new(),
+                );
+                TriggerFiring::ReceiptEligible(
+                    state
+                        .delayed_triggers
+                        .last()
+                        .unwrap()
+                        .provenance
+                        .origin()
+                        .unwrap(),
+                )
+            } else {
+                TriggerFiring::Ordinary
+            };
+            state.pending_trigger = Some(Box::new(pending.clone()));
+            state.pending_trigger_firing = Some(firing);
+            let context = if delayed {
+                PendingTriggerContext::delayed_for_test(
+                    pending.clone(),
+                    match firing {
+                        TriggerFiring::ReceiptEligible(origin) => origin,
+                        _ => unreachable!(),
+                    },
+                )
+            } else {
+                PendingTriggerContext::single(pending.clone())
+            };
+            state.deferred_triggers = vec![context.clone()];
+            state.pending_trigger_order.as_mut().unwrap().groups[0].triggers = vec![context];
+            // A real source departure retires its live pin without invalidating
+            // the already captured trigger-source context or install origin.
+            let mut departed = state.clone();
+            crate::game::zones::move_to_zone(
+                &mut departed,
+                source,
+                Zone::Graveyard,
+                &mut Vec::new(),
+            );
+            assert_ne!(
+                departed.objects[&source].incarnation,
+                source_context.identity.reference.incarnation
+            );
+            for ingress in 0..3 {
+                let encoded = match ingress {
+                    0 => serde_json::to_value(&departed).unwrap(),
+                    1 => serde_json::to_value(PersistedGameState::Raw(Box::new(departed.clone())))
+                        .unwrap(),
+                    2 => {
+                        serde_json::to_value(PersistedGameState::capture(departed.clone())).unwrap()
+                    }
+                    _ => unreachable!(),
+                };
+                let restored = decode(encoded, ingress).unwrap();
+                assert_eq!(
+                    restored.deferred_triggers[0]
+                        .pending
+                        .ability
+                        .trigger_source
+                        .as_ref(),
+                    Some(&source_context)
+                );
+                assert_eq!(restored.deferred_triggers[0].firing(), firing);
+                assert_ne!(
+                    restored.deferred_triggers[0]
+                        .pending
+                        .ability
+                        .trigger_source
+                        .as_ref()
+                        .unwrap()
+                        .identity
+                        .reference
+                        .incarnation,
+                    restored.objects[&source].incarnation,
+                    "source incarnation is preserved rather than rebound to the live object"
+                );
+            }
+            for ingress in 0..3 {
+                let encoded = match ingress {
+                    0 => serde_json::to_value(&state).unwrap(),
+                    1 => serde_json::to_value(PersistedGameState::Raw(Box::new(state.clone())))
+                        .unwrap(),
+                    2 => serde_json::to_value(PersistedGameState::capture(state.clone())).unwrap(),
+                    _ => unreachable!(),
+                };
+                for placement in 0..3 {
+                    let mut positive = encoded.clone();
+                    let root = if ingress == 2 {
+                        &mut positive["state"]
+                    } else {
+                        &mut positive
+                    };
+                    let canonical = serde_json::to_value(firing).unwrap();
+                    let companion = if delayed {
+                        serde_json::json!({"Delayed": canonical["ReceiptEligible"]})
+                    } else {
+                        serde_json::json!("Normal")
+                    };
+                    let carrier = match placement {
+                        0 => &mut root["deferred_triggers"][0],
+                        1 => &mut root["pending_trigger_order"]["groups"][0]["triggers"][0],
+                        2 => &mut root["pending_trigger"],
+                        _ => unreachable!(),
+                    };
+                    carrier["firing_classification"] = companion.clone();
+                    carrier["dispatch_origin"] =
+                        serde_json::json!(if delayed { "Delayed" } else { "Normal" });
+                    let restored = decode(positive.clone(), ingress).unwrap_or_else(|error| {
+                        panic!("delayed={delayed} ingress={ingress} placement={placement}: {error}")
+                    });
+                    assert_eq!(restored.pending_trigger_firing, Some(firing));
+                    assert_eq!(restored.deferred_triggers[0].firing(), firing);
+                    assert_eq!(
+                        restored.deferred_triggers[0]
+                            .pending
+                            .ability
+                            .trigger_source
+                            .as_ref(),
+                        Some(&source_context)
+                    );
+                    for malformed in 0..if delayed { 5 } else { 1 } {
+                        let mut bad = positive.clone();
+                        let root = if ingress == 2 {
+                            &mut bad["state"]
+                        } else {
+                            &mut bad
+                        };
+                        let carrier = match placement {
+                            0 => &mut root["deferred_triggers"][0],
+                            1 => &mut root["pending_trigger_order"]["groups"][0]["triggers"][0],
+                            2 => &mut root["pending_trigger"],
+                            _ => unreachable!(),
+                        };
+                        match malformed {
+                            0 => {
+                                carrier["dispatch_origin"] =
+                                    serde_json::json!(if delayed { "Normal" } else { "Delayed" })
+                            }
+                            1 => {
+                                carrier["firing_classification"]["Delayed"]["token"] =
+                                    serde_json::json!(99)
+                            }
+                            2 => {
+                                carrier["firing_classification"]["Delayed"]["instance"] =
+                                    serde_json::json!(99)
+                            }
+                            3 => {
+                                carrier["firing_classification"]["Delayed"]["source_id"] =
+                                    serde_json::json!(99)
+                            }
+                            4 => carrier["firing"] = serde_json::json!("LegacyDelayed"),
+                            _ => unreachable!(),
+                        }
+                        let error = decode(bad, ingress).unwrap_err();
+                        assert!(error.contains("firing representations disagree"), "delayed={delayed} ingress={ingress} placement={placement} malformed={malformed}: {error}");
+                    }
+                }
+                if delayed {
+                    let mut legacy = encoded;
+                    let root = if ingress == 2 {
+                        &mut legacy["state"]
+                    } else {
+                        &mut legacy
+                    };
+                    root["deferred_triggers"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("firing");
+                    root["deferred_triggers"][0]["dispatch_origin"] = serde_json::json!("Delayed");
+                    assert_eq!(
+                        decode(legacy, ingress).unwrap().deferred_triggers[0].firing(),
+                        TriggerFiring::LegacyDelayed
+                    );
+                }
+            }
+        }
+        // Continuation aliases use the same complete-origin coherence. This focused
+        // representation fixture supplements the public Windfall restore/completion path.
+        let origin = serde_json::json!({"token": 7, "instance": 9, "source_id": 11});
+        let precise = serde_json::json!({"ReceiptEligible": origin});
+        let good = serde_json::json!({"chain": {}, "trigger_context": {}, "trigger_firing": precise,
+            "firing_classification": {"Delayed": origin}, "dispatch_origin": "Delayed"});
+        let mut positive = good.clone();
+        migrate_legacy_continuation_firing(&mut positive, false).unwrap();
+        assert_eq!(positive["trigger_firing"], precise);
+        for field in ["token", "instance", "source_id"] {
+            let mut bad = good.clone();
+            bad["firing_classification"]["Delayed"][field] = serde_json::json!(99);
+            assert!(
+                migrate_legacy_continuation_firing(&mut bad, false).is_err(),
+                "{field}"
+            );
+        }
+        let mut third = good;
+        third["firing"] = serde_json::json!("LegacyDelayed");
+        assert!(migrate_legacy_continuation_firing(&mut third, false).is_err());
+    }
+
+    #[test]
     fn delayed_install_migration_rejects_source_alias_conflicts_in_both_envelopes() {
         let (state, _) = delayed_install_fixture();
         let raw = serde_json::to_value(PersistedGameState::Raw(Box::new(state.clone())))
@@ -46836,7 +47101,7 @@ mod tests {
                     let observation = receipt(event);
                     match control {
                         0 => observation.subject.name.push('!'),
-                        1 => observation.subject.controller = PlayerId(0),
+                        1 => observation.subject.controller = PlayerId(1),
                         2 => observation.delivered_to = Some(Zone::Exile),
                         3 => {
                             observation.revealed_by =
@@ -46858,6 +47123,11 @@ mod tests {
                         _ => unreachable!(),
                     }
                 });
+                assert_ne!(
+                    serde_json::to_value(&changed).unwrap(),
+                    authoritative_early,
+                    "delayed={delayed} meaningful raw control={control}"
+                );
                 assert!(
                     !loop_states_equal(&normalized, &changed.normalize_for_loop()),
                     "delayed={delayed} meaningful control={control}"

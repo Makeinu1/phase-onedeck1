@@ -388,6 +388,8 @@ pub struct BoundDiscardReveal {
     pub replacement: super::proposed_event::AppliedReplacementKey,
     pub source: Option<ObjectIncarnationRef>,
     pub controller: PlayerId,
+    /// CR 701.24c: the selected owner-Shuffle remains owed after redirection.
+    pub shuffle_owner: PlayerId,
 }
 
 /// CR 701.9c: facts of the original hand occurrence and its actual delivery.
@@ -421,22 +423,23 @@ impl DiscardObservation {
             && (self.delivered_to.is_none() || self.pending_reveal.is_none())
             && self.pending_reveal.as_ref().is_none_or(|bound| {
                 use super::proposed_event::AppliedReplacementKey;
-                match (&bound.replacement, bound.source) {
-                    (
-                        AppliedReplacementKey::Object { source, .. }
-                        | AppliedReplacementKey::EntryControllerChoice { source, .. },
-                        Some(pin),
-                    ) => {
-                        pin.object_id == *source
-                            && pin.incarnation != super::identifiers::LEGACY_INCARNATION
+                bound.shuffle_owner == self.subject.owner
+                    && match (&bound.replacement, bound.source) {
+                        (
+                            AppliedReplacementKey::Object { source, .. }
+                            | AppliedReplacementKey::EntryControllerChoice { source, .. },
+                            Some(pin),
+                        ) => {
+                            pin.object_id == *source
+                                && pin.incarnation != super::identifiers::LEGACY_INCARNATION
+                        }
+                        (
+                            AppliedReplacementKey::Floating { .. }
+                            | AppliedReplacementKey::StepEndMana { .. },
+                            None,
+                        ) => true,
+                        _ => false,
                     }
-                    (
-                        AppliedReplacementKey::Floating { .. }
-                        | AppliedReplacementKey::StepEndMana { .. },
-                        None,
-                    ) => true,
-                    _ => false,
-                }
             })
     }
 

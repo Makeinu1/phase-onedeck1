@@ -311,6 +311,8 @@ fn r6_library_of_leng_applies_to_sandbox_discard() {
     });
     let (grimoire, card) = ids.unwrap();
     let before = discard_count(&runner, P0);
+    let rng_before = runner.state().rng.clone();
+    assert!(runner.state().library_of(P0).len() > 1);
 
     let parked = runner.act(discard(card)).expect("discard succeeds");
     match &runner.state().waiting_for {
@@ -356,6 +358,25 @@ fn r6_library_of_leng_applies_to_sandbox_discard() {
         .and_then(|p| p.library.front().copied());
     assert_eq!(top, Some(card));
     assert_eq!(zone_of(&runner, card), Zone::Library);
+    assert_eq!(runner.state().rng.get_word_pos(), rng_before.get_word_pos());
+    assert_eq!(
+        runner.state().rng.outcome_draws(),
+        rng_before.outcome_draws()
+    );
+    assert_eq!(result.events.iter().filter(|event| matches!(event,
+        GameEvent::ZoneChanged { object_id, from: Some(Zone::Hand), to: Zone::Library, record }
+            if *object_id == card && record.trigger_source_context().is_some_and(|context| context.identity.reference == original)
+    )).count(), 1, "the original Hand occurrence moves directly to Library");
+    assert!(!result.events.iter().any(|event| matches!(event,
+        GameEvent::ZoneChanged { object_id, to: Zone::Graveyard, .. } if *object_id == card
+    )));
+    assert!(!result.events.iter().any(|event| matches!(
+        event,
+        GameEvent::PlayerPerformedAction {
+            action: engine::types::events::PlayerActionKind::ShuffledLibrary,
+            ..
+        }
+    )));
     // CR 701.9c + CR 603.2c: a redirected discard is one occurrence.
     assert_eq!(
         discarded_with_sources(&result.events),
@@ -1214,8 +1235,34 @@ fn r16_printed_shuffle_back_reveal_preserves_typed_discard_observers() {
                 if select_reveal {
                     let moved = events.iter().position(|event| matches!(event, GameEvent::ZoneChanged { object_id, from: Some(Zone::Hand), record, .. } if *object_id == card && record.trigger_source_context().is_some_and(|context| context.identity.reference == original))).expect("original hand departure");
                     assert!(reveals[0] < moved);
+                    let shuffles = events
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, event)| {
+                            matches!(
+                                event,
+                                GameEvent::PlayerPerformedAction {
+                                    player_id: P0,
+                                    action: PlayerActionKind::ShuffledLibrary,
+                                    ..
+                                }
+                            )
+                            .then_some(index)
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        shuffles.len(),
+                        1,
+                        "{name} rip={rip_count}: exactly one selected owner-Shuffle"
+                    );
+                    assert!(moved < shuffles[0]);
+                    assert_eq!(events.iter().filter(|event| matches!(event,
+                        GameEvent::EffectResolved { source_id, kind: engine::types::ability::EffectKind::Shuffle, .. } if *source_id == card
+                    )).count(), 1, "the selected instruction uses its existing resolver");
+                }
+                if !select_reveal {
                     assert!(
-                        events.iter().any(|event| matches!(
+                        !events.iter().any(|event| matches!(
                             event,
                             GameEvent::PlayerPerformedAction {
                                 player_id: P0,
@@ -1223,7 +1270,7 @@ fn r16_printed_shuffle_back_reveal_preserves_typed_discard_observers() {
                                 ..
                             }
                         )),
-                        "selected Shuffle suffix runs"
+                        "selected RIP does not owe the unselected canonical Shuffle"
                     );
                 }
                 assert!(runner.state().pending_replacement.is_none());
