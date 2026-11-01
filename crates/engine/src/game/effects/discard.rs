@@ -3808,7 +3808,7 @@ mod tests {
                             AbilityKind::Spell,
                             Effect::GainLife {
                                 amount: QuantityExpr::Fixed { value: 2 },
-                                target: None,
+                                player: TargetFilter::Controller,
                             },
                         );
                         later.optional = true;
