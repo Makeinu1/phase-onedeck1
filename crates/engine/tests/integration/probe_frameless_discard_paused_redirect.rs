@@ -23,6 +23,7 @@ use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
+use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
@@ -40,6 +41,13 @@ fn run(rest_in_peace_copies: usize) -> Option<Observed> {
     let db = load_db()?;
     let mut scenario = GameScenario::new_n_player(2, 42);
     scenario.at_phase(Phase::PreCombatMain);
+    // Mind Rot costs {2}{B}.
+    scenario.with_mana_pool(
+        P0,
+        (0..3)
+            .map(|_| ManaUnit::new(ManaType::Black, ObjectId(0), false, vec![]))
+            .collect(),
+    );
     for seat in [P0, P1] {
         for _ in 0..4 {
             scenario.add_real_card(seat, "Swamp", Zone::Library, db);
