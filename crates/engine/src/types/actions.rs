@@ -1272,7 +1272,7 @@ pub enum DebugAction {
     /// controller.
     Sacrifice { object_id: ObjectId },
     /// CR 701.9a: Discard a card from its owner's hand through the single
-    /// discard authority, as an effect-caused discard (CR 614.1a), with no
+    /// discard authority, as an effect-caused discard, with no
     /// source object. Replacements and discard triggers (CR 603.2) apply. The
     /// discarding player is the card's owner. Admitted only at a settled
     /// Priority window.
@@ -1559,7 +1559,8 @@ impl DebugAction {
         Ok(())
     }
 
-    /// Whether this debug action is a real player-resource event whose
+    /// Whether this debug action is a real player event (life, counters,
+    /// energy, discard) whose
     /// replacements can park a CR 616.1 ordering choice, so it is admitted only
     /// at a settled Priority boundary. `CreateCard`'s battlefield-ETB entry has
     /// its own payload-dependent check in `preflight_debug_action`.
