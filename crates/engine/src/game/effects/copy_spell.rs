@@ -1,6 +1,7 @@
 use crate::game::ability_utils::build_resolved_from_def;
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::game_object::GameObject;
+use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::game::targeting::{TriggeringActivation, TriggeringSpell};
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef, CopyRetargetPermission,
@@ -145,6 +146,9 @@ pub fn resolve(
         // cast from a graveyard" riders (Sevinne's Reclamation, issue #3283)
         // re-fire when a flashback copy resolves.
         copy_obj.cast_from_zone = None;
+        // CR 707.12: if this copy is later cast ("you may cast the copy"), it is
+        // cast from the zone the copied object is in.
+        copy_obj.copied_from_zone = Some(crate::game::game_object::CastOrigin::of(source_obj));
         copy_obj.cast_controller = None;
         // CR 707.10: no mana was spent to cast a spell copy — reset the
         // cast-payment stamps so spend-color riders ("if {W}{W} was spent to
@@ -2269,6 +2273,8 @@ mod tests {
                 owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
                 tapped: false,
                 count: QuantityExpr::Ref {
                     qty: crate::types::ability::QuantityRef::AdditionalCostPaymentCount,
@@ -2622,6 +2628,8 @@ mod tests {
                 owner: TargetFilter::Controller,
                 attach_to: None,
                 enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
                 supertypes: vec![],
                 static_abilities: vec![],
                 enter_with_counters: vec![],

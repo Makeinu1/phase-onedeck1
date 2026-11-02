@@ -11,7 +11,8 @@
 //! including degenerate token-army boards — so it never rejects legitimate play;
 //! it only blocks payloads engineered to force large allocations/clones.
 use engine::types::actions::{
-    DebugAction, DebugTokenRequest, GameAction, MAX_DEBUG_CREATE_COUNT, MAX_DEBUG_LIFE_AMOUNT,
+    DebugAction, DebugTokenRequest, GameAction, MAX_DEBUG_COUNTER_AMOUNT, MAX_DEBUG_CREATE_COUNT,
+    MAX_DEBUG_LIFE_AMOUNT,
 };
 use engine::types::counter::CounterType;
 use engine::types::game_state::{ManaChoice, ProductionOverride};
@@ -411,6 +412,15 @@ fn guard_debug_action_payload(action: &DebugAction) -> Result<(), String> {
                 ));
             }
         }
+        // `counter_kind` is a unit-variant enum (a bounded scalar), so only the
+        // count needs a bound.
+        DebugAction::GivePlayerCounters { count, .. } | DebugAction::GiveEnergy { count, .. } => {
+            if *count > MAX_DEBUG_COUNTER_AMOUNT {
+                return Err(format!(
+                    "Debug.CounterGain.count {count} exceeds the maximum {MAX_DEBUG_COUNTER_AMOUNT}"
+                ));
+            }
+        }
         DebugAction::MoveToZone { .. }
         | DebugAction::RemoveObject { .. }
         | DebugAction::Sacrifice { .. }
@@ -450,6 +460,17 @@ pub fn guard_game_action_payload(action: &GameAction) -> Result<(), String> {
         GameAction::ChooseReplacementAndRemember { choice } => {
             if let engine::types::actions::ReplacementAutoChoice::Order { order } = choice {
                 bound_list("ChooseReplacementAndRemember.order", order.len())?;
+            }
+        }
+
+        // Un-card actions: the only client-supplied free-form text is the spoken
+        // word or number of a gesture.
+        GameAction::UnAction { action } => {
+            if let engine::types::un_actions::UnAction::PerformTell {
+                tell: engine::types::un_actions::UnTell::Said { text },
+            } = action
+            {
+                bound_string("UnAction.PerformTell.text", text)?;
             }
         }
 
@@ -538,7 +559,7 @@ pub fn guard_game_action_payload(action: &GameAction) -> Result<(), String> {
             // here so its wire bound is a conscious decision, not a silent gap.
             match count {
                 IterationCount::Fixed(n) => bound_batch_count("DeclareShortcut.count", *n)?,
-                IterationCount::UntilLethal => {}
+                IterationCount::UntilLethal | IterationCount::WithoutEnd => {}
             }
             if let Some(template) = template {
                 bound_list("DeclareShortcut.template.decisions", template.decisions.len())?;

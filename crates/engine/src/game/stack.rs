@@ -1,3 +1,4 @@
+use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::types::ability::{
     cost_paid_object_snapshot_ids_eq, AbilityKind, ContinuousEffectOnset, ContinuousModification,
     CopyCountStatus, DetachedRemainder, Duration, Effect, EffectKind, IllegalTargetsDisposition,
@@ -1748,16 +1749,11 @@ fn resolving_saga_chapter(entry: &StackEntry) -> Option<ResolvingSagaChapter> {
     let StackEntryKind::TriggeredAbility { ability, .. } = &entry.kind else {
         return None;
     };
-    let occurrence = &ability.trigger_definition_ref.as_ref()?.occurrence;
     let saga = ability.trigger_source.as_ref()?;
 
     // CR 714.2: chapter numbers come from the chapter-symbol provenance on the
     // source incarnation's own trigger entries, never from a live lore count.
-    let chapter = saga
-        .trigger_entries
-        .iter()
-        .find(|entry| &entry.occurrence == occurrence)
-        .and_then(|entry| entry.definition.saga_chapter)?;
+    let chapter = ability.triggered_definition()?.saga_chapter?;
     // CR 714.2d: greatest chapter number among that same incarnation's chapter
     // abilities.
     let final_chapter = saga
@@ -3261,7 +3257,9 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) -> u32 {
                             // mark the battlefield object transformed without
                             // swapping faces again. Casting-variant-specific, so
                             // it stays caller-side (the pipeline tail only knows
-                            // the generic `enter_transformed` face-swap).
+                            // the generic `enter_transformed` face-swap). This
+                            // entry is not a CR 701.27a transform, so it emits
+                            // no `GameEvent::Transformed`.
                             if matches!(
                                 casting_variant,
                                 CastingVariant::MoreThanMeetsTheEye | CastingVariant::Disturb
@@ -3276,7 +3274,6 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) -> u32 {
                                 }
                                 if marked {
                                     crate::game::layers::mark_layers_full(state);
-                                    events.push(GameEvent::Transformed { object_id });
                                 }
                             }
                         }
@@ -4477,10 +4474,12 @@ fn resolve_bulk_token_run(
     let consumed = members.len() as u32;
     *state = *bulk;
     // CR 603.2c: members 1..N−1's events were collected on the clone; only the
-    // last member's events reach the caller's checkpoint.
-    state.consumed_before_priority_trigger_events =
-        consumed_trigger_event_occurrences(&bulk_events[..last_member_start]);
+    // last member's events reach the caller's checkpoint. The claims name
+    // positions in the caller's buffer, which the post-action pipeline numbers.
+    let batch_start = events.len();
     events.extend(bulk_events);
+    state.consumed_before_priority_trigger_events =
+        consumed_trigger_event_occurrences(events, batch_start..batch_start + last_member_start);
     crate::game::perf_counters::record_stack_batch_plan();
     crate::game::perf_counters::record_stack_batched_entries(consumed);
     #[cfg(feature = "test-support")]
@@ -4638,10 +4637,13 @@ where
         }
     }
 
-    proof.consumed_before_priority_trigger_events =
-        consumed_trigger_event_occurrences(&proof_events);
     *state = proof;
+    // CR 603.2c: every member's checkpoint ran on the clone, so every proof event
+    // was already collected; claim them at their positions in the caller's buffer.
+    let batch_start = events.len();
     events.extend(proof_events);
+    state.consumed_before_priority_trigger_events =
+        consumed_trigger_event_occurrences(events, batch_start..events.len());
     crate::game::perf_counters::record_stack_batch_plan();
     crate::game::perf_counters::record_stack_batched_entries(run_len);
     Some(run_len)
@@ -4672,23 +4674,25 @@ fn battlefield_counter_snapshot(
         .collect()
 }
 
+/// CR 603.2c: the occurrences at `claimed` in the caller's whole action buffer,
+/// claimed for every collector. Each ordinal comes from
+/// `triggers::trigger_event_occurrence`, the relation every consumer of the claim
+/// numbers and matches with (typed `==` over the whole buffer). A different
+/// relation, such as a serialized string, splits events that compare equal (a
+/// reported life total, a display-only printing) into separate occurrences, so a
+/// collected occurrence would stay collectable.
 fn consumed_trigger_event_occurrences(
     events: &[GameEvent],
+    claimed: std::ops::Range<usize>,
 ) -> Vec<crate::game::triggers::ConsumedTriggerEventOccurrence> {
-    let mut seen = std::collections::HashMap::new();
-    events
-        .iter()
-        .map(|event| {
-            let key = serde_json::to_string(event).expect("GameEvent serializes");
-            let count = seen.entry(key).or_insert(0);
-            let occurrence = *count;
-            *count += 1;
-            crate::game::triggers::ConsumedTriggerEventOccurrence {
-                event: event.clone(),
-                occurrence,
+    claimed
+        .map(
+            |index| crate::game::triggers::ConsumedTriggerEventOccurrence {
+                event: events[index].clone(),
+                occurrence: crate::game::triggers::trigger_event_occurrence(events, index),
                 scope: crate::game::triggers::ConsumedTriggerEventScope::AllCollectors,
-            }
-        })
+            },
+        )
         .collect()
 }
 
@@ -4865,6 +4869,7 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         modal,
         mode_abilities,
         parent_target_missing_reason,
+        control_change_instruction,
     } = ability;
 
     let self_counter = matches!(
@@ -4962,6 +4967,7 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         && modal.is_none()
         && mode_abilities.is_empty()
         && parent_target_missing_reason.is_none()
+        && control_change_instruction.is_none()
 }
 
 /// CR 117.3b + CR 117.3d + CR 117.5 + CR 608.2 + CR 704.3 + CR 119.3: Fixed
@@ -5119,6 +5125,7 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         modal,
         mode_abilities,
         parent_target_missing_reason,
+        control_change_instruction,
     } = ability;
 
     let fixed_controller_gain_life = matches!(
@@ -5193,6 +5200,7 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         && modal.is_none()
         && mode_abilities.is_empty()
         && parent_target_missing_reason.is_none()
+        && control_change_instruction.is_none()
 }
 
 /// CR 117.3b + CR 117.3d + CR 117.5 + CR 608.2 + CR 704.3: Fixed opponent-
@@ -5352,6 +5360,7 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         modal,
         mode_abilities,
         parent_target_missing_reason,
+        control_change_instruction,
     } = ability;
 
     let fixed_opponent_effect = matches!(
@@ -5430,6 +5439,7 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         && modal.is_none()
         && mode_abilities.is_empty()
         && parent_target_missing_reason.is_none()
+        && control_change_instruction.is_none()
 }
 
 fn optional_ability_is_inert_under_auto_choice(
@@ -5478,7 +5488,7 @@ fn ability_has_no_legal_resolution_targets(
         // etc.), all of which are ALWAYS resolvable. Testing raw `target_filter()`
         // here would fork from that authority and silently drop an auto-accepted
         // "you may put a creature from your hand …" trigger (Kaalia et al.).
-        (super::triggers::extract_target_filter_from_effect(&ability.effect).is_some()
+        (crate::types::ability::extract_target_filter_from_effect(&ability.effect).is_some()
             && slots.is_empty())
             || (!slots.is_empty() && slots.iter().all(|slot| slot.legal_targets.is_empty()))
     });
@@ -5707,6 +5717,10 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         illegal_target_slots: a_illegal_target_slots,
         unjudged_target_slots: a_unjudged_target_slots,
         illegal_local_target_slots: a_illegal_local_target_slots,
+        // CR 608.2e: a player-scope driver's transient capture, never on a
+        // stack entry; guaranteed `None` ONE HOP upstream by the
+        // batch-candidate checks, like the modal ordinal.
+        control_change_instruction: _,
     } = a;
     let ResolvedAbility {
         effect: b_effect,
@@ -5796,6 +5810,10 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         illegal_target_slots: b_illegal_target_slots,
         unjudged_target_slots: b_unjudged_target_slots,
         illegal_local_target_slots: b_illegal_local_target_slots,
+        // CR 608.2e: a player-scope driver's transient capture, never on a
+        // stack entry; guaranteed `None` ONE HOP upstream by the
+        // batch-candidate checks, like the modal ordinal.
+        control_change_instruction: _,
     } = b;
 
     a_effect == b_effect
@@ -7070,19 +7088,8 @@ mod tests {
         state.objects.insert(source_id, source);
         state.objects.insert(copy_id, copy);
 
-        let mut root = ResolvedAbility::new(
-            Effect::EpicCopy {
-                spell: Box::new(ResolvedAbility::new(
-                    Effect::Investigate,
-                    Vec::new(),
-                    source_id,
-                    PlayerId(0),
-                )),
-            },
-            Vec::new(),
-            source_id,
-            PlayerId(0),
-        );
+        let mut root =
+            ResolvedAbility::new(Effect::Investigate, Vec::new(), source_id, PlayerId(0));
         root.sub_ability = Some(Box::new(ResolvedAbility::new(
             Effect::Investigate,
             Vec::new(),
@@ -7123,10 +7130,6 @@ mod tests {
             ability.cast_occurrence.is_none()
                 && ability.sub_ability.as_deref().is_none_or(graph_is_clear)
                 && ability.else_ability.as_deref().is_none_or(graph_is_clear)
-                && match &ability.effect {
-                    Effect::EpicCopy { spell } => graph_is_clear(spell),
-                    _ => true,
-                }
         }
 
         assert_eq!(state.objects[&source_id].cast_occurrence, Some(occurrence));
@@ -10346,11 +10349,13 @@ mod tests {
     mod batch_resolve {
         // Driver internals under test (the stack module).
         use super::super::{
-            batch_run_len, effects, fixed_controller_gain_life_run_len,
-            fixed_opponent_effect_run_len, priority_checkpoint_is_settled, resolve_next,
-            resolve_next_with_limit, resolve_proven_inert_trigger_batch_with_proof_hook,
-            resolve_top, run_member_abilities, self_counter_run_len,
+            batch_run_len, consumed_trigger_event_occurrences, effects,
+            fixed_controller_gain_life_run_len, fixed_opponent_effect_run_len,
+            priority_checkpoint_is_settled, resolve_next, resolve_next_with_limit,
+            resolve_proven_inert_trigger_batch_with_proof_hook, resolve_top, run_member_abilities,
+            self_counter_run_len,
         };
+        use crate::game::game_object::ObjectIncarnationRefExt;
         // Test fixtures from the parent `tests` module.
         use super::{pending_spell_entry, setup};
         use crate::game::triggers;
@@ -10452,6 +10457,8 @@ mod tests {
                 owner: TargetFilter::Controller,
                 attach_to: None,
                 enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
                 supertypes: vec![],
                 static_abilities: vec![],
                 enter_with_counters: vec![],
@@ -10478,9 +10485,17 @@ mod tests {
             }
         }
 
-        /// Create a Scute-Swarm-style source permanent (landfall trigger) on the
-        /// battlefield and return its id. The landfall trigger registers under
-        /// `EnterBattlefield(Some(Land))`, so (mirroring real Scute Swarm) it
+        /// Create a Scute Swarm source permanent (landfall trigger) on the
+        /// battlefield and return its id.
+        ///
+        /// Printed Oracle text (MTGJSON, checked 2026-11-01), {2}{G} Insect:
+        /// "Landfall — Whenever a land you control enters, create a 1/1 green
+        /// Insect creature token. If you control six or more lands, create a
+        /// token that's a copy of this creature instead." The helper simplifies
+        /// the card to just the landfall trigger the batching tests key on: it
+        /// omits the six-or-more-lands copy branch (callers push their own fixed
+        /// token effects) and the printed body's other characteristics. The
+        /// landfall trigger registers under `EnterBattlefield(Some(Land))`, so it
         /// never matches the creature-token probe — the source's own trigger does
         /// not block batching, while a creature-keyed observer (CR 603.3) does.
         fn add_scute_source(state: &mut GameState) -> ObjectId {
@@ -10691,6 +10706,8 @@ mod tests {
                 owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
                 tapped: false,
                 count: QuantityExpr::Fixed { value: 1 },
                 extra_keywords: vec![],
@@ -10855,7 +10872,9 @@ mod tests {
                     ability: Box::new(ability),
                     condition: None,
                     trigger_event: Some(trigger_event),
-                    description: Some("Whenever a creature enters, you gain 1 life.".to_string()),
+                    description: Some(
+                        "Whenever another creature enters, you gain 1 life.".to_string(),
+                    ),
                     source_name: state.objects[&source].name.clone(),
                     subject_match_count: None,
                     die_result: None,
@@ -11498,8 +11517,8 @@ mod tests {
         fn fixed_controller_gain_life_triggers_batch_with_production_stamps() {
             crate::game::perf_counters::reset();
             let mut state = setup();
-            let source_a = add_self_counter_source(&mut state, "Bogwater Lumaret A");
-            let source_b = add_self_counter_source(&mut state, "Bogwater Lumaret B");
+            let source_a = add_self_counter_source(&mut state, "Soul Warden A");
+            let source_b = add_self_counter_source(&mut state, "Soul Warden B");
             let etb = life_event(PlayerId(0), 0);
             push_fixed_controller_gain_life_trigger(&mut state, source_a, etb.clone());
             push_fixed_controller_gain_life_trigger(&mut state, source_b, etb.clone());
@@ -11522,6 +11541,412 @@ mod tests {
                 crate::game::perf_counters::snapshot().stack_batched_entries,
                 3
             );
+        }
+
+        fn reported_life_changed(amount: i32, total: i32) -> GameEvent {
+            GameEvent::LifeChanged {
+                player_id: PlayerId(0),
+                amount,
+                new_total: crate::types::events::LifeTotalReading(Some(total)),
+            }
+        }
+
+        fn wire(occurrence: &GameEvent) -> String {
+            serde_json::to_string(occurrence).expect("GameEvent serializes")
+        }
+
+        fn is_life_changed(event: &GameEvent) -> bool {
+            matches!(event, GameEvent::LifeChanged { .. })
+        }
+
+        /// The ordinals of the claims whose event satisfies `matching`, in claim order.
+        fn claimed_ordinals(
+            claims: &[triggers::ConsumedTriggerEventOccurrence],
+            matching: impl Fn(&GameEvent) -> bool,
+        ) -> Vec<usize> {
+            claims
+                .iter()
+                .filter(|claim| matching(&claim.event))
+                .map(|claim| claim.occurrence)
+                .collect()
+        }
+
+        /// What the post-action pipeline would still collect from `events`.
+        fn unclaimed(
+            events: &[GameEvent],
+            requester: triggers::TriggerCollectionRequester,
+            claims: &[triggers::ConsumedTriggerEventOccurrence],
+        ) -> Vec<GameEvent> {
+            triggers::filter_consumed_trigger_events(events, requester, claims)
+        }
+
+        /// A claim is the consumers' identity for the buffer position it names: the
+        /// event there, its `trigger_event_occurrence`, and every collector.
+        fn assert_claim_names_position(
+            claim: &triggers::ConsumedTriggerEventOccurrence,
+            events: &[GameEvent],
+            index: usize,
+        ) {
+            assert_eq!(
+                *claim,
+                triggers::ConsumedTriggerEventOccurrence {
+                    event: events[index].clone(),
+                    occurrence: triggers::trigger_event_occurrence(events, index),
+                    scope: triggers::ConsumedTriggerEventScope::AllCollectors,
+                },
+                "the claim must name buffer position {index}"
+            );
+        }
+
+        /// CR 603.2c: a gain-life proof batch claims each `LifeChanged` at the
+        /// ordinal every consumer numbers it with. The three events differ only in
+        /// the reported life total, which is display-only, so typed equality treats
+        /// them as three occurrences of one event; a serialized-string numbering
+        /// would call each the first and leave two collectable.
+        #[test]
+        fn gain_life_proof_batch_claims_number_by_the_consumers_equality() {
+            use triggers::TriggerCollectionRequester::{Delayed, Ordinary};
+
+            let mut state = setup();
+            let source = add_self_counter_source(&mut state, "Soul Warden");
+            for _ in 0..3 {
+                push_fixed_controller_gain_life_trigger(
+                    &mut state,
+                    source,
+                    life_event(PlayerId(0), 0),
+                );
+            }
+            let life_before = state.players[0].life;
+            let mut events = Vec::new();
+            assert_eq!(resolve_next_committed(&mut state, &mut events), 3);
+
+            // Reach: the three gains were reported with three distinct totals, so
+            // their serialized forms differ while their typed values are equal.
+            let totals: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    GameEvent::LifeChanged { new_total, .. } => Some(new_total.0),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                totals,
+                (1..=3).map(|n| Some(life_before + n)).collect::<Vec<_>>()
+            );
+            let claims = &state.consumed_before_priority_trigger_events;
+            assert_eq!(claims.len(), events.len(), "every proof event is claimed");
+
+            for (index, claim) in claims.iter().enumerate() {
+                assert_claim_names_position(claim, &events, index);
+            }
+            assert_eq!(claimed_ordinals(claims, is_life_changed), vec![0, 1, 2]);
+            for requester in [Ordinary, Delayed] {
+                assert!(
+                    unclaimed(&events, requester, claims).is_empty(),
+                    "{requester:?}: every claimed occurrence is consumed"
+                );
+            }
+
+            // A later gain is a new occurrence and stays collectable.
+            let mut later = events.clone();
+            later.push(reported_life_changed(1, life_before + 4));
+            let rest = unclaimed(&later, Ordinary, claims);
+            assert_eq!(rest.len(), 1);
+            assert_eq!(wire(&rest[0]), wire(later.last().unwrap()));
+        }
+
+        /// CR 603.2c: the claims name positions in the caller's whole buffer. An
+        /// event already in the buffer that is equal to a proof event is an earlier
+        /// occurrence, so it stays unclaimed and every appended occurrence is
+        /// consumed; numbering the proof's own events alone would consume the prefix
+        /// and leave the last appended gain collectable. The prefix reports the same
+        /// total as the first emitted gain, so only the buffer position separates
+        /// the two.
+        #[test]
+        fn proof_batch_claims_are_full_buffer_occurrences_after_a_prefix() {
+            use triggers::TriggerCollectionRequester::{Delayed, Ordinary};
+
+            let mut state = setup();
+            let source = add_self_counter_source(&mut state, "Soul Warden");
+            for _ in 0..3 {
+                push_fixed_controller_gain_life_trigger(
+                    &mut state,
+                    source,
+                    life_event(PlayerId(0), 0),
+                );
+            }
+            let life_before = state.players[0].life;
+            let prefix = reported_life_changed(1, life_before + 1);
+            let mut events = vec![prefix.clone()];
+            assert_eq!(resolve_next_committed(&mut state, &mut events), 3);
+
+            // Reach: the prefix is equal to every emitted gain.
+            assert_eq!(events.iter().filter(|event| **event == prefix).count(), 4);
+            let claims = &state.consumed_before_priority_trigger_events;
+            assert_eq!(claims.len(), events.len() - 1, "the prefix is not claimed");
+            for (offset, claim) in claims.iter().enumerate() {
+                assert_claim_names_position(claim, &events, 1 + offset);
+            }
+            assert_eq!(claimed_ordinals(claims, is_life_changed), vec![1, 2, 3]);
+            for requester in [Ordinary, Delayed] {
+                let rest = unclaimed(&events, requester, claims);
+                assert_eq!(rest.len(), 1, "{requester:?}: only the prefix remains");
+                assert_eq!(
+                    wire(&rest[0]),
+                    wire(&prefix),
+                    "{requester:?}: the survivor is the prefix, not the last appended gain"
+                );
+            }
+        }
+
+        /// CR 603.2c: a bulk token run claims members 1..N-1's events at their
+        /// positions in the caller's whole buffer. A prefix event equal to each
+        /// member's `EffectResolved` stays unclaimed together with every event of
+        /// the last member, whose events the caller's own checkpoint collects.
+        #[test]
+        fn bulk_run_claims_are_full_buffer_occurrences_after_a_prefix() {
+            use triggers::TriggerCollectionRequester::Ordinary;
+
+            const MEMBERS: usize = 4;
+            let mut state = setup();
+            add_lands(&mut state, 3);
+            let src = add_scute_source(&mut state);
+            push_token_triggers(&mut state, src, insect_token_effect(), None, MEMBERS);
+
+            // Dry run on a clone to learn the per-member event shape.
+            let mut dry = state.clone();
+            let mut dry_events = Vec::new();
+            assert_eq!(resolve_next_committed(&mut dry, &mut dry_events), 4);
+            let last_member_len =
+                dry_events.len() - dry.consumed_before_priority_trigger_events.len();
+            let prefix = dry_events
+                .iter()
+                .find(|event| matches!(event, GameEvent::EffectResolved { .. }))
+                .expect("each member resolves an effect")
+                .clone();
+            // Reach: the bulk route claimed everything but the last member's events,
+            // and every member emitted an event equal to the prefix.
+            assert!(last_member_len > 0 && last_member_len < dry_events.len());
+            assert_eq!(
+                dry_events.iter().filter(|event| **event == prefix).count(),
+                MEMBERS
+            );
+
+            let mut events = vec![prefix.clone()];
+            assert_eq!(resolve_next_committed(&mut state, &mut events), 4);
+            let claims = &state.consumed_before_priority_trigger_events;
+            assert_eq!(claims.len(), events.len() - 1 - last_member_len);
+            for (offset, claim) in claims.iter().enumerate() {
+                assert_claim_names_position(claim, &events, 1 + offset);
+            }
+            assert_eq!(
+                claimed_ordinals(claims, |event| *event == prefix),
+                vec![1, 2, 3],
+                "the prefix is occurrence 0; members 1..N-1 are occurrences 1..N-1"
+            );
+            let rest: Vec<String> = unclaimed(&events, Ordinary, claims)
+                .iter()
+                .map(wire)
+                .collect();
+            let expected: Vec<String> = std::iter::once(&events[0])
+                .chain(&events[events.len() - last_member_len..])
+                .map(wire)
+                .collect();
+            assert_eq!(
+                rest, expected,
+                "the prefix and the last member's events stay collectable"
+            );
+        }
+
+        /// CR 203.1 + CR 206.1 + CR 603.2c: a printing has no effect on game play,
+        /// so two events that differ only in a display-only printing are two
+        /// occurrences of one event. Each claim consumes its own occurrence and no
+        /// other. The controls: a rules difference keeps independent ordinals, and a
+        /// pair that is serialized-equal but typed-unequal does too.
+        #[test]
+        fn carrier_printing_pairs_number_and_consume_like_their_consumers() {
+            use crate::types::card_printing::{CardPrinting, SharedPrinting};
+            use crate::types::display_only::DisplayOnly;
+            use triggers::TriggerCollectionRequester::Ordinary;
+
+            fn printing(set_code: &str) -> DisplayOnly<Option<SharedPrinting>> {
+                DisplayOnly::new(Some(SharedPrinting::new(CardPrinting {
+                    set_code: set_code.to_string(),
+                    collector_number: "1".to_string(),
+                })))
+            }
+
+            /// A battlefield object carrying `printing`, and its public look-back.
+            fn object_with(printing: DisplayOnly<Option<SharedPrinting>>) -> (GameState, ObjectId) {
+                let mut state = setup();
+                let id = create_object(
+                    &mut state,
+                    CardId(1),
+                    PlayerId(0),
+                    "Carrier Bear".to_string(),
+                    Zone::Battlefield,
+                );
+                state.objects.get_mut(&id).unwrap().printing = printing;
+                (state, id)
+            }
+
+            let zone_changed = |printing: DisplayOnly<Option<SharedPrinting>>| {
+                let (state, id) = object_with(printing.clone());
+                let record = state.objects[&id].snapshot_for_zone_change(
+                    id,
+                    Some(Zone::Battlefield),
+                    Zone::Graveyard,
+                );
+                assert_eq!(
+                    record
+                        .trigger_source_context
+                        .as_ref()
+                        .expect("a real record carries its source context")
+                        .printing
+                        .get(),
+                    printing.get(),
+                    "reach: the printing is on the source context the event carries"
+                );
+                GameEvent::ZoneChanged {
+                    object_id: id,
+                    from: Some(Zone::Battlefield),
+                    to: Zone::Graveyard,
+                    record: Box::new(record),
+                }
+            };
+            let search_viewed = |printing: DisplayOnly<Option<SharedPrinting>>| {
+                let (state, id) = object_with(printing.clone());
+                let view =
+                    crate::game::visibility::capture_library_search_card_view(&state.objects[&id]);
+                assert_eq!(view.printing.get(), printing.get());
+                GameEvent::HiddenSearchViewed {
+                    searcher: PlayerId(0),
+                    cards: vec![view],
+                    audience: vec![PlayerId(0)],
+                }
+            };
+
+            let none = || DisplayOnly::new(None);
+            let pairs = [
+                (
+                    "ZoneChanged S1/S2",
+                    zone_changed(printing("SNTA")),
+                    zone_changed(printing("SNTB")),
+                ),
+                (
+                    "ZoneChanged S1/none",
+                    zone_changed(printing("SNTA")),
+                    zone_changed(none()),
+                ),
+                (
+                    "HiddenSearchViewed S1/S2",
+                    search_viewed(printing("SNTA")),
+                    search_viewed(printing("SNTB")),
+                ),
+            ];
+            for (label, first, second) in pairs {
+                // Reach: the pair is a real divergence between typed equality and
+                // serialized identity.
+                assert_eq!(first, second, "{label}: equal under typed equality");
+                assert_ne!(wire(&first), wire(&second), "{label}: serialized apart");
+
+                let events = vec![first, second];
+                let both = consumed_trigger_event_occurrences(&events, 0..2);
+                assert_eq!(
+                    both.iter()
+                        .map(|claim| claim.occurrence)
+                        .collect::<Vec<_>>(),
+                    vec![0, 1],
+                    "{label}: the printing never splits an occurrence"
+                );
+                assert!(
+                    unclaimed(&events, Ordinary, &both).is_empty(),
+                    "{label}: both occurrences are consumed"
+                );
+                let only_first = consumed_trigger_event_occurrences(&events, 0..1);
+                let rest = unclaimed(&events, Ordinary, &only_first);
+                assert_eq!(rest.len(), 1, "{label}: the second occurrence remains");
+                assert_eq!(wire(&rest[0]), wire(&events[1]), "{label}");
+            }
+
+            // Control: a rules difference keeps independent ordinals.
+            let small = reported_life_changed(1, 21);
+            let large = reported_life_changed(2, 21);
+            assert_ne!(small, large);
+            let events = vec![small, large];
+            let both = consumed_trigger_event_occurrences(&events, 0..2);
+            assert_eq!(
+                both.iter()
+                    .map(|claim| claim.occurrence)
+                    .collect::<Vec<_>>(),
+                vec![0, 0]
+            );
+            let rest = unclaimed(
+                &events,
+                Ordinary,
+                &consumed_trigger_event_occurrences(&events, 0..1),
+            );
+            assert_eq!(rest, vec![events[1].clone()]);
+
+            // Control, the opposite divergence: `Loyalty` and `Generic("loyalty")`
+            // serialize alike but are typed-unequal, so they are distinct events.
+            let counter_added = |counter_type: CounterType| GameEvent::CounterAdded {
+                object_id: ObjectId(1),
+                counter_type,
+                count: 1,
+                actor: PlayerId(0),
+            };
+            let loyalty = counter_added(CounterType::Loyalty);
+            let generic = counter_added(CounterType::Generic("loyalty".to_string()));
+            assert_ne!(loyalty, generic);
+            assert_eq!(wire(&loyalty), wire(&generic), "reach: serialized alike");
+            let events = vec![loyalty, generic];
+            let both = consumed_trigger_event_occurrences(&events, 0..2);
+            assert_eq!(
+                both.iter()
+                    .map(|claim| claim.occurrence)
+                    .collect::<Vec<_>>(),
+                vec![0, 0]
+            );
+            let rest = unclaimed(
+                &events,
+                Ordinary,
+                &consumed_trigger_event_occurrences(&events, 0..1),
+            );
+            assert_eq!(rest, vec![events[1].clone()]);
+        }
+
+        /// CR 603.2c: a claim over a range of the buffer is the occurrence in the
+        /// whole buffer, so earlier equal events are counted and the empty range
+        /// claims nothing.
+        #[test]
+        fn batch_claims_are_full_buffer_occurrences_after_a_prefix() {
+            use triggers::TriggerCollectionRequester::Ordinary;
+
+            let events = vec![
+                reported_life_changed(1, 20),
+                reported_life_changed(1, 21),
+                reported_life_changed(1, 22),
+            ];
+            assert!(events[0] == events[1] && events[1] == events[2]);
+
+            let claims = consumed_trigger_event_occurrences(&events, 1..3);
+            assert_eq!(
+                claims
+                    .iter()
+                    .map(|claim| claim.occurrence)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            let rest = unclaimed(&events, Ordinary, &claims);
+            assert_eq!(rest.len(), 1);
+            assert_eq!(
+                wire(&rest[0]),
+                wire(&events[0]),
+                "the prefix stays collectable"
+            );
+
+            assert!(consumed_trigger_event_occurrences(&events, 3..3).is_empty());
         }
 
         /// CR 607.1: a triggered ability's provenance is derived from
@@ -11568,7 +11993,7 @@ mod tests {
                         condition: None,
                         trigger_event: Some(trigger_event),
                         description: Some(
-                            "Whenever a creature enters, you gain 1 life.".to_string(),
+                            "Whenever another creature enters, you gain 1 life.".to_string(),
                         ),
                         source_name: state.objects[&source].name.clone(),
                         subject_match_count: None,
@@ -11582,8 +12007,8 @@ mod tests {
 
             crate::game::perf_counters::reset();
             let mut state = setup();
-            let source_a = add_self_counter_source(&mut state, "Bogwater Lumaret A");
-            let source_b = add_self_counter_source(&mut state, "Bogwater Lumaret B");
+            let source_a = add_self_counter_source(&mut state, "Soul Warden A");
+            let source_b = add_self_counter_source(&mut state, "Soul Warden B");
             let etb = life_event(PlayerId(0), 0);
             push_printed_gain_life_trigger(&mut state, source_a, etb.clone());
             push_printed_gain_life_trigger(&mut state, source_b, etb.clone());
@@ -11616,7 +12041,7 @@ mod tests {
         fn fixed_controller_gain_life_batch_refuses_when_life_gained_observer_fires() {
             crate::game::perf_counters::reset();
             let mut state = setup();
-            let source = add_self_counter_source(&mut state, "Bogwater Lumaret");
+            let source = add_self_counter_source(&mut state, "Soul Warden");
             let observer = create_object(
                 &mut state,
                 CardId(9_600),
@@ -12226,6 +12651,7 @@ mod tests {
                 enter_with_counters: vec![],
                 tapped: false,
                 enters_attacking: false,
+                attack_request: crate::types::proposed_event::TokenAttackRequest::Unspecified,
                 sacrifice_at: None,
                 source_id: ObjectId(1),
                 controller: PlayerId(0),
@@ -12309,6 +12735,8 @@ mod tests {
                 owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
                 tapped: false,
                 count: QuantityExpr::Fixed { value: 1 },
                 extra_keywords: vec![],
@@ -12574,6 +13002,8 @@ mod tests {
                 owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
                 tapped: false,
                 count: QuantityExpr::Fixed { value: 1 },
                 extra_keywords: vec![],
