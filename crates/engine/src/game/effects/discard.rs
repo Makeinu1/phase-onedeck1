@@ -1217,7 +1217,7 @@ fn route_discard(
             ReplacementResult::Execute(e) => format!(
                 "Execute({})",
                 format!("{e:?}")
-                    .split([" ", "{"])
+                    .split([' ', '{'])
                     .next()
                     .unwrap_or("")
                     .to_string()

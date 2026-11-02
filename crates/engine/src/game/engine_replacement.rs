@@ -429,7 +429,7 @@ fn handle_replacement_choice_inner(
             super::replacement::ReplacementResult::Execute(ev) => format!(
                 "Execute({})",
                 format!("{ev:?}")
-                    .split([" ", "{"])
+                    .split([' ', '{'])
                     .next()
                     .unwrap_or("")
                     .to_string()
