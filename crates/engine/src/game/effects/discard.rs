@@ -58,6 +58,10 @@ pub(crate) fn complete_discard_to_graveyard(
     applied: HashSet<AppliedReplacementKey>,
     events: &mut Vec<GameEvent>,
 ) -> DiscardOutcome {
+    eprintln!(
+        "TRACE complete_discard_to_graveyard obj={object_id:?} frame={discard_frame:?} zone={:?}",
+        state.objects.get(&object_id).map(|o| o.zone)
+    );
     // CR 614.6 + CR 701.9a: lower the accepted discard to an inner hand →
     // graveyard `ZoneChange` carrying the outer pass's `applied` set, then run
     // it through the pipeline so `Moved` redirects (Rest in Peace class) get
@@ -110,6 +114,7 @@ pub(crate) fn complete_discard_to_graveyard(
             return DiscardOutcome::Complete;
         }
         ReplacementResult::NeedsChoice(player) => {
+            eprintln!("TRACE complete_discard_to_graveyard inner ZoneChange NeedsChoice -> return without record");
             // CR 614.1: The replacement-effect pipeline retains `discard_frame` on the paused
             // ZoneChange. Generic replacement resume returns to terminal zone
             // delivery, which appends the exact result and emits bookkeeping.
@@ -121,6 +126,10 @@ pub(crate) fn complete_discard_to_graveyard(
         // and recorded the normal bookkeeping at its terminal point.
         return DiscardOutcome::Complete;
     }
+    eprintln!(
+        "TRACE complete_discard_to_graveyard records discard, zone now {:?}",
+        state.objects.get(&object_id).map(|o| o.zone)
+    );
     crate::game::restrictions::record_discard(state, player_id);
     // CR 701.9c + CR 702.187b: stamp the Mayhem discard marker only if the card
     // actually landed in the graveyard — a redirect (RIP → exile) leaves it
@@ -1201,7 +1210,23 @@ fn route_discard(
         discard_frame,
         applied: HashSet::new(),
     };
-    match replacement::replace_event(state, proposed, events) {
+    let __r = replacement::replace_event(state, proposed, events);
+    eprintln!(
+        "TRACE route_discard outer result={}",
+        match &__r {
+            ReplacementResult::Execute(e) => format!(
+                "Execute({})",
+                format!("{e:?}")
+                    .split([" ", "{"])
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            ),
+            ReplacementResult::Prevented => "Prevented".into(),
+            ReplacementResult::NeedsChoice(p) => format!("NeedsChoice({p:?})"),
+        }
+    );
+    match __r {
         ReplacementResult::Execute(event) => match event {
             ProposedEvent::Discard {
                 player_id: pid,

@@ -423,6 +423,22 @@ fn handle_replacement_choice_inner(
         .as_ref()
         .is_some_and(|pending| matches!(pending.proposed, ProposedEvent::BeginPhase { .. }));
     let result = super::replacement::continue_replacement(state, index, events);
+    eprintln!(
+        "TRACE continue_replacement index={index} result={} waiting={:?}",
+        match &result {
+            super::replacement::ReplacementResult::Execute(ev) => format!(
+                "Execute({})",
+                format!("{ev:?}")
+                    .split([" ", "{"])
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            ),
+            super::replacement::ReplacementResult::Prevented => "Prevented".into(),
+            super::replacement::ReplacementResult::NeedsChoice(p) => format!("NeedsChoice({p:?})"),
+        },
+        std::mem::discriminant(&state.waiting_for)
+    );
     // CR 614.12a: an optional `MayCost` accept whose payment surfaced an
     // interactive sub-choice (e.g. Mox Diamond's "discard a land card" with
     // multiple eligible lands) re-parked the pending replacement with
@@ -481,6 +497,10 @@ fn handle_replacement_choice_inner(
                 //     is restored structurally inside the shared delivery for
                 //     `Stack → Battlefield` events (`CastLinkSnapshot`).
                 event @ ProposedEvent::ZoneChange { .. } => {
+                    eprintln!(
+                        "TRACE resume ZoneChange arm {}",
+                        format!("{event:?}").chars().take(160).collect::<String>()
+                    );
                     let (object_id, to, cause, discard_frame) = match &event {
                         ProposedEvent::ZoneChange {
                             object_id,
@@ -937,6 +957,7 @@ fn handle_replacement_choice_inner(
                     applied,
                     ..
                 } => {
+                    eprintln!("TRACE resume Discard arm frame={discard_frame:?}");
                     if let effects::discard::DiscardOutcome::NeedsReplacementChoice(player) =
                         effects::discard::complete_discard_to_graveyard(
                             state,
