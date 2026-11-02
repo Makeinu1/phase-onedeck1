@@ -62,7 +62,7 @@ fn run(rest_in_peace_copies: usize) -> Option<Observed> {
     let b = scenario.add_real_card(P1, "Swamp", Zone::Hand, db);
     let mut runner: GameRunner = scenario.build();
 
-    let mut commit = runner.cast(mind_rot).free_cast().target_player(P1).commit();
+    let mut commit = runner.cast(mind_rot).target_player(P1).commit();
     let mut events: Vec<GameEvent> = commit.events().to_vec();
     let mut choices_answered = 0;
     let mut grimoire_triggers = 0;
