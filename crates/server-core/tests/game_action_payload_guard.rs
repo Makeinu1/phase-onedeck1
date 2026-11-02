@@ -13,8 +13,8 @@ use engine::types::ability::{
     TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef, TypedFilter,
 };
 use engine::types::actions::{
-    DebugAction, DebugTokenRequest, ReplacementAutoChoice, MAX_DEBUG_CREATE_COUNT,
-    MAX_DEBUG_LIFE_AMOUNT,
+    DebugAction, DebugTokenRequest, ReplacementAutoChoice, MAX_DEBUG_COUNTER_AMOUNT,
+    MAX_DEBUG_CREATE_COUNT, MAX_DEBUG_LIFE_AMOUNT,
 };
 use engine::types::counter::{CounterMatch, CounterType};
 use engine::types::game_state::{
@@ -29,7 +29,7 @@ use engine::types::mana::{
 };
 use engine::types::match_config::DeckCardCount;
 use engine::types::phase::Phase;
-use engine::types::player::PlayerId;
+use engine::types::player::{PlayerCounterKind, PlayerId};
 use engine::types::proposed_event::TokenCharacteristics;
 use engine::types::replacements::ReplacementEvent;
 use engine::types::zones::Zone;
@@ -367,6 +367,46 @@ fn rejects_debug_life_change_amount_above_engine_ceiling() {
 }
 
 #[test]
+fn rejects_debug_counter_gain_count_above_engine_ceiling() {
+    let give_counters = |count| {
+        GameAction::Debug(DebugAction::GivePlayerCounters {
+            player_id: PlayerId(0),
+            counter_kind: PlayerCounterKind::Poison,
+            count,
+        })
+    };
+    let give_energy = |count| {
+        GameAction::Debug(DebugAction::GiveEnergy {
+            player_id: PlayerId(1),
+            count,
+        })
+    };
+
+    guard_game_action_payload(&give_counters(MAX_DEBUG_COUNTER_AMOUNT))
+        .expect("the engine ceiling itself is an accepted player-counter count");
+    guard_game_action_payload(&give_energy(MAX_DEBUG_COUNTER_AMOUNT))
+        .expect("the engine ceiling itself is an accepted energy count");
+
+    for action in [
+        give_counters(MAX_DEBUG_COUNTER_AMOUNT + 1),
+        give_energy(MAX_DEBUG_COUNTER_AMOUNT + 1),
+    ] {
+        let err = guard_game_action_payload(&action).unwrap_err();
+        assert!(err.contains("Debug.CounterGain.count"), "{err}");
+    }
+}
+
+#[test]
+fn accepts_debug_discard_object_only_payload() {
+    assert!(
+        guard_game_action_payload(&GameAction::Debug(DebugAction::Discard {
+            object_id: ObjectId(1),
+        }))
+        .is_ok()
+    );
+}
+
+#[test]
 fn rejects_oversized_debug_token_keyword_ast_payload() {
     let action = GameAction::Debug(DebugAction::CreateToken {
         request: DebugTokenRequest::Custom {
@@ -448,6 +488,20 @@ fn accepts_within_bound_declare_shortcut_template() {
         template: None,
     })
     .is_ok());
+}
+
+#[test]
+fn accepts_declare_shortcut_without_end() {
+    assert!(guard_game_action_payload(&GameAction::DeclareShortcut {
+        count: IterationCount::WithoutEnd,
+        template: None,
+    })
+    .is_ok());
+    assert!(guard_game_action_payload(&GameAction::DeclareShortcut {
+        count: IterationCount::WithoutEnd,
+        template: Some(shortcut_template(MAX_ACTION_LIST_LEN + 1)),
+    })
+    .is_err());
 }
 
 #[test]

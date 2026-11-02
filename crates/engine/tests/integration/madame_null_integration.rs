@@ -110,6 +110,7 @@ fn set_etb_event(state: &mut GameState, entering: ObjectId) {
             linked_exile_snapshot: Vec::new(),
             is_token: false,
             combat_status: Default::default(),
+            block_pairs: Vec::new(),
             trigger_definitions: Vec::new(),
             trigger_source_context: None,
             co_departed: Vec::new(),
@@ -119,6 +120,7 @@ fn set_etb_event(state: &mut GameState, entering: ObjectId) {
             recorded_turn_number: 0,
             is_suspected: false,
             was_prepared: false,
+            departure: engine::types::game_state::ZoneDeparture::Moved,
         }),
     });
 }
