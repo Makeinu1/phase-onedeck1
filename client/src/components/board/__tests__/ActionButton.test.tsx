@@ -175,6 +175,48 @@ describe("ActionButton", () => {
     expect(screen.getByRole("button", { name: "Auto-Passing to End Step..." })).toBeInTheDocument();
   });
 
+  it("shows Space on the visible resolve action without changing its accessible name", () => {
+    useGameStore.setState({
+      gameMode: "online",
+      gameState: {
+        ...createGameState(priorityPrompt()),
+        phase: "PostCombatMain",
+        active_player: 0,
+        auto_pass: {},
+        stack: [spellStackEntry()],
+      },
+      waitingFor: priorityPrompt(),
+      legalActions: [],
+    });
+    useMultiplayerStore.setState({ activePlayerId: 0, actionPending: false });
+
+    render(<ActionButton />);
+
+    expect(screen.getByRole("button", { name: "Resolve" })).toBeEnabled();
+    expect(screen.getByText("Space")).toBeInTheDocument();
+  });
+
+  it("shows Space and Enter hints for empty-stack priority flow", () => {
+    useGameStore.setState({
+      gameMode: "online",
+      gameState: {
+        ...createGameState(priorityPrompt()),
+        phase: "PostCombatMain",
+        active_player: 0,
+        auto_pass: {},
+        stack: [],
+      },
+      waitingFor: priorityPrompt(),
+      legalActions: [],
+    });
+    useMultiplayerStore.setState({ activePlayerId: 0, actionPending: false });
+
+    render(<ActionButton />);
+
+    expect(screen.getByText("Space")).toBeInTheDocument();
+    expect(screen.getByText("Enter")).toBeInTheDocument();
+  });
+
   it("does not block Resolve All behind client-side drain state", () => {
     useGameStore.setState({
       gameMode: "online",
