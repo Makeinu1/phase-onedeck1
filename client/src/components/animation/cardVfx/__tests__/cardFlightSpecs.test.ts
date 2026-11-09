@@ -195,6 +195,29 @@ describe("cardFlightSpecFor", () => {
     expect(cardFlightSpecFor(spellCast, context(announced, post))).toBeNull();
   });
 
+  // V20 is a display consequence, not a card rule: a concealed hand occurrence
+  // carries no stable id for the viewer (CR 400.2, CR 402.3), so the routed
+  // object can be absent from `pre` (an opponent's cast from a hidden hand) or
+  // from `post` (a bounce into a hidden hand). The flight is omitted, not errored.
+  it("V20: a concealed endpoint has no flight and does not throw", () => {
+    const onStack = stateWith(visible(card.params({ zone: "Stack" }).build()));
+    const onBattlefield = stateWith(visible(card.onBattlefield().build()));
+    const announced: AnimationEvent = { type: "StackPushed", data: { object_id: X } };
+
+    // (a) cast event, routed object absent from `pre`.
+    expect(() => cardFlightSpecFor(spellCast, context(stateWith(), onStack))).not.toThrow();
+    expect(cardFlightSpecFor(spellCast, context(stateWith(), onStack))).toBeNull();
+    // (b) the announcement event takes the same null path.
+    expect(() => cardFlightSpecFor(announced, context(stateWith(), onStack))).not.toThrow();
+    expect(cardFlightSpecFor(announced, context(stateWith(), onStack))).toBeNull();
+    // (c) a bounce into a concealed hand, routed object absent from `post`.
+    expect(() => cardFlightSpecFor(zoneChanged("Battlefield", "Hand"), context(onBattlefield, stateWith()))).not.toThrow();
+    expect(cardFlightSpecFor(zoneChanged("Battlefield", "Hand"), context(onBattlefield, stateWith()))).toBeNull();
+    // Reach guard: with the object present on both sides the same events fly.
+    expect(cardFlightSpecFor(zoneChanged("Battlefield", "Hand"), context(onBattlefield, stateWith(visible(card.inHand().build())))))
+      .not.toBeNull();
+  });
+
   it("V3-4f: pace 0 has no flight; any other pace is carried on the spec", () => {
     const pre = stateWith(visible(card.inHand().build()));
     const post = stateWith(visible(card.params({ zone: "Stack" }).build()));
@@ -568,6 +591,19 @@ describe("a sweep", () => {
     // A spell of another colour, or a lone bounce, sends no wave; the batch keeps its stagger.
     expect(cardFlightSpecFor(step[1], sweepContext(["Red"], step, "Hand"))).toMatchObject({ delayMs: 90, sweep: null });
     expect(cardFlightSpecFor(step[0], sweepContext(["Blue"], [step[0]], "Hand"))?.sweep).toBeNull();
+  });
+
+  it("V20-sweep: a sweep member concealed in the destination has no flight while the others still fly", () => {
+    const step = [bounced(X), bounced(OTHER)];
+    const ctx = sweepContext(["Blue"], step, "Hand");
+    delete ctx.post!.objects[X];
+
+    expect(() => cardFlightSpecFor(step[0], ctx)).not.toThrow();
+    expect(cardFlightSpecFor(step[0], ctx)).toBeNull();
+    expect(cardFlightSpecFor(step[1], ctx)).toMatchObject({
+      objectId: OTHER,
+      route: { from: "Battlefield", to: "Hand", ownerId: 1 },
+    });
   });
 
   it("V17-3: destruction follows its source's colours and controller, apart from the top stack spell and other deaths", () => {

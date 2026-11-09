@@ -209,6 +209,7 @@ mod petals_of_insight;
 mod play_trace;
 mod power_fist_combat_damage_regression;
 mod preacher_of_the_schism_life_gates;
+mod preview_concealed_occurrences;
 mod primo_unbounded_fractal_counters;
 mod pugnacious_hammerskull_another_dinosaur;
 mod purged_source_intervening_if_lki;
