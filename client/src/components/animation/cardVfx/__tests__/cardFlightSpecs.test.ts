@@ -213,7 +213,7 @@ describe("cardFlightSpecFor", () => {
     // (c) a bounce into a concealed hand, routed object absent from `post`.
     expect(() => cardFlightSpecFor(zoneChanged("Battlefield", "Hand"), context(onBattlefield, stateWith()))).not.toThrow();
     expect(cardFlightSpecFor(zoneChanged("Battlefield", "Hand"), context(onBattlefield, stateWith()))).toBeNull();
-    // Reach guard: with the object present on both sides the same events fly.
+    // Reach guard: with the object present on both sides the bounce flies (the cast positives are V7-2).
     expect(cardFlightSpecFor(zoneChanged("Battlefield", "Hand"), context(onBattlefield, stateWith(visible(card.inHand().build())))))
       .not.toBeNull();
   });

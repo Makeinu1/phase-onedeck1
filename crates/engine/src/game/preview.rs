@@ -90,11 +90,11 @@ fn zone_is_public(zone: Zone) -> bool {
     !matches!(zone, Zone::Hand | Zone::Library)
 }
 
-/// CR 400.2: the endpoint of a transition the actor observed — the
-/// destination when it is public, otherwise the origin — read from the
-/// actor's projection. `None` when neither endpoint is public (elided) or the
-/// projection does not hold the object there (fail closed: nothing about the
-/// object is read from authoritative state).
+/// CR 400.2: the endpoint of a transition the actor observed — the first
+/// public endpoint, destination before origin, that the actor's projection
+/// holds the object at. `None` when neither endpoint is public (elided) or the
+/// projection holds the object at no public endpoint (fail closed: nothing
+/// about the object is read from authoritative state).
 fn observed_endpoint<'v>(
     id: ObjectId,
     before_view: &'v GameState,
@@ -145,9 +145,11 @@ pub fn compute_preview_diff(
         match before.authoritative.objects.get(id) {
             // CR 400.2: observable iff one endpoint is a public zone; displayed
             // fields come from the actor's projection at that endpoint.
-            // CR 108.4 + CR 108.4a: a card in a hand or library has no controller
-            // (its owner stands in); the controller shown is the permanent's or
-            // spell's at the observed public endpoint (CR 110.2 / CR 112.2).
+            // CR 108.4 + CR 108.4a: a card that is neither a permanent nor a
+            // spell has no controller (its owner stands in). The controller
+            // shown is the projection's at the observed endpoint: the
+            // permanent's or spell's when that endpoint is the battlefield or
+            // stack (CR 110.2 / CR 112.2), otherwise the owner fallback.
             Some(b) => {
                 if b.zone != a.zone {
                     if let Some(shown) =
@@ -625,10 +627,12 @@ mod tests {
         let mut before = GameState::new_two_player(1);
         let mut after = before.clone();
         // 60: bounce whose before-view key is missing. 61: created token whose
-        // after-view key is missing.
+        // after-view key is missing. 63: token that ceases to exist from the
+        // battlefield (absent from `after`) whose before-view key is missing.
         insert(&mut before, 60, "Gone", Zone::Battlefield);
         insert(&mut after, 60, "Gone", Zone::Hand);
         insert(&mut after, 61, "Phantom", Zone::Battlefield);
+        insert(&mut before, 63, "Vanished", Zone::Battlefield);
         // Positive control: present in both views, proves the loop ran.
         insert(&mut before, 62, "Control", Zone::Battlefield);
         insert(&mut after, 62, "Control", Zone::Graveyard);
@@ -638,6 +642,7 @@ mod tests {
         before_view.objects.remove(&ObjectId(60));
         after_view.objects.remove(&ObjectId(60));
         after_view.objects.remove(&ObjectId(61));
+        before_view.objects.remove(&ObjectId(63));
 
         let diff = compute_preview_diff(
             PreviewSnapshot {
