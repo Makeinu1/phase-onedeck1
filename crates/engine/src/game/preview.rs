@@ -148,19 +148,21 @@ pub fn compute_preview_diff(
             // CR 108.4 + CR 108.4a: a card in a hand or library has no controller
             // (its owner stands in); the controller shown is the permanent's or
             // spell's at the observed public endpoint (CR 110.2 / CR 112.2).
-            Some(b) if b.zone != a.zone => {
-                if let Some(shown) = observed_endpoint(*id, before.view, b.zone, after.view, a.zone)
-                {
-                    zone_changes.push(ZoneChange {
-                        object_id: *id,
-                        name: shown.name.clone(),
-                        controller: shown.controller,
-                        from: b.zone,
-                        to: a.zone,
-                    });
+            Some(b) => {
+                if b.zone != a.zone {
+                    if let Some(shown) =
+                        observed_endpoint(*id, before.view, b.zone, after.view, a.zone)
+                    {
+                        zone_changes.push(ZoneChange {
+                            object_id: *id,
+                            name: shown.name.clone(),
+                            controller: shown.controller,
+                            from: b.zone,
+                            to: a.zone,
+                        });
+                    }
                 }
             }
-            Some(_) => {}
             // Fail closed: the projection must hold what it reports.
             None if zone_is_public(a.zone) && after.view.objects.contains_key(id) => {
                 created.push(*id)
