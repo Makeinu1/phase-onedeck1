@@ -142,6 +142,7 @@ pub fn compute_preview_diff(
     let mut zone_changes = Vec::new();
     let mut created = Vec::new();
     for (id, a) in &after.authoritative.objects {
+        let to = a.zone;
         match before.authoritative.objects.get(id) {
             // CR 400.2: observable iff one endpoint is a public zone; displayed
             // fields come from the actor's projection at that endpoint.
@@ -150,25 +151,20 @@ pub fn compute_preview_diff(
             // shown is the projection's at the observed endpoint: the
             // permanent's or spell's when that endpoint is the battlefield or
             // stack (CR 110.2 / CR 112.2), otherwise the owner fallback.
-            Some(b) => {
-                if b.zone != a.zone {
-                    if let Some(shown) =
-                        observed_endpoint(*id, before.view, b.zone, after.view, a.zone)
-                    {
-                        zone_changes.push(ZoneChange {
-                            object_id: *id,
-                            name: shown.name.clone(),
-                            controller: shown.controller,
-                            from: b.zone,
-                            to: a.zone,
-                        });
-                    }
+            Some(b) if b.zone != to => {
+                if let Some(shown) = observed_endpoint(*id, before.view, b.zone, after.view, to) {
+                    zone_changes.push(ZoneChange {
+                        object_id: *id,
+                        name: shown.name.clone(),
+                        controller: shown.controller,
+                        from: b.zone,
+                        to,
+                    });
                 }
             }
+            Some(_) => {}
             // Fail closed: the projection must hold what it reports.
-            None if zone_is_public(a.zone) && after.view.objects.contains_key(id) => {
-                created.push(*id)
-            }
+            None if zone_is_public(to) && after.view.objects.contains_key(id) => created.push(*id),
             None => {}
         }
     }
