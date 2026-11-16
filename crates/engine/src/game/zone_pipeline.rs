@@ -869,7 +869,9 @@ pub(crate) fn move_object_with_terminal(
     //   - zone_pipeline.rs: exempt library-placement delivery (~821)
     //   - zone_pipeline.rs: replacement delivery placement (~2353)
     // Migrating each onto this arm is a production no-op today (the only
-    // `Moved` definition targeting the library is test-only) but pins the
+    // `Moved` definition targeting the library is test-only; a
+    // `ReplacementEvent::Discard` branch, Library of Leng, redirects to the library
+    // with a placement carried on the event instead) but pins the
     // redirect consult for the future. Re-verify the census before lifting:
     //   rg -o 'destination_zone\(Zone::\w+\)' crates/engine/src | sort | uniq -c
     if let Some(position) = req.placement.clone() {
@@ -1638,6 +1640,14 @@ fn anticipated_zone_change_delivery(
 /// `mill_double_redirect_choice_continuation` (two sequential parks, no
 /// completion) and `surveil_rest_pile_redirect_continuation` (two sequential
 /// parks WITH a completion that must fire once after the second park drains).
+///
+/// CLASSIFICATION CONTRACT (issue #10431): the resumed segment's
+/// `terminal_completion` is recorded by the resume seam
+/// (`engine_replacement::handle_replacement_choice_inner`) before either
+/// terminal, so a delivery that parks again in its own tail (ETB counter
+/// ordering, entering-attacker choice) is still classified `Moved` here. `None`
+/// at this point means the delivery never reached a terminal decision and is a
+/// contract violation, not a state this function may paper over.
 pub(crate) fn drain_pending_batch_deliveries(state: &mut GameState, events: &mut Vec<GameEvent>) {
     if let Some(pending) = state.active_batch_delivery().cloned() {
         let PendingBatchDeliveries {
@@ -1690,9 +1700,24 @@ pub(crate) fn drain_pending_batch_deliveries(state: &mut GameState, events: &mut
                 &paused_current.delivery_events,
             )
             .expect("resumed batch retains its exact paused delivery");
-            let terminal_completion = paused_current
-                .terminal_completion
-                .expect("resumed batch delivery records its exact terminal completion");
+            // CR 616.1 + CR 603.10a: a resumed batch member must be classified
+            // before its owner can be drained. The resume seam records it whether
+            // the delivery returns `Done` or parks again
+            // (`engine_replacement::handle_replacement_choice_inner`), so `None`
+            // here means a delivery that never reached a terminal decision — a
+            // contract violation, never a fallback (settlement would leave the
+            // member `Pending`).
+            let terminal_completion =
+                paused_current
+                    .terminal_completion
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "resumed batch member {} (incarnation {}) has no terminal completion ({} retained delivery events)",
+                            paused_current.member.object_id.0,
+                            paused_current.member.incarnation,
+                            paused_current.delivery_events.len()
+                        )
+                    });
             logical_zone_change_group
                 .record_delivery_completion(paused_current.member.object_id, terminal_completion)
                 .expect("resumed batch member records its exact terminal outcome");
@@ -3725,7 +3750,9 @@ fn entry_receiver(
 /// placement, which the tail's auto-shuffle convention then randomizes. A
 /// `Moved` replacement may have redirected the event to a non-library zone; the
 /// placement then has no effect (the index/shuffle gates both key on
-/// `to == Zone::Library`).
+/// `to == Zone::Library`). CR 614.6: a placement carried on the event by a
+/// redirecting replacement (Library of Leng's "put it on top of your library
+/// instead") wins over the caller's `library_placement`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn deliver_replaced_zone_change(
     state: &mut GameState,
@@ -3755,11 +3782,17 @@ pub(crate) fn deliver_replaced_zone_change(
         enter_as_copy,
         enter_with_choices,
         discard_frame,
+        library_placement: event_placement,
         performed_by,
         applied,
         ..
     } = event
     {
+        // CR 614.6: a redirecting replacement's placement (the modified event)
+        // wins over the caller's.
+        let library_placement = event_placement
+            .map(|position| *position)
+            .or(library_placement);
         if let Some(entry) = state.liminal_entries.get_mut(&object_id) {
             entry.replacement_applied = applied.clone();
         }
@@ -5615,6 +5648,115 @@ mod w3_library_placement_tests {
         // The redirect sent the card to exile instead of the library.
         assert_eq!(state.objects[&card].zone, Zone::Exile);
         assert!(!state.players[0].library.contains(&card));
+    }
+
+    /// Build a three-card library `[a, b, c]` and a card in hand, then deliver an
+    /// already-replaced hand-to-`to` `ZoneChange` carrying `event_placement`, with
+    /// `caller_placement` as the caller's argument.
+    fn deliver_with_placements(
+        to: Zone,
+        event_placement: Option<LibraryPosition>,
+        caller_placement: Option<LibraryPosition>,
+    ) -> (GameState, ObjectId, Vec<ObjectId>, Vec<GameEvent>) {
+        let mut state = GameState::new_two_player(42);
+        let library: Vec<ObjectId> = (1..=3)
+            .map(|i| {
+                create_object(
+                    &mut state,
+                    CardId(i),
+                    PlayerId(0),
+                    format!("Library {i}"),
+                    Zone::Library,
+                )
+            })
+            .collect();
+        state.players[0].library = library.iter().copied().collect();
+        let card = create_object(
+            &mut state,
+            CardId(90),
+            PlayerId(0),
+            "Delivered".to_string(),
+            Zone::Hand,
+        );
+        let mut event = ProposedEvent::zone_change(card, Zone::Hand, to, None);
+        if let ProposedEvent::ZoneChange {
+            library_placement, ..
+        } = &mut event
+        {
+            *library_placement = event_placement.map(Box::new);
+        }
+        let mut events = Vec::new();
+        let result = deliver_replaced_zone_change(
+            &mut state,
+            event,
+            None,
+            None,
+            None,
+            false,
+            PostReplacementDrainOwner::DeliveryTail,
+            caller_placement,
+            &mut events,
+        );
+        assert!(matches!(result, ZoneDeliveryResult::Done));
+        (state, card, library, events)
+    }
+
+    fn shuffled(events: &[GameEvent]) -> bool {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                GameEvent::PlayerPerformedAction {
+                    action: crate::types::events::PlayerActionKind::ShuffledLibrary,
+                    ..
+                }
+            )
+        })
+    }
+
+    /// Z1 (CR 614.6 + CR 701.24a): the placement carried on the event wins over the
+    /// caller's argument, and a placement is not a shuffle.
+    #[test]
+    fn event_library_placement_wins_over_caller_placement() {
+        let (state, card, library, events) = deliver_with_placements(
+            Zone::Library,
+            Some(LibraryPosition::Top),
+            Some(LibraryPosition::Bottom),
+        );
+        let mut expected = vec![card];
+        expected.extend(library);
+        assert_eq!(
+            state.players[0].library.iter().copied().collect::<Vec<_>>(),
+            expected,
+            "event placement Top beats caller placement Bottom"
+        );
+        assert!(!shuffled(&events));
+    }
+
+    /// Z1 control: with no event placement the caller's placement is honoured.
+    #[test]
+    fn caller_library_placement_applies_without_event_placement() {
+        let (state, card, library, events) =
+            deliver_with_placements(Zone::Library, None, Some(LibraryPosition::Bottom));
+        let mut expected = library;
+        expected.push(card);
+        assert_eq!(
+            state.players[0].library.iter().copied().collect::<Vec<_>>(),
+            expected
+        );
+        assert!(!shuffled(&events));
+    }
+
+    /// Z1 redirect-away: a placement on an event whose destination is not the
+    /// library is ignored.
+    #[test]
+    fn event_library_placement_is_ignored_for_non_library_destination() {
+        let (state, card, library, _events) =
+            deliver_with_placements(Zone::Exile, Some(LibraryPosition::Top), None);
+        assert_eq!(state.objects[&card].zone, Zone::Exile);
+        assert_eq!(
+            state.players[0].library.iter().copied().collect::<Vec<_>>(),
+            library
+        );
     }
 
     /// W3 (CR 701.24a): a NON-EXEMPT library placement with no redirect places the
